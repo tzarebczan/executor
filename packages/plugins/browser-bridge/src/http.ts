@@ -28,6 +28,15 @@ export type AuthSession = {
 export type BrowserBridgeHttpDeps = {
   /** Resolve Bearer / API key / cookie session. Return null if unauthenticated. */
   readonly getSession: (request: Request) => Promise<AuthSession | null>;
+  /**
+   * After a reverse session opens, provision the visible Chrome integration +
+   * connection in the Executor catalog (so the site shows "Chrome / desktop").
+   * Best-effort — must not fail the session open.
+   */
+  readonly ensureCatalog?: (request: Request) => Promise<{
+    ok: boolean;
+    detail?: string;
+  }>;
 };
 
 const json = (value: unknown, status = 200) =>
@@ -72,7 +81,7 @@ export function makeBrowserBridgeHandler(deps: BrowserBridgeHttpDeps) {
     const userId = auth.user.id;
     const organizationId = auth.session?.activeOrganizationId || undefined;
 
-    // POST /session
+    // POST /session — open reverse channel + ensure catalog shows Chrome
     if (path === "/session" && request.method === "POST") {
       const body = (await readJson(request)) as Record<string, unknown> | null;
       const session = createSession({
@@ -84,13 +93,47 @@ export function makeBrowserBridgeHandler(deps: BrowserBridgeHttpDeps) {
         capabilities: body?.capabilities,
         connection: (body?.connection as Record<string, unknown>) || undefined,
       });
+
+      let catalog: { ok: boolean; detail?: string } | undefined;
+      if (deps.ensureCatalog) {
+        try {
+          catalog = await deps.ensureCatalog(request);
+        } catch (e) {
+          catalog = { ok: false, detail: String((e as Error)?.message || e) };
+        }
+      }
+
       return json({
         sessionId: session.id,
         id: session.id,
         pollPath: `/api/browser-bridge/session/${session.id}/jobs`,
         resultPath: `/api/browser-bridge/session/${session.id}/result`,
+        // What should appear in Executor UI after this
+        integration: "browser",
+        connection: "desktop",
+        address: "tools.browser.user.desktop",
+        catalog,
         ...sessionPublicView(session),
       });
+    }
+
+    // POST /install — re-run catalog ensure without a new session
+    if (path === "/install" && request.method === "POST") {
+      if (!deps.ensureCatalog) {
+        return json({ ok: false, error: "catalog ensure not wired on this host" }, 501);
+      }
+      try {
+        const catalog = await deps.ensureCatalog(request);
+        return json({
+          ok: catalog.ok,
+          integration: "browser",
+          connection: "desktop",
+          address: "tools.browser.user.desktop",
+          ...catalog,
+        });
+      } catch (e) {
+        return json({ ok: false, error: String((e as Error)?.message || e) }, 500);
+      }
     }
 
     // GET /sessions

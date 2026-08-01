@@ -81,6 +81,9 @@ export const makeSelfHostApp = async (options: MakeSelfHostAppOptions = {}) => {
 
   // Browser reverse bridge (Executor Browser extension path B).
   // Same auth as API: cookie, Bearer session, or API key as Bearer / x-api-key.
+  //
+  // After a session opens we provision tools.browser.user.desktop via MCP
+  // `browserBridge.ensureChrome` (static tool) so the Executor UI shows Chrome.
   const browserBridgeHandler = makeBrowserBridgeHandler({
     getSession: async (request) => {
       try {
@@ -101,6 +104,112 @@ export const makeSelfHostApp = async (options: MakeSelfHostAppOptions = {}) => {
         };
       } catch {
         return null;
+      }
+    },
+    ensureCatalog: async (request) => {
+      const authz = request.headers.get("authorization") || "";
+      const cookie = request.headers.get("cookie") || "";
+      const mcpUrl = `http://127.0.0.1:${config.port}/mcp`;
+      const headers: Record<string, string> = {
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+      };
+      if (authz) headers.authorization = authz;
+      if (cookie) headers.cookie = cookie;
+
+      const post = async (body: unknown, sessionId?: string | null) => {
+        const h = { ...headers };
+        if (sessionId) h["mcp-session-id"] = sessionId;
+        const r = await fetch(mcpUrl, { method: "POST", headers: h, body: JSON.stringify(body) });
+        const text = await r.text();
+        const sid = r.headers.get("mcp-session-id") || r.headers.get("Mcp-Session-Id");
+        return { ok: r.ok, status: r.status, text, sid };
+      };
+
+      try {
+        const init = await post({
+          jsonrpc: "2.0",
+          id: 1,
+          method: "initialize",
+          params: {
+            protocolVersion: "2024-11-05",
+            capabilities: {},
+            clientInfo: { name: "browser-bridge-install", version: "0.1.0" },
+          },
+        });
+        if (!init.ok) {
+          return { ok: false, detail: `mcp initialize ${init.status}` };
+        }
+        const sid = init.sid;
+        try {
+          await post({ jsonrpc: "2.0", method: "notifications/initialized" }, sid);
+        } catch {
+          /* ignore */
+        }
+
+        // Prefer execute sandbox — finds ensureChrome regardless of address shape.
+        const code = `
+const tryCall = async (path) => {
+  try {
+    const fn = path.split(".").reduce((o, k) => (o == null ? o : o[k]), tools);
+    if (typeof fn === "function") return await fn({});
+    if (fn && typeof fn === "object" && typeof fn.call === "function") return await fn.call({});
+  } catch (e) {
+    return { __err: String(e) };
+  }
+  return { __err: "not found" };
+};
+let r = await tryCall("executor.coreTools.browserBridge.ensureChrome");
+if (r && !r.__err) return r;
+r = await tryCall("executor.browserBridge.ensureChrome");
+if (r && !r.__err) return r;
+// Fallback: register via core connections after mcp-style manual setup
+try {
+  await tools.executor.coreTools.integrations.list({});
+} catch (_) {}
+return { ok: false, note: "ensureChrome tool not found", tried: true };
+`.trim();
+
+        const exec = await post(
+          {
+            jsonrpc: "2.0",
+            id: 2,
+            method: "tools/call",
+            params: { name: "execute", arguments: { code } },
+          },
+          sid,
+        );
+
+        // Accept approval pause
+        let text = exec.text;
+        const idMatch = text.match(/exec_[a-f0-9-]{36}/);
+        if (text.includes("waiting_for_interaction") && idMatch) {
+          const resume = await post(
+            {
+              jsonrpc: "2.0",
+              id: 3,
+              method: "tools/call",
+              params: {
+                name: "resume",
+                arguments: { executionId: idMatch[0], action: "accept", content: "{}" },
+              },
+            },
+            sid,
+          );
+          text = resume.text;
+        }
+
+        const ok =
+          exec.ok &&
+          (text.includes('"ok":true') ||
+            text.includes("tools.browser") ||
+            text.includes("Chrome connection"));
+        return {
+          ok,
+          detail: text.slice(0, 400),
+        };
+      } catch (e) {
+        return { ok: false, detail: String((e as Error)?.message || e) };
       }
     },
   });

@@ -86,12 +86,17 @@ async function runTool(
 
   if (name === "status") {
     const sessions = listSessionsForUser(userId).map(sessionPublicView);
+    const live = sessions[0];
     return {
       sessions,
+      live: Boolean(live),
+      extension: live?.client ?? null,
+      tools: (live?.capabilities as { tools?: string[] } | undefined)?.tools ?? [],
+      pendingJobs: live?.pending ?? 0,
       note:
         sessions.length === 0
           ? "No live reverse session. Open Executor Browser → Connect (path B)."
-          : `${sessions.length} session(s) live`,
+          : `${sessions.length} session(s) live · ${live?.client && typeof live.client === "object" && "name" in live.client ? String((live.client as { name?: string }).name) : "extension"}`,
     };
   }
   if (name === "call") {
@@ -202,16 +207,28 @@ export const browserBridgePlugin = definePlugin((options: BrowserBridgePluginOpt
         const sessions = listSessionsForUser(userId);
         if (sessions.length === 0) {
           return {
+            // Must use HealthStatus vocab: healthy | expired | degraded | unknown
             status: "degraded" as const,
             checkedAt: Date.now(),
-            detail: "No live reverse session. Open Executor Browser → Connect (path B).",
+            detail:
+              "No live reverse session. Open Executor Browser extension → Connect (path B).",
           };
         }
         const s = sessions[0]!;
+        const client = (s.client || {}) as { name?: string; version?: string };
+        const caps = (s.capabilities || {}) as { tools?: string[] };
+        const toolN = caps.tools?.length ?? 0;
         return {
-          status: "ok" as const,
+          status: "healthy" as const,
           checkedAt: Date.now(),
-          detail: `Reverse session live · ${s.id.slice(0, 12)}…`,
+          detail: [
+            `Reverse live · session ${s.id.slice(0, 12)}…`,
+            client.name ? `ext ${client.name}@${client.version || "?"}` : null,
+            toolN ? `${toolN} tools` : null,
+            `lastSeen ${new Date(s.lastSeenAt).toISOString()}`,
+          ]
+            .filter(Boolean)
+            .join(" · "),
         };
       }),
 

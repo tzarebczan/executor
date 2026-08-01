@@ -1,10 +1,9 @@
 /**
  * Chrome desktop reverse channel (path B).
  *
- * Visibility strategy:
- * 1) Static integration `browser` — always in the catalog / tools list (no connection required).
- * 2) `ensureChrome` — also creates DB connection tools.browser.user.desktop for Connections UI + agents.
- * 3) resolveTools/invokeTool — power that connection once it exists.
+ * One catalog entry only: DB integration `browser` + connection `desktop`
+ * (created by ensureChrome). No static `browser` integration — that duplicated
+ * the row in the UI with no status dot.
  */
 
 import {
@@ -47,7 +46,6 @@ const InstallOutput = Schema.Struct({
 const InstallOutputStd = schemaToStaticToolSchema(InstallOutput);
 
 type OwnerLike = { readonly tenant: string; readonly subject: string | null };
-type ExecCtx = { readonly ctx: { readonly owner: OwnerLike } };
 
 function userIdFromOwner(owner: OwnerLike): string {
   return String(owner.subject || owner.tenant || "anonymous");
@@ -57,12 +55,13 @@ const TOOL_CATALOG: readonly ToolDef[] = [
   { name: ToolName.make("status"), description: "List live reverse-bridge sessions." },
   {
     name: ToolName.make("call"),
-    description: "Invoke browser tool: ping|tabs.list|tabs.open|navigate|snapshot|click|type|screenshot.",
+    description:
+      "Invoke browser tool: ping|tabs.list|tabs.open|navigate|snapshot|click|type|screenshot.",
   },
   { name: ToolName.make("snapshot"), description: "A11y-ish DOM snapshot (prefer over screenshot)." },
-  { name: ToolName.make("navigate"), description: "Navigate or open URL. Args: { url, newTab? }." },
+  { name: ToolName.make("navigate"), description: "Navigate to URL. Args: { url, newTab? }." },
   { name: ToolName.make("click"), description: "Click by x/y, selector, or nodeIndex." },
-  { name: ToolName.make("type"), description: "Type into focused field. Args: { text, selector?, submit? }." },
+  { name: ToolName.make("type"), description: "Type text. Args: { text, selector?, submit? }." },
   { name: ToolName.make("tabs_list"), description: "List Executor agent-group tabs." },
   { name: ToolName.make("tabs_open"), description: "Open URL in agent-group tab." },
   { name: ToolName.make("screenshot"), description: "JPEG of active tab." },
@@ -79,7 +78,6 @@ async function runTool(
   args: Record<string, unknown> | undefined,
   timeoutMs: number,
 ): Promise<unknown> {
-  // Map static-friendly names to extension tool names
   const map: Record<string, string> = {
     tabs_list: "tabs.list",
     tabs_open: "tabs.open",
@@ -109,70 +107,6 @@ async function runTool(
   return callTool({ userId, tool: name, args: args || {}, timeoutMs });
 }
 
-function staticBrowserTools(timeoutMs: number) {
-  const exec =
-    (toolName: string) =>
-    (args: unknown, context: ExecCtx) =>
-      Effect.tryPromise({
-        try: () =>
-          runTool(
-            userIdFromOwner(context.ctx.owner),
-            toolName,
-            (args || {}) as Record<string, unknown>,
-            timeoutMs,
-          ),
-        catch: (e) => e as Error,
-      });
-
-  return [
-    tool({
-      name: "status",
-      description: "List live reverse-bridge sessions for this user.",
-      execute: exec("status"),
-    }),
-    tool({
-      name: "snapshot",
-      description: "DOM/a11y snapshot of the active agent tab.",
-      execute: exec("snapshot"),
-    }),
-    tool({
-      name: "navigate",
-      description: "Navigate to a URL (args: { url, newTab? }).",
-      execute: exec("navigate"),
-    }),
-    tool({
-      name: "click",
-      description: "Click by coordinates, selector, or nodeIndex.",
-      execute: exec("click"),
-    }),
-    tool({
-      name: "type",
-      description: "Type text (args: { text, selector?, submit? }).",
-      execute: exec("type"),
-    }),
-    tool({
-      name: "tabs_list",
-      description: "List tabs in the Executor agent group.",
-      execute: exec("tabs_list"),
-    }),
-    tool({
-      name: "tabs_open",
-      description: "Open a URL in the agent tab group.",
-      execute: exec("tabs_open"),
-    }),
-    tool({
-      name: "screenshot",
-      description: "Capture the active tab as JPEG.",
-      execute: exec("screenshot"),
-    }),
-    tool({
-      name: "ping",
-      description: "Ping the reverse bridge.",
-      execute: exec("ping"),
-    }),
-  ];
-}
-
 function ensureChromeEffect(ctx: PluginCtx) {
   const slug = IntegrationSlug.make(BROWSER_INTEGRATION_SLUG);
   const connName = ConnectionName.make(BROWSER_CONNECTION_NAME);
@@ -187,6 +121,7 @@ function ensureChromeEffect(ctx: PluginCtx) {
       canRefresh: true,
     });
 
+    // Effect v4: catchAll is gone — use catch / orElseSucceed
     const created = yield* ctx.connections
       .create({
         owner: "user",
@@ -197,28 +132,26 @@ function ensureChromeEffect(ctx: PluginCtx) {
       })
       .pipe(
         Effect.map(() => true),
-        Effect.catchAll((err) => {
-          // already exists is fine
-          console.warn("[browser-bridge] connections.create:", String(err));
-          return Effect.succeed(false);
-        }),
+        Effect.catch(() => Effect.succeed(false)),
       );
 
-    // Force tool catalog materialization for the connection
-    yield* ctx.connections.refresh({
-      owner: "user",
-      integration: slug,
-      name: connName,
-    }).pipe(Effect.catchAll(() => Effect.void));
+    yield* ctx.connections
+      .refresh({
+        owner: "user",
+        integration: slug,
+        name: connName,
+      })
+      .pipe(Effect.catch(() => Effect.void));
 
+    const sessions = listSessionsForUser(userIdFromOwner(ctx.owner));
     return {
       ok: true,
       integration: BROWSER_INTEGRATION_SLUG,
       connection: BROWSER_CONNECTION_NAME,
       address: "tools.browser.user.desktop",
       note: created
-        ? "Chrome connection created — appears under Connections."
-        : "Chrome connection ensured (may already exist).",
+        ? `Chrome connection created.${sessions.length ? " Reverse session live." : " Connect extension for green status."}`
+        : `Chrome connection ensured.${sessions.length ? " Reverse session live." : " Connect extension for green status."}`,
     };
   });
 }
@@ -286,17 +219,9 @@ export const browserBridgePlugin = definePlugin((options: BrowserBridgePluginOpt
       ensureChrome: () => ensureChromeEffect(ctx),
     }),
 
+    // Only installer under executor — do NOT also declare static id "browser"
+    // (that duplicated the catalog row with no health dot).
     staticIntegrations: (self: { ensureChrome: () => Effect.Effect<unknown> }) => [
-      // Always-visible tools (Integrations / tool search) — no DB connection needed
-      {
-        id: "browser",
-        kind: "browser-bridge" as const,
-        name: "Chrome (Executor Browser)",
-        canRemove: false,
-        canRefresh: true,
-        tools: staticBrowserTools(defaultTimeout),
-      },
-      // Installer under executor namespace so reverse session can provision Connections row
       {
         id: "browserBridge",
         kind: "executor" as const,
@@ -305,7 +230,7 @@ export const browserBridgePlugin = definePlugin((options: BrowserBridgePluginOpt
           tool({
             name: "ensureChrome",
             description:
-              "Create Chrome (Executor Browser) integration + tools.browser.user.desktop connection for this user.",
+              "Create Chrome (Executor Browser) integration + tools.browser.user.desktop for this user.",
             outputSchema: InstallOutputStd,
             execute: () =>
               self.ensureChrome() as Effect.Effect<{

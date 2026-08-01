@@ -3,8 +3,10 @@
 name: selfhost-image
 
 on:
+  # Single lab image branch only — do not also list feat/* or we double-run
+  # every time we force-push the same SHA to two branches.
   push:
-    branches: [lab, feat/browser-bridge-reverse, main]
+    branches: [lab]
     paths:
       - "apps/host-selfhost/**"
       - "packages/**"
@@ -43,7 +45,7 @@ jobs:
         with:
           images: ${{ env.IMAGE }}
           tags: |
-            type=raw,value=lab,enable=${{ github.ref == 'refs/heads/lab' || github.ref == 'refs/heads/feat/browser-bridge-reverse' || github.event_name == 'workflow_dispatch' }}
+            type=raw,value=lab,enable=true
             type=sha,prefix=sha-,format=short
             type=raw,value=latest,enable=${{ github.ref == 'refs/heads/lab' }}
 

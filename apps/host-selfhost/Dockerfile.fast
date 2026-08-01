@@ -1,0 +1,51 @@
+# Faster iterative builds: BuildKit cache mounts for bun install.
+# Same runtime result as Dockerfile; use from scripts/build-selfhost-local.sh
+# via: DOCKERFILE=apps/host-selfhost/Dockerfile.fast ./scripts/build-selfhost-local.sh
+#
+#   docker buildx build -f apps/host-selfhost/Dockerfile.fast -t executor-selfhost .
+
+# syntax=docker/dockerfile:1.6
+
+FROM oven/bun:1 AS prod-deps
+WORKDIR /app
+COPY package.json bun.lock ./
+COPY apps/host-selfhost/package.json apps/host-selfhost/
+COPY packages ./packages
+COPY apps ./apps
+COPY scripts ./scripts
+# Cache bun global + install dir across builds
+RUN --mount=type=cache,target=/root/.bun/install/cache \
+    bun install --frozen-lockfile --production --ignore-scripts --filter @executor-js/host-selfhost \
+ && bun run apps/host-selfhost/scripts/package-runtime.ts
+
+FROM oven/bun:1 AS build
+WORKDIR /app
+COPY package.json bun.lock ./
+COPY apps/host-selfhost/package.json apps/host-selfhost/
+COPY packages ./packages
+COPY apps ./apps
+COPY scripts ./scripts
+# Full monorepo copy for vite build assets
+COPY . .
+RUN --mount=type=cache,target=/root/.bun/install/cache \
+    bun install --frozen-lockfile \
+ && cd apps/host-selfhost && bun run build
+
+FROM gcr.io/distroless/cc-debian12 AS runtime
+WORKDIR /app
+LABEL org.opencontainers.image.source="https://github.com/tzarebczan/executor" \
+      org.opencontainers.image.description="Lab self-hosted Executor (browser-bridge)" \
+      org.opencontainers.image.licenses="MIT"
+ENV NODE_ENV=production \
+    EXECUTOR_HOST=0.0.0.0 \
+    PORT=4788 \
+    EXECUTOR_DATA_DIR=/data
+COPY --from=prod-deps /usr/local/bin/bun /usr/local/bin/bun
+COPY --from=prod-deps /app/.selfhost-runtime /app
+COPY --from=build /app/apps/host-selfhost/dist /app/apps/host-selfhost/dist
+WORKDIR /app/apps/host-selfhost
+VOLUME ["/data"]
+EXPOSE 4788
+HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=5 \
+  CMD bun -e "fetch('http://127.0.0.1:4788/api/health').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"
+CMD ["bun", "run", "dist-server/serve.js"]

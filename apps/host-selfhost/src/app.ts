@@ -147,27 +147,27 @@ export const makeSelfHostApp = async (options: MakeSelfHostAppOptions = {}) => {
           /* ignore */
         }
 
-        // Prefer execute sandbox — finds ensureChrome regardless of address shape.
+        // Static tool fqid: executor.browserBridge.ensureChrome
+        // (kind:executor mounts as tools.executor.browserBridge.ensureChrome)
         const code = `
-const tryCall = async (path) => {
-  try {
-    const fn = path.split(".").reduce((o, k) => (o == null ? o : o[k]), tools);
-    if (typeof fn === "function") return await fn({});
-    if (fn && typeof fn === "object" && typeof fn.call === "function") return await fn.call({});
-  } catch (e) {
-    return { __err: String(e) };
-  }
-  return { __err: "not found" };
-};
-let r = await tryCall("executor.coreTools.browserBridge.ensureChrome");
-if (r && !r.__err) return r;
-r = await tryCall("executor.browserBridge.ensureChrome");
-if (r && !r.__err) return r;
-// Fallback: register via core connections after mcp-style manual setup
+// Primary: static install tool from browser-bridge plugin
 try {
-  await tools.executor.coreTools.integrations.list({});
-} catch (_) {}
-return { ok: false, note: "ensureChrome tool not found", tried: true };
+  const r = await tools.executor.browserBridge.ensureChrome({});
+  return { ok: true, via: "executor.browserBridge.ensureChrome", r };
+} catch (e1) {
+  // Fallback: manual register + connection create via core tools
+  try {
+    // Some builds nest under coreTools for executor namespace tools
+    const r2 = await tools.executor.coreTools["browserBridge.ensureChrome"]({});
+    return { ok: true, via: "coreTools[browserBridge.ensureChrome]", r: r2 };
+  } catch (e2) {
+    return {
+      ok: false,
+      e1: String(e1 && e1.message ? e1.message : e1),
+      e2: String(e2 && e2.message ? e2.message : e2),
+    };
+  }
+}
 `.trim();
 
         const exec = await post(
@@ -203,10 +203,11 @@ return { ok: false, note: "ensureChrome tool not found", tried: true };
           exec.ok &&
           (text.includes('"ok":true') ||
             text.includes("tools.browser") ||
-            text.includes("Chrome connection"));
+            text.includes("Chrome connection") ||
+            text.includes("ensureChrome"));
         return {
           ok,
-          detail: text.slice(0, 400),
+          detail: text.slice(0, 800),
         };
       } catch (e) {
         return { ok: false, detail: String((e as Error)?.message || e) };

@@ -1,3 +1,5 @@
+/* oxlint-disable executor/no-try-catch-or-throw, executor/no-unknown-error-message -- boundary: this Fetch adapter converts untyped request and long-poll failures into generic HTTP responses */
+
 /**
  * HTTP surface for Executor Browser extension reverse channel.
  *
@@ -6,11 +8,9 @@
  *   POST   /api/browser-bridge/session/:id/result
  *   DELETE /api/browser-bridge/session/:id
  *   GET    /api/browser-bridge/sessions
- *   POST   /api/browser-bridge/call
  */
 
 import {
-  callTool,
   createSession,
   deleteSession,
   getSession,
@@ -99,12 +99,12 @@ export function makeBrowserBridgeHandler(deps: BrowserBridgeHttpDeps) {
         try {
           catalog = await deps.ensureCatalog(request);
         } catch (e) {
-          catalog = { ok: false, detail: String((e as Error)?.message || e) };
+          catalog = { ok: false, detail: String(e) };
         }
       }
 
       return json({
-        sessionId: session.id,
+        ...sessionPublicView(session),
         id: session.id,
         pollPath: `/api/browser-bridge/session/${session.id}/jobs`,
         resultPath: `/api/browser-bridge/session/${session.id}/result`,
@@ -113,7 +113,6 @@ export function makeBrowserBridgeHandler(deps: BrowserBridgeHttpDeps) {
         connection: "desktop",
         address: "tools.browser.user.desktop",
         catalog,
-        ...sessionPublicView(session),
       });
     }
 
@@ -125,14 +124,13 @@ export function makeBrowserBridgeHandler(deps: BrowserBridgeHttpDeps) {
       try {
         const catalog = await deps.ensureCatalog(request);
         return json({
-          ok: catalog.ok,
+          ...catalog,
           integration: "browser",
           connection: "desktop",
           address: "tools.browser.user.desktop",
-          ...catalog,
         });
       } catch (e) {
-        return json({ ok: false, error: String((e as Error)?.message || e) }, 500);
+        return json({ ok: false, error: String(e) }, 500);
       }
     }
 
@@ -141,29 +139,6 @@ export function makeBrowserBridgeHandler(deps: BrowserBridgeHttpDeps) {
       return json({
         sessions: listSessionsForUser(userId).map(sessionPublicView),
       });
-    }
-
-    // POST /call  — agent/HTTP convenience
-    if (path === "/call" && request.method === "POST") {
-      const body = (await readJson(request)) as {
-        tool?: string;
-        args?: Record<string, unknown>;
-        sessionId?: string;
-        timeoutMs?: number;
-      } | null;
-      if (!body?.tool) return badRequest("tool required");
-      try {
-        const result = await callTool({
-          userId,
-          tool: body.tool,
-          args: body.args,
-          sessionId: body.sessionId,
-          timeoutMs: body.timeoutMs,
-        });
-        return json({ ok: true, result });
-      } catch (e) {
-        return json({ ok: false, error: String((e as Error)?.message || e) }, 504);
-      }
     }
 
     // /session/:id/...
@@ -189,7 +164,7 @@ export function makeBrowserBridgeHandler(deps: BrowserBridgeHttpDeps) {
           const jobs = await takeJobs(sessionId, userId, waitMs);
           return json({ jobs });
         } catch (e) {
-          return notFound(String((e as Error)?.message || e));
+          return notFound(String(e));
         }
       }
 

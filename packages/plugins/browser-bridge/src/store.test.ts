@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { beforeEach, describe, expect, it } from "@effect/vitest";
 import {
   _resetStoreForTests,
   callTool,
@@ -36,5 +36,23 @@ describe("browser-bridge store", () => {
 
   it("rejects call without session", async () => {
     await expect(callTool({ userId: "nobody", tool: "ping" })).rejects.toThrow(/No live/);
+  });
+
+  it("rejects postResult for another user", async () => {
+    const s = createSession({ userId: "u1" });
+    const callP = callTool({ userId: "u1", tool: "ping", args: {} });
+    const jobs = await takeJobs(s.id, "u1", 2000);
+    expect(postResult(s.id, "u2", jobs[0]!.id, { ok: true })).toBe(false);
+    expect(postResult(s.id, "u1", jobs[0]!.id, { ok: true })).toBe(true);
+    await expect(callP).resolves.toEqual({ ok: true });
+  });
+
+  it("rejects oversized results", async () => {
+    const s = createSession({ userId: "u1" });
+    const callP = callTool({ userId: "u1", tool: "screenshot", args: {} });
+    const jobs = await takeJobs(s.id, "u1", 2000);
+    const huge = "x".repeat(7 * 1024 * 1024);
+    expect(postResult(s.id, "u1", jobs[0]!.id, { dataUrl: huge })).toBe(true);
+    await expect(callP).rejects.toThrow(/too large/);
   });
 });

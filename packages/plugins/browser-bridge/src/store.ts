@@ -1,8 +1,11 @@
+/* oxlint-disable executor/no-error-constructor, executor/no-promise-reject -- boundary: the in-memory long-poll adapter exposes Promise rejection to HTTP and plugin callers */
+
 /**
  * In-process reverse browser-bridge sessions.
  *
  * Extension (path B) opens a session and long-polls for jobs.
- * Agents enqueue tools via plugin tools or POST /call and wait for results.
+ * Agents enqueue tools via plugin tools (tools.browser.user.desktop.*) and wait for results.
+ * There is no raw HTTP /browser-bridge/call — only session/jobs/result.
  */
 
 export type BridgeJob = {
@@ -39,6 +42,8 @@ export type BridgeSession = {
 
 const SESSION_TTL_MS = 15 * 60 * 1000;
 const DEFAULT_CALL_TIMEOUT_MS = 45_000;
+/** Cap reverse-bridge result payload (screenshots are base64 JPEG). */
+export const MAX_RESULT_JSON_BYTES = 6 * 1024 * 1024;
 
 const sessions = new Map<string, BridgeSession>();
 
@@ -209,9 +214,32 @@ export function postResult(
   const s = getSession(sessionId);
   if (!s || s.userId !== userId) return false;
   touch(s);
+  try {
+    const encoded = JSON.stringify(result ?? null);
+    if (encoded.length > MAX_RESULT_JSON_BYTES) {
+      const err = new Error(
+        `browser tool result too large (${encoded.length} bytes; max ${MAX_RESULT_JSON_BYTES})`,
+      );
+      const job = s.inflight.get(jobId);
+      if (job) {
+        s.inflight.delete(jobId);
+        job.reject(err);
+        return true;
+      }
+      const idx = s.pending.findIndex((j) => j.id === jobId);
+      if (idx >= 0) {
+        const j = s.pending.splice(idx, 1)[0]!;
+        j.reject(err);
+        return true;
+      }
+      return false;
+    }
+  } catch {
+    return false;
+  }
   const job = s.inflight.get(jobId);
   if (!job) {
-    // maybe still pending (race)
+    // maybe still pending (race) — only accept if owned by this session/user
     const idx = s.pending.findIndex((j) => j.id === jobId);
     if (idx >= 0) {
       const j = s.pending.splice(idx, 1)[0]!;

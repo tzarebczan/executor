@@ -45,31 +45,286 @@ const InstallOutput = Schema.Struct({
 });
 const InstallOutputStd = schemaToStaticToolSchema(InstallOutput);
 
+const noArgsSchema = {
+  type: "object",
+  additionalProperties: false,
+} as const;
+
+const tabTargetProperties = {
+  tabId: { type: "integer", minimum: 0 },
+} as const;
+
+const tabTargetSchema = {
+  type: "object",
+  properties: tabTargetProperties,
+  additionalProperties: false,
+} as const;
+
+const urlSchema = {
+  type: "string",
+  pattern: "^https?://",
+} as const;
+
+const approval = (description: string) => ({
+  requiresApproval: true,
+  approvalDescription: description,
+});
+
+/** Prefer discrete tools; `call` re-validates args against the target tool schema. */
+export const INNER_BROWSER_TOOLS = [
+  "ping",
+  "tabs.list",
+  "tabs.open",
+  "navigate",
+  "snapshot",
+  "click",
+  "type",
+  "screenshot",
+] as const;
+
+export type InnerBrowserTool = (typeof INNER_BROWSER_TOOLS)[number];
+
+/** Session is degraded if extension has not polled within this window. */
+export const SESSION_STALE_MS = 90_000;
+
 type OwnerLike = { readonly tenant: string; readonly subject: string | null };
 
 function userIdFromOwner(owner: OwnerLike): string {
   return String(owner.subject || owner.tenant || "anonymous");
 }
 
-const TOOL_CATALOG: readonly ToolDef[] = [
-  { name: ToolName.make("status"), description: "List live reverse-bridge sessions." },
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function assertHttpUrl(url: unknown, field = "url"): string {
+  if (typeof url !== "string" || !url.trim()) {
+    throw new Error(`${field} is required`);
+  }
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    throw new Error(`${field} must be a valid http(s) URL`);
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error(`${field} must use http or https`);
+  }
+  return url;
+}
+
+function assertOptionalTabId(args: Record<string, unknown>): void {
+  if (args.tabId === undefined) return;
+  if (typeof args.tabId !== "number" || !Number.isInteger(args.tabId) || args.tabId < 0) {
+    throw new Error("tabId must be a non-negative integer");
+  }
+}
+
+/**
+ * Validate generic `call` payload so it cannot bypass per-tool input rules.
+ * Returns normalized { tool, args } for the reverse bridge.
+ */
+export function validateInnerCall(
+  toolRaw: unknown,
+  argsRaw: unknown,
+): { tool: InnerBrowserTool; args: Record<string, unknown> } {
+  const tool = String(toolRaw || "");
+  if (!(INNER_BROWSER_TOOLS as readonly string[]).includes(tool)) {
+    throw new Error(
+      `Unknown or disallowed tool "${tool}". Use one of: ${INNER_BROWSER_TOOLS.join(", ")}`,
+    );
+  }
+  const args = argsRaw === undefined || argsRaw === null ? {} : argsRaw;
+  if (!isPlainObject(args)) {
+    throw new Error("args must be an object");
+  }
+  // Reject unexpected top-level keys per tool (defense in depth)
+  const only = (allowed: string[]) => {
+    for (const key of Object.keys(args)) {
+      if (!allowed.includes(key)) {
+        throw new Error(`Unexpected arg "${key}" for ${tool}`);
+      }
+    }
+  };
+
+  switch (tool as InnerBrowserTool) {
+    case "ping":
+    case "tabs.list":
+      only([]);
+      return { tool, args: {} };
+    case "snapshot":
+    case "screenshot":
+      only(["tabId"]);
+      assertOptionalTabId(args);
+      return { tool, args: args.tabId === undefined ? {} : { tabId: args.tabId } };
+    case "tabs.open": {
+      only(["url", "active"]);
+      const url = assertHttpUrl(args.url);
+      const out: Record<string, unknown> = { url };
+      if (args.active !== undefined) {
+        if (typeof args.active !== "boolean") throw new Error("active must be boolean");
+        out.active = args.active;
+      }
+      return { tool, args: out };
+    }
+    case "navigate": {
+      only(["tabId", "url", "newTab"]);
+      assertOptionalTabId(args);
+      const url = assertHttpUrl(args.url);
+      const out: Record<string, unknown> = { url };
+      if (args.tabId !== undefined) out.tabId = args.tabId;
+      if (args.newTab !== undefined) {
+        if (typeof args.newTab !== "boolean") throw new Error("newTab must be boolean");
+        out.newTab = args.newTab;
+      }
+      return { tool, args: out };
+    }
+    case "click": {
+      only(["tabId", "x", "y", "selector", "nodeIndex"]);
+      assertOptionalTabId(args);
+      const hasTarget =
+        args.selector != null ||
+        args.nodeIndex != null ||
+        (args.x != null && args.y != null);
+      if (!hasTarget) {
+        throw new Error("click requires selector, nodeIndex, or x+y");
+      }
+      if (args.selector !== undefined && (typeof args.selector !== "string" || !args.selector)) {
+        throw new Error("selector must be a non-empty string");
+      }
+      if (args.nodeIndex !== undefined) {
+        if (
+          typeof args.nodeIndex !== "number" ||
+          !Number.isInteger(args.nodeIndex) ||
+          args.nodeIndex < 0 ||
+          args.nodeIndex > 199
+        ) {
+          throw new Error("nodeIndex must be an integer 0–199");
+        }
+      }
+      if (args.x !== undefined && typeof args.x !== "number") throw new Error("x must be a number");
+      if (args.y !== undefined && typeof args.y !== "number") throw new Error("y must be a number");
+      return { tool, args: { ...args } };
+    }
+    case "type": {
+      only(["tabId", "text", "selector", "submit"]);
+      assertOptionalTabId(args);
+      if (typeof args.text !== "string") throw new Error("text is required");
+      if (args.selector !== undefined && (typeof args.selector !== "string" || !args.selector)) {
+        throw new Error("selector must be a non-empty string");
+      }
+      if (args.submit !== undefined && typeof args.submit !== "boolean") {
+        throw new Error("submit must be boolean");
+      }
+      return { tool, args: { ...args } };
+    }
+    default:
+      throw new Error(`Unhandled tool ${tool}`);
+  }
+}
+
+export const BROWSER_TOOL_CATALOG: readonly ToolDef[] = [
+  {
+    name: ToolName.make("status"),
+    description: "List live reverse-bridge sessions.",
+    inputSchema: noArgsSchema,
+  },
   {
     name: ToolName.make("call"),
     description:
-      "Invoke browser tool: ping|tabs.list|tabs.open|navigate|snapshot|click|type|screenshot.",
+      "Generic bridge invoke. Prefer discrete tools. Args are re-validated against the target tool schema (no schema bypass).",
+    inputSchema: {
+      type: "object",
+      properties: {
+        tool: {
+          type: "string",
+          enum: [...INNER_BROWSER_TOOLS],
+        },
+        args: { type: "object", additionalProperties: true },
+        sessionId: { type: "string", minLength: 1 },
+        timeoutMs: { type: "integer", minimum: 1_000, maximum: 120_000 },
+      },
+      required: ["tool"],
+      additionalProperties: false,
+    },
+    // Always approve: target may be mutating or screenshot (sensitive)
+    annotations: approval("Run a browser operation through the generic bridge call"),
   },
-  { name: ToolName.make("snapshot"), description: "A11y-ish DOM snapshot (prefer over screenshot)." },
-  { name: ToolName.make("navigate"), description: "Navigate to URL. Args: { url, newTab? }." },
-  { name: ToolName.make("click"), description: "Click by x/y, selector, or nodeIndex." },
-  { name: ToolName.make("type"), description: "Type text. Args: { text, selector?, submit? }." },
-  { name: ToolName.make("tabs_list"), description: "List Executor agent-group tabs." },
-  { name: ToolName.make("tabs_open"), description: "Open URL in agent-group tab." },
-  { name: ToolName.make("screenshot"), description: "JPEG of active tab." },
-  { name: ToolName.make("ping"), description: "Liveness check." },
+  {
+    name: ToolName.make("snapshot"),
+    description: "A11y-ish DOM snapshot (prefer over screenshot).",
+    inputSchema: tabTargetSchema,
+  },
+  {
+    name: ToolName.make("navigate"),
+    description: "Navigate an Executor-group tab to an HTTP(S) URL.",
+    inputSchema: {
+      type: "object",
+      properties: { ...tabTargetProperties, url: urlSchema, newTab: { type: "boolean" } },
+      required: ["url"],
+      additionalProperties: false,
+    },
+    annotations: approval("Navigate the user's Executor browser tab"),
+  },
+  {
+    name: ToolName.make("click"),
+    description: "Click by coordinates, selector, or snapshot node index.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ...tabTargetProperties,
+        x: { type: "number" },
+        y: { type: "number" },
+        selector: { type: "string", minLength: 1 },
+        nodeIndex: { type: "integer", minimum: 0, maximum: 199 },
+      },
+      additionalProperties: false,
+    },
+    annotations: approval("Click an element in the user's Executor browser tab"),
+  },
+  {
+    name: ToolName.make("type"),
+    description: "Type text into an input in an Executor-group tab.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        ...tabTargetProperties,
+        text: { type: "string" },
+        selector: { type: "string", minLength: 1 },
+        submit: { type: "boolean" },
+      },
+      required: ["text"],
+      additionalProperties: false,
+    },
+    annotations: approval("Type into the user's Executor browser tab"),
+  },
+  {
+    name: ToolName.make("tabs_list"),
+    description: "List Executor agent-group tabs.",
+    inputSchema: noArgsSchema,
+  },
+  {
+    name: ToolName.make("tabs_open"),
+    description: "Open an HTTP(S) URL in a new Executor-group tab.",
+    inputSchema: {
+      type: "object",
+      properties: { url: urlSchema, active: { type: "boolean" } },
+      required: ["url"],
+      additionalProperties: false,
+    },
+    annotations: approval("Open a new Executor browser tab"),
+  },
+  {
+    name: ToolName.make("screenshot"),
+    description: "JPEG of an Executor-group tab (may show sensitive content).",
+    inputSchema: tabTargetSchema,
+    annotations: approval("Capture a screenshot of the user's Executor browser tab"),
+  },
+  { name: ToolName.make("ping"), description: "Liveness check.", inputSchema: noArgsSchema },
 ];
 
 function catalogResult(): ResolveToolsResult {
-  return { tools: [...TOOL_CATALOG] };
+  return { tools: [...BROWSER_TOOL_CATALOG] };
 }
 
 async function runTool(
@@ -101,12 +356,17 @@ async function runTool(
   }
   if (name === "call") {
     const body = args || {};
+    const timeoutOverride =
+      typeof body.timeoutMs === "number" && Number.isFinite(body.timeoutMs)
+        ? body.timeoutMs
+        : timeoutMs;
+    const validated = validateInnerCall(body.tool, body.args);
     return callTool({
       userId,
-      tool: String(body.tool || "ping"),
-      args: (body.args as Record<string, unknown>) || {},
-      sessionId: body.sessionId as string | undefined,
-      timeoutMs: (body.timeoutMs as number) || timeoutMs,
+      tool: validated.tool,
+      args: validated.args,
+      sessionId: typeof body.sessionId === "string" ? body.sessionId : undefined,
+      timeoutMs: timeoutOverride,
     });
   }
   return callTool({ userId, tool: name, args: args || {}, timeoutMs });
@@ -205,22 +465,34 @@ export const browserBridgePlugin = definePlugin((options: BrowserBridgePluginOpt
       Effect.sync(() => {
         const userId = userIdFromOwner(ctx.owner);
         const sessions = listSessionsForUser(userId);
+        const checkedAt = Date.now();
         if (sessions.length === 0) {
           return {
             // Must use HealthStatus vocab: healthy | expired | degraded | unknown
             status: "degraded" as const,
-            checkedAt: Date.now(),
-            detail:
-              "No live reverse session. Open Executor Browser extension → Connect (path B).",
+            checkedAt,
+            detail: "No live reverse session. Open Executor Browser extension → Connect (path B).",
           };
         }
         const s = sessions[0]!;
+        const ageMs = checkedAt - s.lastSeenAt;
         const client = (s.client || {}) as { name?: string; version?: string };
         const caps = (s.capabilities || {}) as { tools?: string[] };
         const toolN = caps.tools?.length ?? 0;
+        if (ageMs > SESSION_STALE_MS) {
+          return {
+            status: "degraded" as const,
+            checkedAt,
+            detail: [
+              `Reverse session stale (${Math.round(ageMs / 1000)}s since last poll)`,
+              `session ${s.id.slice(0, 12)}…`,
+              "Reconnect Executor Browser side panel.",
+            ].join(" · "),
+          };
+        }
         return {
           status: "healthy" as const,
-          checkedAt: Date.now(),
+          checkedAt,
           detail: [
             `Reverse live · session ${s.id.slice(0, 12)}…`,
             client.name ? `ext ${client.name}@${client.version || "?"}` : null,
@@ -238,7 +510,7 @@ export const browserBridgePlugin = definePlugin((options: BrowserBridgePluginOpt
 
     // Only installer under executor — do NOT also declare static id "browser"
     // (that duplicated the catalog row with no health dot).
-    staticIntegrations: (self: { ensureChrome: () => Effect.Effect<unknown> }) => [
+    staticIntegrations: (self) => [
       {
         id: "browserBridge",
         kind: "executor" as const,
@@ -249,14 +521,7 @@ export const browserBridgePlugin = definePlugin((options: BrowserBridgePluginOpt
             description:
               "Create Chrome (Executor Browser) integration + tools.browser.user.desktop for this user.",
             outputSchema: InstallOutputStd,
-            execute: () =>
-              self.ensureChrome() as Effect.Effect<{
-                ok: boolean;
-                integration: string;
-                connection: string;
-                address: string;
-                note: string;
-              }>,
+            execute: () => self.ensureChrome(),
           }),
         ],
       },

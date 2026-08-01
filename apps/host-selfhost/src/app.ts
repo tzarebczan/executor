@@ -86,6 +86,7 @@ export const makeSelfHostApp = async (options: MakeSelfHostAppOptions = {}) => {
   // `browserBridge.ensureChrome` (static tool) so the Executor UI shows Chrome.
   const browserBridgeHandler = makeBrowserBridgeHandler({
     getSession: async (request) => {
+      // oxlint-disable-next-line executor/no-try-catch-or-throw -- boundary: Better Auth reports malformed or unavailable sessions by rejecting
       try {
         let session = await betterAuth.auth.api.getSession({ headers: request.headers });
         if (!session) {
@@ -126,6 +127,7 @@ export const makeSelfHostApp = async (options: MakeSelfHostAppOptions = {}) => {
         return { ok: r.ok, status: r.status, text, sid };
       };
 
+      // oxlint-disable-next-line executor/no-try-catch-or-throw -- boundary: MCP catalog installation is a best-effort HTTP adapter operation
       try {
         const init = await post({
           jsonrpc: "2.0",
@@ -141,6 +143,7 @@ export const makeSelfHostApp = async (options: MakeSelfHostAppOptions = {}) => {
           return { ok: false, detail: `mcp initialize ${init.status}` };
         }
         const sid = init.sid;
+        // oxlint-disable-next-line executor/no-try-catch-or-throw -- boundary: MCP notification failure does not invalidate the initialized session
         try {
           await post({ jsonrpc: "2.0", method: "notifications/initialized" }, sid);
         } catch {
@@ -149,26 +152,7 @@ export const makeSelfHostApp = async (options: MakeSelfHostAppOptions = {}) => {
 
         // Static tool fqid: executor.browserBridge.ensureChrome
         // (kind:executor mounts as tools.executor.browserBridge.ensureChrome)
-        const code = `
-// Primary: static install tool from browser-bridge plugin
-try {
-  const r = await tools.executor.browserBridge.ensureChrome({});
-  return { ok: true, via: "executor.browserBridge.ensureChrome", r };
-} catch (e1) {
-  // Fallback: manual register + connection create via core tools
-  try {
-    // Some builds nest under coreTools for executor namespace tools
-    const r2 = await tools.executor.coreTools["browserBridge.ensureChrome"]({});
-    return { ok: true, via: "coreTools[browserBridge.ensureChrome]", r: r2 };
-  } catch (e2) {
-    return {
-      ok: false,
-      e1: String(e1 && e1.message ? e1.message : e1),
-      e2: String(e2 && e2.message ? e2.message : e2),
-    };
-  }
-}
-`.trim();
+        const code = "return tools.executor.browserBridge.ensureChrome({});";
 
         const exec = await post(
           {
@@ -180,24 +164,7 @@ try {
           sid,
         );
 
-        // Accept approval pause
-        let text = exec.text;
-        const idMatch = text.match(/exec_[a-f0-9-]{36}/);
-        if (text.includes("waiting_for_interaction") && idMatch) {
-          const resume = await post(
-            {
-              jsonrpc: "2.0",
-              id: 3,
-              method: "tools/call",
-              params: {
-                name: "resume",
-                arguments: { executionId: idMatch[0], action: "accept", content: "{}" },
-              },
-            },
-            sid,
-          );
-          text = resume.text;
-        }
+        const text = exec.text;
 
         const ok =
           exec.ok &&
@@ -210,7 +177,8 @@ try {
           detail: text.slice(0, 800),
         };
       } catch (e) {
-        return { ok: false, detail: String((e as Error)?.message || e) };
+        // oxlint-disable-next-line executor/no-unknown-error-message -- boundary: catalog installation reports a generic diagnostic to the extension
+        return { ok: false, detail: String(e) };
       }
     },
   });

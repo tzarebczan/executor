@@ -1,3 +1,5 @@
+/* oxlint-disable executor/no-promise-catch, executor/no-try-catch-or-throw, executor/no-error-constructor -- provider SDK and fetch adapter boundary normalizes third-party failures */
+
 import { AgentBrowser, type BrowserCommandResult } from "remote-agent-browser";
 
 export type CloudBrowserProvider =
@@ -48,6 +50,7 @@ export type CloudBrowserProviderConfig =
 export interface CloudBrowserHandle {
   readonly session: CloudBrowserSession;
   readonly connectionHeaders?: Readonly<Record<string, string>>;
+  readonly agentBrowser?: AgentBrowser;
   run?(command: string, args?: readonly string[]): Promise<BrowserCommandResult>;
   close(): Promise<void>;
 }
@@ -111,23 +114,38 @@ export async function createCloudBrowserSession(
         sessionId: browser.session,
         transport: "agent-browser",
       },
+      agentBrowser: browser,
       run: (command, args = []) => browser.exec(command, { args: [...args] }),
       close: () => browser.close(),
     };
   }
 
   if (config.provider === "cloudflare-browser-run") {
-    const keepAlive = Math.min(600_000, Math.max(60_000, config.keepAliveMs || 600_000));
+    const keepAlive = Math.min(1_200_000, Math.max(10_000, config.keepAliveMs || 600_000));
     const base = `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(config.accountId)}/browser-rendering/devtools/browser`;
-    const body = await jsonRequest(fetchImpl, `${base}?keep_alive=${keepAlive}`, {
+    const body = await jsonRequest(fetchImpl, `${base}?keep_alive=${keepAlive}&targets=true`, {
       method: "POST",
       headers: { authorization: `Bearer ${config.apiToken}` },
     });
     const sessionId = String(body.sessionId || "");
     const cdpUrl = String(body.webSocketDebuggerUrl || "");
+    const targets = Array.isArray(body.targets) ? body.targets : [];
+    const liveUrl = targets.find(
+      (target): target is { readonly devtoolsFrontendUrl: string } =>
+        typeof target === "object" &&
+        target !== null &&
+        "devtoolsFrontendUrl" in target &&
+        typeof target.devtoolsFrontendUrl === "string",
+    )?.devtoolsFrontendUrl;
     if (!sessionId || !cdpUrl) throw new Error("Cloudflare did not return a CDP session");
     return {
-      session: { provider: config.provider, sessionId, transport: "cdp", cdpUrl },
+      session: {
+        provider: config.provider,
+        sessionId,
+        transport: "cdp",
+        cdpUrl,
+        liveUrl,
+      },
       connectionHeaders: { authorization: `Bearer ${config.apiToken}` },
       close: async () => {
         await jsonRequest(fetchImpl, `${base}/${encodeURIComponent(sessionId)}`, {

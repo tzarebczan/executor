@@ -13,15 +13,24 @@ describe("cloud browser providers", () => {
     const fetch = vi
       .fn<typeof globalThis.fetch>()
       .mockResolvedValueOnce(
-        response({ sessionId: "cf-1", webSocketDebuggerUrl: "wss://cf.test/cdp" }),
+        response({
+          sessionId: "cf-1",
+          webSocketDebuggerUrl: "wss://cf.test/cdp",
+          targets: [{ devtoolsFrontendUrl: "https://live.browser.run/session/cf-1" }],
+        }),
       )
       .mockResolvedValueOnce(response({ status: "closing" }));
     const handle = await createCloudBrowserSession(
       { provider: "cloudflare-browser-run", accountId: "account", apiToken: "secret" },
       { fetch },
     );
-    expect(handle.session).toMatchObject({ sessionId: "cf-1", transport: "cdp" });
+    expect(handle.session).toMatchObject({
+      sessionId: "cf-1",
+      transport: "cdp",
+      liveUrl: "https://live.browser.run/session/cf-1",
+    });
     expect(fetch.mock.calls[0]?.[0]).toContain("keep_alive=600000");
+    expect(fetch.mock.calls[0]?.[0]).toContain("targets=true");
     await handle.close();
     expect(fetch.mock.calls[1]?.[1]).toMatchObject({ method: "DELETE" });
   });

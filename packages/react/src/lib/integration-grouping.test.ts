@@ -90,4 +90,16 @@ describe("groupIntegrations", () => {
       integrationFamily(integration("google_calendar", "google", "Google Calendar")),
     ).toBeNull();
   });
+
+  it("groups multiple browser targets under Browsers", () => {
+    const items = groupIntegrations([
+      integration("browser", "browser-bridge", "Local Chrome", "browser"),
+      integration("browser-cloudflare", "browser-bridge", "Cloudflare", "browser"),
+    ]);
+
+    expect(items).toHaveLength(1);
+    const group = items[0] as IntegrationFamilyGroup;
+    expect(group.family).toBe("browser");
+    expect(group.label).toBe("Browsers");
+  });
 });

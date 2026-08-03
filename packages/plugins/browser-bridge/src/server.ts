@@ -1,3 +1,5 @@
+/* oxlint-disable executor/no-try-catch-or-throw, executor/no-error-constructor, executor/no-switch-statement, executor/no-instanceof-error, executor/no-unknown-error-message -- plugin boundary normalizes schema, storage, and remote browser failures */
+
 /**
  * Chrome desktop reverse channel (path B).
  *
@@ -9,7 +11,11 @@
 import {
   definePlugin,
   tool,
+  Context,
+  Data,
   Effect,
+  HttpApi,
+  HttpApiBuilder,
   Schema,
   ToolName,
   ConnectionName,
@@ -31,6 +37,23 @@ import {
   validateBrowserToolCall,
   type BrowserToolName,
 } from "./protocol";
+import {
+  browserAuthMethods,
+  browserProviderName,
+  LOCAL_BROWSER_CONFIG,
+  parseBrowserIntegrationConfig,
+  type BrowserIntegrationConfig,
+} from "./integration-config";
+import { CLOUD_BROWSER_PROVIDERS } from "./cloud-providers";
+import {
+  getRemoteBrowserSession,
+  listRemoteBrowserSessions,
+  runRemoteBrowserTool,
+  startRemoteBrowserSession,
+  stopAllRemoteBrowserSessions,
+  stopRemoteBrowserSession,
+} from "./remote-runtime";
+import { BrowserControlApi, type AddBrowserProviderInput } from "./shared";
 
 export interface BrowserBridgePluginOptions {
   readonly callTimeoutMs?: number;
@@ -71,6 +94,21 @@ const approval = (description: string) => ({
   requiresApproval: true,
   approvalDescription: description,
 });
+
+class BrowserBridgeError extends Data.TaggedError("BrowserBridgeError")<{
+  readonly message: string;
+  readonly cause?: unknown;
+}> {}
+
+function browserBridgeError(cause: unknown, fallback: string): BrowserBridgeError {
+  const message =
+    cause && typeof cause === "object" && "message" in cause && typeof cause.message === "string"
+      ? cause.message
+      : typeof cause === "string"
+        ? cause
+        : fallback;
+  return new BrowserBridgeError({ message, cause });
+}
 
 /** Prefer discrete tools; `call` re-validates args against the target tool schema. */
 export const INNER_BROWSER_TOOLS = BROWSER_TOOL_NAMES;
@@ -343,6 +381,377 @@ function catalogResult(): ResolveToolsResult {
   return { tools: [...BROWSER_TOOL_CATALOG] };
 }
 
+const REMOTE_SESSION_TOOLS: readonly ToolDef[] = [
+  {
+    name: ToolName.make("session_status"),
+    description: "Show the current remote browser session without starting one.",
+    inputSchema: noArgsSchema,
+  },
+  {
+    name: ToolName.make("session_start"),
+    description: "Start or reuse this connection's remote browser session.",
+    inputSchema: noArgsSchema,
+    annotations: approval("Start a remote browser session that may incur provider usage"),
+  },
+  {
+    name: ToolName.make("session_stop"),
+    description: "Stop this connection's remote browser session.",
+    inputSchema: noArgsSchema,
+  },
+];
+
+function remoteCatalogResult(): ResolveToolsResult {
+  return {
+    tools: [...REMOTE_SESSION_TOOLS, ...BROWSER_TOOL_NAMES.map(browserCatalogEntry)],
+  };
+}
+
+function remoteSessionKey(owner: OwnerLike, integration: string, connection: string): string {
+  return `${userIdFromOwner(owner)}:${integration}:${connection}`;
+}
+
+function isRemoteBrowserConfig(
+  config: BrowserIntegrationConfig | null,
+): config is Exclude<BrowserIntegrationConfig, { provider: "local-extension" }> {
+  return config !== null && config.provider !== "local-extension";
+}
+
+type BrowserTargetView = {
+  readonly integration: string;
+  readonly name: string;
+  readonly provider: BrowserIntegrationConfig["provider"];
+  readonly connection?: string;
+  readonly address?: string;
+  readonly state: "live" | "ready" | "offline" | "needs-connection";
+  readonly detail: string;
+  readonly session?: Omit<ReturnType<typeof listRemoteBrowserSessions>[number], "key">;
+};
+
+const remoteProviderSetup: Record<
+  Exclude<BrowserIntegrationConfig["provider"], "local-extension">,
+  { readonly setup: string; readonly note: string }
+> = {
+  "vercel-sandbox": {
+    setup: "Vercel login or VERCEL_OIDC_TOKEN",
+    note: "Isolated agent-browser session in Vercel Sandbox",
+  },
+  "cloudflare-browser-run": {
+    setup: "Account ID and Browser Rendering API token",
+    note: "Managed Chromium over Cloudflare CDP",
+  },
+  "browser-use": {
+    setup: "Browser Use API key",
+    note: "Managed browser with optional live view and recording",
+  },
+  "generic-cdp": {
+    setup: "CDP WebSocket URL and optional auth header",
+    note: "Browserbase, Browserless, Kernel, or another CDP endpoint",
+  },
+};
+
+function withoutSessionKey(
+  session: ReturnType<typeof listRemoteBrowserSessions>[number],
+): Omit<typeof session, "key"> {
+  const { key: _key, ...view } = session;
+  return view;
+}
+
+function browserOverviewEffect(ctx: PluginCtx) {
+  return Effect.gen(function* () {
+    const integrations = yield* ctx.core.integrations.list();
+    const browserRows = integrations.filter((integration) => integration.kind === "browser-bridge");
+    const records = [] as Array<{
+      readonly integration: (typeof browserRows)[number];
+      readonly config: BrowserIntegrationConfig;
+    }>;
+    for (const integration of browserRows) {
+      const record = yield* ctx.core.integrations.get(integration.slug);
+      const config = record ? parseBrowserIntegrationConfig(record.config) : null;
+      if (config) records.push({ integration, config });
+    }
+
+    const targets: BrowserTargetView[] = [];
+    const userId = userIdFromOwner(ctx.owner);
+    const localSessions = listSessionsForUser(userId);
+    const localRecord = records.find((record) => record.config.provider === "local-extension");
+    const localConnections = localRecord
+      ? yield* ctx.connections.list({ integration: localRecord.integration.slug })
+      : [];
+    const localConnection = localConnections[0];
+    const localSession = localSessions[0];
+    targets.push({
+      integration: String(localRecord?.integration.slug || BROWSER_INTEGRATION_SLUG),
+      name: localRecord?.integration.name || "Local Chrome",
+      provider: "local-extension",
+      connection: localConnection ? String(localConnection.name) : BROWSER_CONNECTION_NAME,
+      address: localConnection?.address || "tools.browser.user.desktop",
+      state: localSession ? "live" : "offline",
+      detail: localSession
+        ? `Extension ${String((localSession.client as { version?: string } | undefined)?.version || "connected")} · ${localSession.pending} pending`
+        : "Extension reverse session is not connected",
+    });
+
+    for (const record of records) {
+      if (!isRemoteBrowserConfig(record.config)) continue;
+      const connections = yield* ctx.connections.list({ integration: record.integration.slug });
+      if (connections.length === 0) {
+        targets.push({
+          integration: String(record.integration.slug),
+          name: record.integration.name,
+          provider: record.config.provider,
+          state: "needs-connection",
+          detail: "Provider added; add credentials to create a callable browser target",
+        });
+        continue;
+      }
+      for (const connection of connections) {
+        const key = remoteSessionKey(
+          ctx.owner,
+          String(record.integration.slug),
+          String(connection.name),
+        );
+        const session = getRemoteBrowserSession(key);
+        targets.push({
+          integration: String(record.integration.slug),
+          name: record.integration.name,
+          provider: record.config.provider,
+          connection: String(connection.name),
+          address: connection.address,
+          state: session ? "live" : "ready",
+          detail: session
+            ? `Session ${session.sessionId} is active`
+            : "Configured; starts on first browser call",
+          ...(session ? { session: withoutSessionKey(session) } : {}),
+        });
+      }
+    }
+
+    const configured = new Map<string, number>();
+    for (const record of records) {
+      if (record.config.provider === "local-extension") continue;
+      configured.set(record.config.provider, (configured.get(record.config.provider) || 0) + 1);
+    }
+    return {
+      providers: CLOUD_BROWSER_PROVIDERS.map((provider) => ({
+        id: provider.id,
+        name: provider.name,
+        transport: provider.transport,
+        setup: remoteProviderSetup[provider.id].setup,
+        note:
+          "note" in provider && provider.note
+            ? provider.note
+            : remoteProviderSetup[provider.id].note,
+        configured: configured.get(provider.id) || 0,
+      })),
+      targets,
+      updatedAt: Date.now(),
+    };
+  });
+}
+
+function requiredText(value: string | undefined, label: string): string {
+  const trimmed = value?.trim();
+  if (!trimmed) throw new Error(`${label} is required`);
+  return trimmed;
+}
+
+function optionalNumber(
+  value: number | undefined,
+  label: string,
+  options: { readonly min: number; readonly max?: number; readonly integer?: boolean },
+): number | undefined {
+  if (value === undefined) return undefined;
+  if (
+    !Number.isFinite(value) ||
+    value < options.min ||
+    (options.max !== undefined && value > options.max) ||
+    (options.integer && !Number.isInteger(value))
+  ) {
+    const range =
+      options.max === undefined ? `at least ${options.min}` : `${options.min}-${options.max}`;
+    throw new Error(`${label} must be ${range}${options.integer ? " and an integer" : ""}`);
+  }
+  return value;
+}
+
+function browserConfigFromInput(
+  input: AddBrowserProviderInput,
+): Exclude<BrowserIntegrationConfig, { provider: "local-extension" }> {
+  switch (input.provider) {
+    case "vercel-sandbox":
+      const timeoutMs = optionalNumber(input.timeoutMs, "Session timeout", { min: 1 });
+      const vcpus = optionalNumber(input.vcpus, "vCPUs", { min: 1, integer: true });
+      return {
+        provider: input.provider,
+        ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+        ...(vcpus !== undefined ? { vcpus } : {}),
+      };
+    case "cloudflare-browser-run": {
+      const keepAliveMs = optionalNumber(input.keepAliveMs, "Keep-alive", {
+        min: 10_000,
+        max: 1_200_000,
+        integer: true,
+      });
+      return {
+        provider: input.provider,
+        accountId: requiredText(input.accountId, "Cloudflare account ID"),
+        ...(keepAliveMs !== undefined ? { keepAliveMs } : {}),
+      };
+    }
+    case "browser-use": {
+      const timeoutMinutes = optionalNumber(input.timeoutMinutes, "Timeout", {
+        min: 1,
+        max: 240,
+        integer: true,
+      });
+      return {
+        provider: input.provider,
+        ...(timeoutMinutes !== undefined ? { timeoutMinutes } : {}),
+        ...(input.profileId ? { profileId: input.profileId.trim() } : {}),
+        ...(input.proxyCountryCode !== undefined
+          ? { proxyCountryCode: input.proxyCountryCode }
+          : {}),
+        ...(input.enableRecording !== undefined ? { enableRecording: input.enableRecording } : {}),
+      };
+    }
+    case "generic-cdp": {
+      const cdpUrl = requiredText(input.cdpUrl, "CDP URL");
+      const parsed = new URL(cdpUrl);
+      if (!["ws:", "wss:", "http:", "https:"].includes(parsed.protocol)) {
+        throw new Error("CDP URL must use ws, wss, http, or https");
+      }
+      const headerName = input.authHeaderName?.trim();
+      return {
+        provider: input.provider,
+        cdpUrl,
+        ...(input.liveUrl?.trim() ? { liveUrl: input.liveUrl.trim() } : {}),
+        auth: headerName
+          ? { kind: "header", headerName, prefix: input.authPrefix || "" }
+          : { kind: "none" },
+      };
+    }
+  }
+}
+
+function addBrowserProviderEffect(ctx: PluginCtx, input: AddBrowserProviderInput) {
+  return Effect.gen(function* () {
+    const config = yield* Effect.try({
+      try: () => browserConfigFromInput(input),
+      catch: (error) => browserBridgeError(error, "Invalid browser provider configuration"),
+    });
+    const slug = IntegrationSlug.make(
+      input.slug?.trim() ||
+        (
+          {
+            "vercel-sandbox": "browser-vercel",
+            "cloudflare-browser-run": "browser-cloudflare",
+            "browser-use": "browser-use",
+            "generic-cdp": "browser-cdp",
+          } as const
+        )[config.provider],
+    );
+    const existing = yield* ctx.core.integrations.get(slug);
+    if (existing) {
+      return yield* new BrowserBridgeError({
+        message: `Integration "${String(slug)}" already exists`,
+      });
+    }
+
+    const secretRequired =
+      config.provider === "cloudflare-browser-run" ||
+      config.provider === "browser-use" ||
+      (config.provider === "generic-cdp" && config.auth?.kind === "header");
+    const credential = input.credential?.trim() || "";
+    if (secretRequired && !credential) {
+      return yield* new BrowserBridgeError({ message: "Provider credential is required" });
+    }
+
+    const name = input.name?.trim() || browserProviderName(config.provider);
+    yield* ctx.core.integrations.register({
+      slug,
+      name,
+      description: remoteProviderSetup[config.provider].note,
+      config,
+      canRemove: true,
+      canRefresh: true,
+    });
+    const template =
+      config.provider === "cloudflare-browser-run"
+        ? "api-token"
+        : config.provider === "browser-use"
+          ? "api-key"
+          : config.provider === "generic-cdp" && config.auth?.kind === "header"
+            ? "header"
+            : "none";
+    const connectionName = ConnectionName.make(input.connectionName?.trim() || "default");
+    const connection = yield* ctx.connections.create({
+      owner: "user",
+      name: connectionName,
+      integration: slug,
+      template: AuthTemplateSlug.make(template),
+      value: credential,
+      description: `${name} browser target`,
+    });
+    const overview = yield* browserOverviewEffect(ctx);
+    return overview.targets.find(
+      (target) =>
+        target.integration === String(slug) && target.connection === String(connection.name),
+    )!;
+  });
+}
+
+const makeBrowserBridgeExtension = (ctx: PluginCtx) => ({
+  ensureChrome: () => ensureChromeEffect(ctx),
+  overview: () => browserOverviewEffect(ctx),
+  addProvider: (input: AddBrowserProviderInput) => addBrowserProviderEffect(ctx, input),
+  stopSession: (integration: string, connection: string) =>
+    Effect.promise(() =>
+      stopRemoteBrowserSession(remoteSessionKey(ctx.owner, integration, connection)).then(
+        (stopped) => ({ stopped }),
+      ),
+    ),
+});
+
+export type BrowserBridgePluginExtension = ReturnType<typeof makeBrowserBridgeExtension>;
+
+export class BrowserBridgeExtensionService extends Context.Service<
+  BrowserBridgeExtensionService,
+  BrowserBridgePluginExtension
+>()("BrowserBridgeExtensionService") {}
+
+const BrowserControlApiBundle = HttpApi.make("browser-control").add(BrowserControlApi);
+
+const BrowserControlHandlers = HttpApiBuilder.group(
+  BrowserControlApiBundle,
+  "browserControl",
+  (handlers) =>
+    handlers
+      .handle("overview", () =>
+        Effect.gen(function* () {
+          const extension = yield* BrowserBridgeExtensionService;
+          return yield* extension.overview();
+        }).pipe(
+          Effect.mapError((error) => browserBridgeError(error, "Could not load browsers").message),
+        ),
+      )
+      .handle("addProvider", ({ payload }) =>
+        Effect.gen(function* () {
+          const extension = yield* BrowserBridgeExtensionService;
+          return yield* extension.addProvider(payload);
+        }).pipe(
+          Effect.mapError((error) => browserBridgeError(error, "Could not add browser").message),
+        ),
+      )
+      .handle("stopSession", ({ params }) =>
+        Effect.gen(function* () {
+          const extension = yield* BrowserBridgeExtensionService;
+          return yield* extension.stopSession(params.integration, params.connection);
+        }).pipe(
+          Effect.mapError((error) => browserBridgeError(error, "Could not stop browser").message),
+        ),
+      ),
+);
+
 async function runTool(
   userId: string,
   toolName: string,
@@ -402,7 +811,7 @@ function ensureChromeEffect(ctx: PluginCtx) {
       name: "Chrome (Executor Browser)",
       description:
         "Real Chrome via the Executor Browser extension reverse channel (path B). No companion process required.",
-      config: { transport: "reverse", kind: "extension" },
+      config: LOCAL_BROWSER_CONFIG,
       canRemove: true,
       canRefresh: true,
     });
@@ -459,20 +868,79 @@ export const browserBridgePlugin = definePlugin((options: BrowserBridgePluginOpt
       },
     ],
 
-    describeAuthMethods: () => [
-      {
-        id: "none",
-        label: "Extension reverse (no secret)",
-        kind: "none" as const,
-        template: "none",
-      },
-    ],
+    describeAuthMethods: (integration) => {
+      const config = parseBrowserIntegrationConfig(integration.config);
+      return config ? browserAuthMethods(config) : [];
+    },
+
+    describeIntegrationDisplay: (integration) => {
+      const config = parseBrowserIntegrationConfig(integration.config);
+      return {
+        family: "browser",
+        ...(config?.provider === "generic-cdp" ? { url: config.liveUrl || config.cdpUrl } : {}),
+      };
+    },
 
     remoteToolCatalog: false,
-    resolveTools: () => Effect.succeed(catalogResult()),
-    invokeTool: ({ toolRow, args, ctx }) =>
+    resolveTools: ({ config }) =>
+      Effect.succeed(
+        isRemoteBrowserConfig(parseBrowserIntegrationConfig(config))
+          ? remoteCatalogResult()
+          : catalogResult(),
+      ),
+    validateToolArgs: ({ toolRow, args }) =>
+      Effect.try({
+        try: () => {
+          const name = String(toolRow.name);
+          if (name.startsWith("session_")) return;
+          validateInnerCall(browserToolNameFromCatalog(name) || name, args || {});
+        },
+        catch: (error) => browserBridgeError(error, "Invalid browser tool arguments"),
+      }),
+    invokeTool: ({ toolRow, credential, args, ctx }) =>
       Effect.gen(function* () {
         const caller = yield* Effect.service(toolCallerRef);
+        const config = parseBrowserIntegrationConfig(credential.config);
+        if (!config) {
+          return yield* new BrowserBridgeError({
+            message: `Browser integration "${toolRow.integration}" has invalid config`,
+          });
+        }
+        if (isRemoteBrowserConfig(config)) {
+          const key = remoteSessionKey(
+            ctx.owner,
+            String(credential.integration),
+            String(credential.connection),
+          );
+          const name = String(toolRow.name);
+          if (name === "session_status") {
+            return getRemoteBrowserSession(key);
+          }
+          if (name === "session_start") {
+            return yield* Effect.tryPromise({
+              try: () => startRemoteBrowserSession(key, config, credential.value),
+              catch: (error) => browserBridgeError(error, "Could not start remote browser"),
+            });
+          }
+          if (name === "session_stop") {
+            return yield* Effect.tryPromise({
+              try: () => stopRemoteBrowserSession(key),
+              catch: (error) => browserBridgeError(error, "Could not stop remote browser"),
+            });
+          }
+          const validated = validateInnerCall(browserToolNameFromCatalog(name) || name, args || {});
+          return yield* Effect.tryPromise({
+            try: () =>
+              runRemoteBrowserTool({
+                key,
+                config,
+                credential: credential.value,
+                tool: validated.tool,
+                args: validated.args as never,
+              }),
+            catch: (error) => browserBridgeError(error, "Remote browser tool failed"),
+          });
+        }
         return yield* Effect.tryPromise({
           try: () =>
             runTool(
@@ -482,12 +950,28 @@ export const browserBridgePlugin = definePlugin((options: BrowserBridgePluginOpt
               defaultTimeout,
               caller,
             ),
-          catch: (e) => e as Error,
+          catch: (error) => browserBridgeError(error, "Local browser tool failed"),
         });
       }),
 
-    checkHealth: ({ ctx }) =>
+    checkHealth: ({ ctx, integration, credential }) =>
       Effect.sync(() => {
+        const config = parseBrowserIntegrationConfig(integration.config);
+        if (isRemoteBrowserConfig(config)) {
+          const key = remoteSessionKey(
+            ctx.owner,
+            String(credential.integration),
+            String(credential.connection),
+          );
+          const live = getRemoteBrowserSession(key);
+          return {
+            status: "healthy" as const,
+            checkedAt: Date.now(),
+            detail: live
+              ? `${browserProviderName(config.provider)} session ${live.sessionId} is active`
+              : `${browserProviderName(config.provider)} is configured; session starts on demand`,
+          };
+        }
         const userId = userIdFromOwner(ctx.owner);
         const sessions = listSessionsForUser(userId);
         const checkedAt = Date.now();
@@ -529,9 +1013,20 @@ export const browserBridgePlugin = definePlugin((options: BrowserBridgePluginOpt
         };
       }),
 
-    extension: (ctx: PluginCtx) => ({
-      ensureChrome: () => ensureChromeEffect(ctx),
-    }),
+    removeConnection: ({ ctx, integration, connection }) =>
+      Effect.promise(() =>
+        stopRemoteBrowserSession(
+          remoteSessionKey(ctx.owner, String(integration), String(connection.name)),
+        ).then(() => undefined),
+      ),
+
+    close: () => Effect.promise(stopAllRemoteBrowserSessions),
+
+    extension: makeBrowserBridgeExtension,
+
+    routes: () => BrowserControlApi,
+    handlers: () => BrowserControlHandlers,
+    extensionService: BrowserBridgeExtensionService,
 
     // Only installer under executor — do NOT also declare static id "browser"
     // (that duplicated the catalog row with no health dot).

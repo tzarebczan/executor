@@ -3,6 +3,7 @@ import type { Integration } from "@executor-js/sdk/shared";
 const FAMILY_LABELS: Record<string, string> = {
   google: "Google",
   microsoft: "Microsoft",
+  browser: "Browsers",
 };
 
 export const familyLabel = (family: string): string =>

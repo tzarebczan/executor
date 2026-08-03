@@ -10,7 +10,9 @@
     "./store": "./src/store.ts",
     "./http": "./src/http.ts",
     "./protocol": "./src/protocol.ts",
-    "./cloud-providers": "./src/cloud-providers.ts"
+    "./cloud-providers": "./src/cloud-providers.ts",
+    "./shared": "./src/shared.ts",
+    "./client": "./src/client.tsx"
   },
   "scripts": {
     "test": "vitest run",
@@ -19,13 +21,44 @@
   "dependencies": {
     "@executor-js/sdk": "workspace:*",
     "effect": "catalog:",
+    "puppeteer-core": "^25.4.0",
     "remote-agent-browser": "^1.0.0"
   },
   "devDependencies": {
+    "@effect/atom-react": "catalog:",
     "@effect/vitest": "catalog:",
+    "@executor-js/api": "workspace:*",
+    "@executor-js/react": "workspace:*",
     "@types/node": "catalog:",
+    "@types/react": "catalog:",
     "bun-types": "catalog:",
+    "lucide-react": "^1.7.0",
+    "react": "catalog:",
     "typescript": "catalog:",
     "vitest": "catalog:"
+  },
+  "peerDependencies": {
+    "@effect/atom-react": "catalog:",
+    "@executor-js/api": "workspace:*",
+    "@executor-js/react": "workspace:*",
+    "lucide-react": "^1.7.0",
+    "react": "catalog:"
+  },
+  "peerDependenciesMeta": {
+    "@effect/atom-react": {
+      "optional": true
+    },
+    "@executor-js/api": {
+      "optional": true
+    },
+    "@executor-js/react": {
+      "optional": true
+    },
+    "lucide-react": {
+      "optional": true
+    },
+    "react": {
+      "optional": true
+    }
   }
 }

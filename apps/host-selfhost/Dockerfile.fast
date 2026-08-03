@@ -14,6 +14,7 @@ COPY apps/host-selfhost/package.json apps/host-selfhost/
 COPY e2e/package.json e2e/
 COPY packages ./packages
 COPY apps ./apps
+COPY examples ./examples
 COPY scripts ./scripts
 # Cache bun global + install dir across builds
 RUN --mount=type=cache,target=/root/.bun/install/cache \
@@ -28,6 +29,7 @@ COPY apps/host-selfhost/package.json apps/host-selfhost/
 COPY e2e/package.json e2e/
 COPY packages ./packages
 COPY apps ./apps
+COPY examples ./examples
 COPY scripts ./scripts
 # Full monorepo copy for vite build assets
 COPY . .

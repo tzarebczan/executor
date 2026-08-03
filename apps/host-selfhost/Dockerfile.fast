@@ -9,6 +9,7 @@
 FROM oven/bun:1 AS prod-deps
 WORKDIR /app
 COPY package.json bun.lock ./
+COPY patches ./patches
 COPY apps/host-selfhost/package.json apps/host-selfhost/
 COPY e2e/package.json e2e/
 COPY packages ./packages
@@ -22,6 +23,7 @@ RUN --mount=type=cache,target=/root/.bun/install/cache \
 FROM oven/bun:1 AS build
 WORKDIR /app
 COPY package.json bun.lock ./
+COPY patches ./patches
 COPY apps/host-selfhost/package.json apps/host-selfhost/
 COPY e2e/package.json e2e/
 COPY packages ./packages

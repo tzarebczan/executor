@@ -16,6 +16,12 @@ export type BridgeJob = {
   resolve: (result: unknown) => void;
   reject: (err: Error) => void;
   delivered: boolean;
+  caller?: BridgeCaller;
+};
+
+export type BridgeCaller = {
+  name: string;
+  version?: string;
 };
 
 export type BridgeSession = {
@@ -145,7 +151,7 @@ export function takeJobs(
   sessionId: string,
   userId: string,
   waitMs = 25_000,
-): Promise<Array<{ id: string; tool: string; args: Record<string, unknown> }>> {
+): Promise<Array<{ id: string; tool: string; args: Record<string, unknown>; caller?: BridgeCaller }>> {
   const s = getSession(sessionId);
   if (!s || s.userId !== userId) {
     return Promise.reject(new Error("session not found"));
@@ -173,6 +179,7 @@ export function takeJobs(
           id: j.id,
           tool: j.tool,
           args: j.args,
+          caller: j.caller,
         })),
       );
     };
@@ -183,13 +190,13 @@ export function takeJobs(
 
 function drainPending(
   s: BridgeSession,
-): Array<{ id: string; tool: string; args: Record<string, unknown> }> {
+): Array<{ id: string; tool: string; args: Record<string, unknown>; caller?: BridgeCaller }> {
   const batch = s.pending.splice(0, s.pending.length);
   for (const j of batch) {
     j.delivered = true;
     s.inflight.set(j.id, j);
   }
-  return batch.map((j) => ({ id: j.id, tool: j.tool, args: j.args }));
+  return batch.map((j) => ({ id: j.id, tool: j.tool, args: j.args, caller: j.caller }));
 }
 
 function notifyWaiters(s: BridgeSession): void {
@@ -259,6 +266,7 @@ export type CallToolInput = {
   tool: string;
   args?: Record<string, unknown>;
   timeoutMs?: number;
+  caller?: BridgeCaller;
 };
 
 /** Agent path: enqueue tool, wait for extension result. */
@@ -296,6 +304,7 @@ export function callTool(input: CallToolInput): Promise<unknown> {
       args: input.args || {},
       createdAt: Date.now(),
       delivered: false,
+      caller: input.caller,
       resolve: (result) => {
         clearTimeout(timer);
         resolve(result);

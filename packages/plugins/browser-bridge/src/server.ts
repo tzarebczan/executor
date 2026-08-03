@@ -19,9 +19,18 @@ import {
   type PluginCtx,
   type ResolveToolsResult,
   type ToolDef,
+  toolCallerRef,
 } from "@executor-js/sdk/core";
 
 import { callTool, listSessionsForUser, sessionPublicView } from "./store";
+import {
+  BROWSER_TOOL_DEFINITIONS,
+  BROWSER_TOOL_NAMES,
+  browserToolCatalogName,
+  browserToolNameFromCatalog,
+  validateBrowserToolCall,
+  type BrowserToolName,
+} from "./protocol";
 
 export interface BrowserBridgePluginOptions {
   readonly callTimeoutMs?: number;
@@ -50,20 +59,13 @@ const noArgsSchema = {
   additionalProperties: false,
 } as const;
 
-const tabTargetProperties = {
-  tabId: { type: "integer", minimum: 0 },
-} as const;
-
+const tabTargetProperties = { tabId: { type: "integer", minimum: 0 } } as const;
 const tabTargetSchema = {
   type: "object",
   properties: tabTargetProperties,
   additionalProperties: false,
 } as const;
-
-const urlSchema = {
-  type: "string",
-  pattern: "^https?://",
-} as const;
+const urlSchema = { type: "string", pattern: "^https?://" } as const;
 
 const approval = (description: string) => ({
   requiresApproval: true,
@@ -71,18 +73,9 @@ const approval = (description: string) => ({
 });
 
 /** Prefer discrete tools; `call` re-validates args against the target tool schema. */
-export const INNER_BROWSER_TOOLS = [
-  "ping",
-  "tabs.list",
-  "tabs.open",
-  "navigate",
-  "snapshot",
-  "click",
-  "type",
-  "screenshot",
-] as const;
+export const INNER_BROWSER_TOOLS = BROWSER_TOOL_NAMES;
 
-export type InnerBrowserTool = (typeof INNER_BROWSER_TOOLS)[number];
+export type InnerBrowserTool = BrowserToolName;
 
 /** Session is degraded if extension has not polled within this window. */
 export const SESSION_STALE_MS = 90_000;
@@ -98,15 +91,8 @@ function isPlainObject(value: unknown): value is Record<string, unknown> {
 }
 
 function assertHttpUrl(url: unknown, field = "url"): string {
-  if (typeof url !== "string" || !url.trim()) {
-    throw new Error(`${field} is required`);
-  }
-  let parsed: URL;
-  try {
-    parsed = new URL(url);
-  } catch {
-    throw new Error(`${field} must be a valid http(s) URL`);
-  }
+  if (typeof url !== "string" || !url.trim()) throw new Error(`${field} is required`);
+  const parsed = new URL(url);
   if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
     throw new Error(`${field} must use http or https`);
   }
@@ -124,7 +110,7 @@ function assertOptionalTabId(args: Record<string, unknown>): void {
  * Validate generic `call` payload so it cannot bypass per-tool input rules.
  * Returns normalized { tool, args } for the reverse bridge.
  */
-export function validateInnerCall(
+export function validateInnerCallV1(
   toolRaw: unknown,
   argsRaw: unknown,
 ): { tool: InnerBrowserTool; args: Record<string, unknown> } {
@@ -147,16 +133,17 @@ export function validateInnerCall(
     }
   };
 
-  switch (tool as InnerBrowserTool) {
+  const normalizedTool = tool as InnerBrowserTool;
+  switch (normalizedTool) {
     case "ping":
     case "tabs.list":
       only([]);
-      return { tool, args: {} };
+      return { tool: normalizedTool, args: {} };
     case "snapshot":
     case "screenshot":
       only(["tabId"]);
       assertOptionalTabId(args);
-      return { tool, args: args.tabId === undefined ? {} : { tabId: args.tabId } };
+      return { tool: normalizedTool, args: args.tabId === undefined ? {} : { tabId: args.tabId } };
     case "tabs.open": {
       only(["url", "active"]);
       const url = assertHttpUrl(args.url);
@@ -165,7 +152,7 @@ export function validateInnerCall(
         if (typeof args.active !== "boolean") throw new Error("active must be boolean");
         out.active = args.active;
       }
-      return { tool, args: out };
+      return { tool: normalizedTool, args: out };
     }
     case "navigate": {
       only(["tabId", "url", "newTab"]);
@@ -177,15 +164,13 @@ export function validateInnerCall(
         if (typeof args.newTab !== "boolean") throw new Error("newTab must be boolean");
         out.newTab = args.newTab;
       }
-      return { tool, args: out };
+      return { tool: normalizedTool, args: out };
     }
     case "click": {
       only(["tabId", "x", "y", "selector", "nodeIndex"]);
       assertOptionalTabId(args);
       const hasTarget =
-        args.selector != null ||
-        args.nodeIndex != null ||
-        (args.x != null && args.y != null);
+        args.selector != null || args.nodeIndex != null || (args.x != null && args.y != null);
       if (!hasTarget) {
         throw new Error("click requires selector, nodeIndex, or x+y");
       }
@@ -204,7 +189,7 @@ export function validateInnerCall(
       }
       if (args.x !== undefined && typeof args.x !== "number") throw new Error("x must be a number");
       if (args.y !== undefined && typeof args.y !== "number") throw new Error("y must be a number");
-      return { tool, args: { ...args } };
+      return { tool: normalizedTool, args: { ...args } };
     }
     case "type": {
       only(["tabId", "text", "selector", "submit"]);
@@ -216,14 +201,22 @@ export function validateInnerCall(
       if (args.submit !== undefined && typeof args.submit !== "boolean") {
         throw new Error("submit must be boolean");
       }
-      return { tool, args: { ...args } };
+      return { tool: normalizedTool, args: { ...args } };
     }
     default:
       throw new Error(`Unhandled tool ${tool}`);
   }
 }
 
-export const BROWSER_TOOL_CATALOG: readonly ToolDef[] = [
+export function validateInnerCall(
+  toolRaw: unknown,
+  argsRaw: unknown,
+): { tool: InnerBrowserTool; args: Record<string, unknown> } {
+  const call = validateBrowserToolCall(toolRaw, argsRaw);
+  return { tool: call.tool, args: call.args as Record<string, unknown> };
+}
+
+export const BROWSER_TOOL_CATALOG_V1: readonly ToolDef[] = [
   {
     name: ToolName.make("status"),
     description: "List live reverse-bridge sessions.",
@@ -323,6 +316,29 @@ export const BROWSER_TOOL_CATALOG: readonly ToolDef[] = [
   { name: ToolName.make("ping"), description: "Liveness check.", inputSchema: noArgsSchema },
 ];
 
+function browserCatalogEntry(name: BrowserToolName): ToolDef {
+  const definition = BROWSER_TOOL_DEFINITIONS[name];
+  const base = {
+    name: ToolName.make(browserToolCatalogName(name)),
+    description: definition.description,
+    inputSchema: definition.inputSchema,
+  };
+  return definition.risk === "read"
+    ? base
+    : {
+        ...base,
+        annotations: approval(
+          `${definition.risk === "sensitive" ? "Allow sensitive" : "Run"} browser operation: ${name}`,
+        ),
+      };
+}
+
+export const BROWSER_TOOL_CATALOG: readonly ToolDef[] = [
+  BROWSER_TOOL_CATALOG_V1[0]!,
+  BROWSER_TOOL_CATALOG_V1[1]!,
+  ...BROWSER_TOOL_NAMES.map(browserCatalogEntry),
+];
+
 function catalogResult(): ResolveToolsResult {
   return { tools: [...BROWSER_TOOL_CATALOG] };
 }
@@ -332,12 +348,9 @@ async function runTool(
   toolName: string,
   args: Record<string, unknown> | undefined,
   timeoutMs: number,
+  caller?: { name: string; version?: string } | null,
 ): Promise<unknown> {
-  const map: Record<string, string> = {
-    tabs_list: "tabs.list",
-    tabs_open: "tabs.open",
-  };
-  const name = map[toolName] || toolName;
+  const name = browserToolNameFromCatalog(toolName) || toolName;
 
   if (name === "status") {
     const sessions = listSessionsForUser(userId).map(sessionPublicView);
@@ -367,9 +380,17 @@ async function runTool(
       args: validated.args,
       sessionId: typeof body.sessionId === "string" ? body.sessionId : undefined,
       timeoutMs: timeoutOverride,
+      caller: caller ?? undefined,
     });
   }
-  return callTool({ userId, tool: name, args: args || {}, timeoutMs });
+  const validated = validateInnerCall(name, args || {});
+  return callTool({
+    userId,
+    tool: validated.tool,
+    args: validated.args,
+    timeoutMs,
+    caller: caller ?? undefined,
+  });
 }
 
 function ensureChromeEffect(ctx: PluginCtx) {
@@ -450,15 +471,19 @@ export const browserBridgePlugin = definePlugin((options: BrowserBridgePluginOpt
     remoteToolCatalog: false,
     resolveTools: () => Effect.succeed(catalogResult()),
     invokeTool: ({ toolRow, args, ctx }) =>
-      Effect.tryPromise({
-        try: () =>
-          runTool(
-            userIdFromOwner(ctx.owner),
-            String(toolRow.name),
-            (args || {}) as Record<string, unknown>,
-            defaultTimeout,
-          ),
-        catch: (e) => e as Error,
+      Effect.gen(function* () {
+        const caller = yield* Effect.service(toolCallerRef);
+        return yield* Effect.tryPromise({
+          try: () =>
+            runTool(
+              userIdFromOwner(ctx.owner),
+              String(toolRow.name),
+              (args || {}) as Record<string, unknown>,
+              defaultTimeout,
+              caller,
+            ),
+          catch: (e) => e as Error,
+        });
       }),
 
     checkHealth: ({ ctx }) =>

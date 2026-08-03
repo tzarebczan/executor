@@ -25,6 +25,7 @@ import {
   isToolFile,
   makeOrgWriteAccessState,
   sanitizeArtifactPreviewMarkup,
+  toolCallerRef,
   type OrgWriteAccess,
 } from "@executor-js/sdk";
 import type {
@@ -37,6 +38,7 @@ import type {
   ElicitationRequest,
   SaveArtifactInput,
   ToolFileValue,
+  ToolCallerInfo,
 } from "@executor-js/sdk";
 import type * as Tracer from "effect/Tracer";
 import {
@@ -1231,15 +1233,27 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
         ),
     ).pipe(Effect.withSpan("mcp.host.create_server"));
 
+    const withClientAttribution = <A, EffE>(
+      effect: Effect.Effect<A, EffE>,
+    ): Effect.Effect<A, EffE> => {
+      const client = server.server.getClientVersion();
+      const caller: ToolCallerInfo | null = client?.name
+        ? { name: client.name, ...(client.version ? { version: client.version } : {}) }
+        : null;
+      return Effect.provideService(effect, toolCallerRef, caller);
+    };
+
     const executeWithNativeElicitation = (
       code: string,
       extra: McpRequestJoinKeys,
     ): Effect.Effect<McpToolResult, E> =>
-      engine
-        .execute(code, {
-          onElicitation: makeMcpElicitationHandler(server, extra.requestId, debugLog),
-        })
-        .pipe(Effect.map(toMcpResult));
+      withClientAttribution(
+        engine
+          .execute(code, {
+            onElicitation: makeMcpElicitationHandler(server, extra.requestId, debugLog),
+          })
+          .pipe(Effect.map(toMcpResult)),
+      );
 
     const executeCode = (
       code: string,
@@ -1259,7 +1273,7 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
         if (elicitationMode.mode === "native") {
           return yield* executeWithNativeElicitation(code, extra);
         }
-        const outcome = yield* engine.executeWithPause(code);
+        const outcome = yield* withClientAttribution(engine.executeWithPause(code));
         debugLog("execute.paused_flow_result", {
           status: outcome.status,
           executionId: outcome.status === "paused" ? outcome.execution.id : undefined,
@@ -1385,7 +1399,7 @@ export const createExecutorMcpServer = <E extends Cause.YieldableError>(
         if (elicitationMode.mode === "native") {
           return yield* executeWithNativeElicitation(boundCode, extra);
         }
-        const outcome = yield* engine.executeWithPause(boundCode);
+        const outcome = yield* withClientAttribution(engine.executeWithPause(boundCode));
         debugLog("execute_action.paused_flow_result", {
           status: outcome.status,
           executionId: outcome.status === "paused" ? outcome.execution.id : undefined,

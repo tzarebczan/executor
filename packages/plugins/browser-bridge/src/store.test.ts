@@ -34,6 +34,20 @@ describe("browser-bridge store", () => {
     expect(result).toEqual({ ok: true, mode: "extension-reverse" });
   });
 
+  it("delivers privacy-safe caller attribution with a job", async () => {
+    const s = createSession({ userId: "u1" });
+    const callP = callTool({
+      userId: "u1",
+      tool: "snapshot",
+      caller: { name: "codex", version: "1.2.3" },
+    });
+    const jobs = await takeJobs(s.id, "u1", 0);
+
+    expect(jobs[0]?.caller).toEqual({ name: "codex", version: "1.2.3" });
+    postResult(s.id, "u1", jobs[0]!.id, { ok: true });
+    await expect(callP).resolves.toEqual({ ok: true });
+  });
+
   it("rejects call without session", async () => {
     await expect(callTool({ userId: "nobody", tool: "ping" })).rejects.toThrow(/No live/);
   });

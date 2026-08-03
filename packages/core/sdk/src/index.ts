@@ -65,6 +65,10 @@ export {
 } from "./ids";
 export { connectionIdentifier, isConnectionIdentifier } from "./connection-name-identifier";
 
+// Request attribution. Hosts scope this to one execution; plugins may use it
+// for privacy-safe audit records without depending on a transport.
+export { toolCallerRef, type ToolCallerInfo } from "./request-context";
+
 // Errors (tagged) — the ExecuteError set + integration lifecycle.
 export {
   ToolNotFoundError,

@@ -12,6 +12,8 @@ export const BrowserProviderDefinition = Schema.Struct({
   id: RemoteBrowserProvider,
   name: Schema.String,
   transport: Schema.Literals(["agent-browser", "cdp"]),
+  availability: Schema.Literals(["available", "needs-setup", "unavailable"]),
+  availabilityDetail: Schema.String,
   setup: Schema.String,
   note: Schema.String,
   configured: Schema.Number,

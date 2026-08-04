@@ -449,6 +449,37 @@ const remoteProviderSetup: Record<
   },
 };
 
+function remoteProviderHostReady(
+  provider: Exclude<BrowserIntegrationConfig["provider"], "local-extension">,
+): boolean {
+  return provider !== "vercel-sandbox" || Boolean(process.env.VERCEL_OIDC_TOKEN);
+}
+
+function remoteProviderAvailability(
+  provider: Exclude<BrowserIntegrationConfig["provider"], "local-extension">,
+  configured: number,
+): {
+  readonly availability: "available" | "needs-setup" | "unavailable";
+  readonly availabilityDetail: string;
+} {
+  if (!remoteProviderHostReady(provider)) {
+    return {
+      availability: "unavailable",
+      availabilityDetail: "VERCEL_OIDC_TOKEN is not set on this Executor host",
+    };
+  }
+  if (configured > 0) {
+    return {
+      availability: "available",
+      availabilityDetail: `${configured} target${configured === 1 ? "" : "s"} configured`,
+    };
+  }
+  return {
+    availability: "needs-setup",
+    availabilityDetail: remoteProviderSetup[provider].setup,
+  };
+}
+
 function withoutSessionKey(
   session: ReturnType<typeof listRemoteBrowserSessions>[number],
 ): Omit<typeof session, "key"> {
@@ -487,7 +518,7 @@ function browserOverviewEffect(ctx: PluginCtx) {
       address: localConnection?.address || "tools.browser.user.desktop",
       state: localSession ? "live" : "offline",
       detail: localSession
-        ? `Extension ${String((localSession.client as { version?: string } | undefined)?.version || "connected")} · ${localSession.pending} pending`
+        ? `Extension ${String((localSession.client as { version?: string } | undefined)?.version || "connected")} connected · ${localSession.pending.length === 0 ? "no requests waiting" : `${localSession.pending.length} request${localSession.pending.length === 1 ? "" : "s"} waiting`}`
         : "Extension reverse session is not connected",
     });
 
@@ -511,16 +542,19 @@ function browserOverviewEffect(ctx: PluginCtx) {
           String(connection.name),
         );
         const session = getRemoteBrowserSession(key);
+        const hostReady = remoteProviderHostReady(record.config.provider);
         targets.push({
           integration: String(record.integration.slug),
           name: record.integration.name,
           provider: record.config.provider,
           connection: String(connection.name),
           address: connection.address,
-          state: session ? "live" : "ready",
+          state: session ? "live" : hostReady ? "ready" : "offline",
           detail: session
             ? `Session ${session.sessionId} is active`
-            : "Configured; starts on first browser call",
+            : hostReady
+              ? "Configured; starts on first browser call"
+              : "Host authentication is missing; this target cannot start",
           ...(session ? { session: withoutSessionKey(session) } : {}),
         });
       }
@@ -532,17 +566,21 @@ function browserOverviewEffect(ctx: PluginCtx) {
       configured.set(record.config.provider, (configured.get(record.config.provider) || 0) + 1);
     }
     return {
-      providers: CLOUD_BROWSER_PROVIDERS.map((provider) => ({
-        id: provider.id,
-        name: provider.name,
-        transport: provider.transport,
-        setup: remoteProviderSetup[provider.id].setup,
-        note:
-          "note" in provider && provider.note
-            ? provider.note
-            : remoteProviderSetup[provider.id].note,
-        configured: configured.get(provider.id) || 0,
-      })),
+      providers: CLOUD_BROWSER_PROVIDERS.map((provider) => {
+        const count = configured.get(provider.id) || 0;
+        return {
+          id: provider.id,
+          name: provider.name,
+          transport: provider.transport,
+          ...remoteProviderAvailability(provider.id, count),
+          setup: remoteProviderSetup[provider.id].setup,
+          note:
+            "note" in provider && provider.note
+              ? provider.note
+              : remoteProviderSetup[provider.id].note,
+          configured: count,
+        };
+      }),
       targets,
       updatedAt: Date.now(),
     };
@@ -639,22 +677,32 @@ function addBrowserProviderEffect(ctx: PluginCtx, input: AddBrowserProviderInput
       try: () => browserConfigFromInput(input),
       catch: (error) => browserBridgeError(error, "Invalid browser provider configuration"),
     });
-    const slug = IntegrationSlug.make(
-      input.slug?.trim() ||
-        (
-          {
-            "vercel-sandbox": "browser-vercel",
-            "cloudflare-browser-run": "browser-cloudflare",
-            "browser-use": "browser-use",
-            "generic-cdp": "browser-cdp",
-          } as const
-        )[config.provider],
-    );
-    const existing = yield* ctx.core.integrations.get(slug);
-    if (existing) {
+    if (!remoteProviderHostReady(config.provider)) {
+      return yield* new BrowserBridgeError({
+        message: remoteProviderAvailability(config.provider, 0).availabilityDetail,
+      });
+    }
+    const requestedSlug = input.slug?.trim();
+    const baseSlug = (
+      {
+        "vercel-sandbox": "browser-vercel",
+        "cloudflare-browser-run": "browser-cloudflare",
+        "browser-use": "browser-use",
+        "generic-cdp": "browser-cdp",
+      } as const
+    )[config.provider];
+    let slug = IntegrationSlug.make(requestedSlug || baseSlug);
+    let existing = yield* ctx.core.integrations.get(slug);
+    if (requestedSlug && existing) {
       return yield* new BrowserBridgeError({
         message: `Integration "${String(slug)}" already exists`,
       });
+    }
+    let suffix = 2;
+    while (existing) {
+      slug = IntegrationSlug.make(`${baseSlug}-${suffix}`);
+      existing = yield* ctx.core.integrations.get(slug);
+      suffix += 1;
     }
 
     const secretRequired =

@@ -1,4 +1,4 @@
-import { useMemo, useState, type FormEvent } from "react";
+import { useState, type FormEvent } from "react";
 import * as Exit from "effect/Exit";
 import {
   AsyncResult,
@@ -11,11 +11,26 @@ import {
 import { Badge } from "@executor-js/react/components/badge";
 import { Button } from "@executor-js/react/components/button";
 import { Checkbox } from "@executor-js/react/components/checkbox";
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "@executor-js/react/components/collapsible";
+import { CopyButton } from "@executor-js/react/components/copy-button";
 import { Input } from "@executor-js/react/components/input";
 import { Label } from "@executor-js/react/components/label";
-import { NativeSelect, NativeSelectOption } from "@executor-js/react/components/native-select";
 import { messageFromExit } from "@executor-js/react/api/error-reporting";
-import { CircleStop, Cloud, ExternalLink, Monitor, Plus, RefreshCw, Server, X } from "lucide-react";
+import {
+  ChevronRight,
+  CircleStop,
+  Cloud,
+  ExternalLink,
+  Monitor,
+  Plus,
+  RefreshCw,
+  Server,
+  X,
+} from "lucide-react";
 
 import { BrowserControlApi, type AddBrowserProviderInput } from "./shared";
 
@@ -31,7 +46,7 @@ type RemoteProvider = AddBrowserProviderInput["provider"];
 
 const providerLabels: Record<RemoteProvider, string> = {
   "vercel-sandbox": "Vercel Sandbox",
-  "cloudflare-browser-run": "Cloudflare Browser Rendering",
+  "cloudflare-browser-run": "Cloudflare Browser Run",
   "browser-use": "Browser Use",
   "generic-cdp": "Generic CDP",
 };
@@ -58,17 +73,40 @@ function StateBadge({ state }: { readonly state: string }) {
   );
 }
 
+function AvailabilityBadge({
+  availability,
+}: {
+  readonly availability: "available" | "needs-setup" | "unavailable";
+}) {
+  const available = availability === "available";
+  const unavailable = availability === "unavailable";
+  return (
+    <Badge
+      variant="outline"
+      className={
+        available
+          ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
+          : unavailable
+            ? "border-destructive/40 bg-destructive/10 text-destructive"
+            : "text-muted-foreground"
+      }
+    >
+      {available ? "Configured" : unavailable ? "Unavailable" : "Needs setup"}
+    </Badge>
+  );
+}
+
 function ProviderForm({
-  initialProvider = "vercel-sandbox",
+  provider,
   onDone,
 }: {
-  readonly initialProvider?: RemoteProvider;
+  readonly provider: RemoteProvider;
   readonly onDone: () => void;
 }) {
-  const [provider, setProvider] = useState<RemoteProvider>(initialProvider);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [recording, setRecording] = useState(false);
+  const [advancedOpen, setAdvancedOpen] = useState(false);
   const addProvider = useAtomSet(addProviderAtom, { mode: "promiseExit" });
 
   const submit = async (event: FormEvent<HTMLFormElement>) => {
@@ -111,24 +149,8 @@ function ProviderForm({
 
   return (
     <form onSubmit={submit} className="grid gap-4 border-t pt-5">
-      <div className="grid gap-2">
-        <Label htmlFor="browser-provider">Provider</Label>
-        <NativeSelect
-          id="browser-provider"
-          value={provider}
-          onChange={(event) => setProvider(event.target.value as RemoteProvider)}
-          className="w-full"
-        >
-          {Object.entries(providerLabels).map(([id, label]) => (
-            <NativeSelectOption key={id} value={id}>
-              {label}
-            </NativeSelectOption>
-          ))}
-        </NativeSelect>
-      </div>
-
       {provider === "vercel-sandbox" && (
-        <div className="grid grid-cols-2 gap-3">
+        <div className="grid gap-3 sm:grid-cols-2">
           <Field
             name="timeoutMs"
             label="Session timeout (ms)"
@@ -158,7 +180,7 @@ function ProviderForm({
       {provider === "browser-use" && (
         <>
           <SecretField name="credential" label="API key" />
-          <div className="grid grid-cols-2 gap-3">
+          <div className="grid gap-3 sm:grid-cols-2">
             <Field
               name="timeoutMinutes"
               label="Timeout (minutes)"
@@ -185,7 +207,7 @@ function ProviderForm({
         <>
           <Field name="cdpUrl" label="CDP endpoint" placeholder="wss://..." required />
           <Field name="liveUrl" label="Live view URL" placeholder="Optional" />
-          <div className="grid grid-cols-2 gap-3">
+          <div className="grid gap-3 sm:grid-cols-2">
             <Field name="authHeaderName" label="Auth header" placeholder="Optional" />
             <Field name="authPrefix" label="Header prefix" placeholder="Bearer " />
           </div>
@@ -193,11 +215,23 @@ function ProviderForm({
         </>
       )}
 
-      <div className="grid grid-cols-2 gap-3">
-        <Field name="name" label="Display name" placeholder={providerLabels[provider]} />
-        <Field name="connectionName" label="Connection" placeholder="default" />
-      </div>
-      <Field name="slug" label="Tool namespace" placeholder="Generated automatically" />
+      <Collapsible open={advancedOpen} onOpenChange={setAdvancedOpen}>
+        <CollapsibleTrigger className="flex items-center gap-1 text-xs font-medium text-muted-foreground transition-colors hover:text-foreground">
+          <ChevronRight
+            className={`size-3.5 transition-transform ${advancedOpen ? "rotate-90" : ""}`}
+          />
+          Advanced
+        </CollapsibleTrigger>
+        <CollapsibleContent className="pt-3">
+          <div className="grid gap-3 sm:grid-cols-2">
+            <Field name="name" label="Display name" placeholder={providerLabels[provider]} />
+            <Field name="connectionName" label="Connection" placeholder="default" />
+          </div>
+          <div className="mt-3">
+            <Field name="slug" label="Tool namespace" placeholder="Generated automatically" />
+          </div>
+        </CollapsibleContent>
+      </Collapsible>
       {error && <p className="text-sm text-destructive">{error}</p>}
       <div className="flex justify-end gap-2">
         <Button type="button" variant="ghost" onClick={onDone} disabled={busy}>
@@ -274,10 +308,7 @@ function BrowsersPage() {
   const [adding, setAdding] = useState<RemoteProvider | null>(null);
   const [stopping, setStopping] = useState<string | null>(null);
   const value = AsyncResult.isSuccess(overview) ? overview.value : null;
-  const remoteTargets = useMemo(
-    () => value?.targets.filter((target) => target.provider !== "local-extension") || [],
-    [value],
-  );
+  const liveTargets = value?.targets.filter((target) => target.state === "live").length || 0;
 
   return (
     <div className="mx-auto flex w-full max-w-6xl flex-col gap-8 px-5 py-7 md:px-8">
@@ -301,11 +332,9 @@ function BrowsersPage() {
 
       <section className="grid gap-3">
         <div className="flex items-center justify-between">
-          <h2 className="text-sm font-semibold uppercase text-muted-foreground">
-            Available targets
-          </h2>
+          <h2 className="text-sm font-semibold uppercase text-muted-foreground">Browser targets</h2>
           <span className="text-xs text-muted-foreground">
-            {value ? `${value.targets.length} configured` : "Loading"}
+            {value ? `${liveTargets} live · ${value.targets.length} configured` : "Loading"}
           </span>
         </div>
         <div className="grid gap-3 md:grid-cols-2">
@@ -325,9 +354,12 @@ function BrowsersPage() {
                     </div>
                     <p className="mt-1 text-xs text-muted-foreground">{target.detail}</p>
                     {target.address && (
-                      <code className="mt-3 block truncate rounded bg-muted px-2 py-1.5 text-xs">
-                        {target.address}
-                      </code>
+                      <div className="mt-3 flex min-w-0 items-center rounded bg-muted pl-2">
+                        <code className="min-w-0 flex-1 truncate py-1.5 text-xs">
+                          {target.address}
+                        </code>
+                        <CopyButton value={target.address} className="mr-1" />
+                      </div>
                     )}
                     <div className="mt-3 flex items-center gap-2">
                       {target.session?.liveUrl && (
@@ -375,7 +407,7 @@ function BrowsersPage() {
             Remote providers
           </h2>
           <p className="mt-1 text-xs text-muted-foreground">
-            Supported means the adapter ships with Executor. Configured targets appear above.
+            Availability reflects this Executor host. Configured sessions start on first use.
           </p>
         </div>
         <div className="divide-y rounded-md border">
@@ -388,39 +420,39 @@ function BrowsersPage() {
                   <div className="min-w-0 flex-1">
                     <div className="flex flex-wrap items-center gap-2">
                       <h3 className="text-sm font-medium">{provider.name}</h3>
-                      <Badge variant="outline">Supported</Badge>
+                      <AvailabilityBadge availability={provider.availability} />
+                      <Badge variant="secondary">
+                        {provider.transport === "cdp" ? "CDP" : "agent-browser"}
+                      </Badge>
                       {provider.configured > 0 && (
                         <Badge variant="secondary">{provider.configured} configured</Badge>
                       )}
                     </div>
                     <p className="mt-1 text-xs text-muted-foreground">
-                      {provider.note} · {provider.setup}
+                      {provider.note} · {provider.availabilityDetail}
                     </p>
                   </div>
                   <Button
                     variant={open ? "ghost" : "outline"}
                     size="sm"
+                    disabled={provider.availability === "unavailable"}
+                    title={
+                      provider.availability === "unavailable"
+                        ? provider.availabilityDetail
+                        : undefined
+                    }
                     onClick={() => setAdding(open ? null : provider.id)}
                   >
                     {open ? <X className="size-4" /> : <Plus className="size-4" />}
-                    {open ? "Close" : "Configure"}
+                    {open ? "Close" : provider.configured > 0 ? "Add target" : "Configure"}
                   </Button>
                 </div>
-                {open && (
-                  <ProviderForm initialProvider={provider.id} onDone={() => setAdding(null)} />
-                )}
+                {open && <ProviderForm provider={provider.id} onDone={() => setAdding(null)} />}
               </div>
             );
           })}
         </div>
       </section>
-
-      {remoteTargets.length === 0 && value && (
-        <p className="text-xs text-muted-foreground">
-          Remote sessions are created lazily. Adding a provider does not start billable browser
-          time.
-        </p>
-      )}
     </div>
   );
 }

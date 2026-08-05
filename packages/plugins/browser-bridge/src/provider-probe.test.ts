@@ -145,20 +145,36 @@ describe("probeProvider", () => {
   it("probes a stored Vercel token rather than looking at the host", async () => {
     // A token target does not care what the host's ambient identity is, so an
     // absent VERCEL_OIDC_TOKEN must not make a perfectly good token fail.
-    const fetch = respond({ "/v2/user": { status: 200, body: { user: { id: "u" } } } });
-    const probe = await probeProvider({ provider: "vercel-sandbox", auth: "token" }, "vercel_abc", {
-      env: {},
-      fetch,
+    const fetch = respond({
+      "/v2/user": { status: 200, body: { user: { id: "u" } } },
+      "/v2/teams/": { status: 200, body: { id: "team_1" } },
     });
+    const probe = await probeProvider(
+      {
+        provider: "vercel-sandbox",
+        auth: "token",
+        teamId: "team_1",
+        projectId: "prj_1",
+      },
+      "vercel_abc",
+      { env: {}, fetch },
+    );
 
     expect(probe.ok).toBe(true);
     expect(String(fetch.mock.calls[0]?.[0])).toContain("api.vercel.com/v2/user");
   });
 
   it("rejects a Vercel token the API refuses", async () => {
-    const probe = await probeProvider({ provider: "vercel-sandbox", auth: "token" }, "bad", {
-      fetch: respond({ "/v2/user": { status: 401 } }),
-    });
+    const probe = await probeProvider(
+      {
+        provider: "vercel-sandbox",
+        auth: "token",
+        teamId: "team_1",
+        projectId: "prj_1",
+      },
+      "bad",
+      { fetch: respond({ "/v2/user": { status: 401 } }) },
+    );
 
     expect(probe.ok).toBe(false);
     if (probe.ok) return;
@@ -170,7 +186,12 @@ describe("probeProvider", () => {
     // "valid token" from "valid token for the wrong scope", and that difference
     // otherwise surfaces as a sandbox that will not start.
     const probe = await probeProvider(
-      { provider: "vercel-sandbox", auth: "token", teamId: "team_other" },
+      {
+        provider: "vercel-sandbox",
+        auth: "token",
+        teamId: "team_other",
+        projectId: "prj_1",
+      },
       "vercel_abc",
       {
         fetch: respond({
@@ -188,9 +209,21 @@ describe("probeProvider", () => {
   it("does not claim a Vercel token proves sandbox entitlement", async () => {
     // Vercel exposes no way to read this, so reporting it as verified would be
     // an invention — the same false green this whole probe layer exists to stop.
-    const probe = await probeProvider({ provider: "vercel-sandbox", auth: "token" }, "vercel_abc", {
-      fetch: respond({ "/v2/user": { status: 200, body: { user: { id: "u" } } } }),
-    });
+    const probe = await probeProvider(
+      {
+        provider: "vercel-sandbox",
+        auth: "token",
+        teamId: "team_1",
+        projectId: "prj_1",
+      },
+      "vercel_abc",
+      {
+        fetch: respond({
+          "/v2/user": { status: 200, body: { user: { id: "u" } } },
+          "/v2/teams/": { status: 200, body: { id: "team_1" } },
+        }),
+      },
+    );
 
     expect(probe.ok).toBe(true);
     if (!probe.ok) return;
@@ -198,13 +231,33 @@ describe("probeProvider", () => {
   });
 
   it("reports a token target with no token as configuration, not as a host problem", async () => {
-    const probe = await probeProvider({ provider: "vercel-sandbox", auth: "token" }, null, {
-      env: {},
+    const probe = await probeProvider(
+      {
+        provider: "vercel-sandbox",
+        auth: "token",
+        teamId: "team_1",
+        projectId: "prj_1",
+      },
+      null,
+      { env: {} },
+    );
+
+    expect(probe.ok).toBe(false);
+    if (probe.ok) return;
+    expect(probe.reason).toBe("config");
+  });
+
+  it("reports legacy Vercel token targets with no scope as configuration failures", async () => {
+    const fetch = vi.fn<typeof globalThis.fetch>();
+    const probe = await probeProvider({ provider: "vercel-sandbox", auth: "token" }, "vercel_abc", {
+      fetch,
     });
 
     expect(probe.ok).toBe(false);
     if (probe.ok) return;
     expect(probe.reason).toBe("config");
+    expect(probe.detail).toContain("Team ID and Project ID");
+    expect(fetch).not.toHaveBeenCalled();
   });
 
   it("sends the configured auth header to a generic CDP endpoint", async () => {

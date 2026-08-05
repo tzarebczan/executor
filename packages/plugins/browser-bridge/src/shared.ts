@@ -49,6 +49,15 @@ export const BrowserAccessView = Schema.Struct({
 
 export type BrowserAccessView = typeof BrowserAccessView.Type;
 
+export const BrowserStartFailure = Schema.Struct({
+  reason: Schema.Literals(["config", "auth", "permission", "quota", "network", "provider"]),
+  detail: Schema.String,
+  hint: Schema.String,
+  failedAt: Schema.Number,
+});
+
+export type BrowserStartFailureView = typeof BrowserStartFailure.Type;
+
 export const BrowserTargetView = Schema.Struct({
   integration: Schema.String,
   name: Schema.String,
@@ -63,11 +72,14 @@ export const BrowserTargetView = Schema.Struct({
   address: Schema.optional(Schema.String),
   /** `stale` is the same 90s rule the health check uses, so the card and the
    *  health dot cannot disagree about whether the bridge is answering. */
-  state: Schema.Literals(["live", "stale", "ready", "offline", "needs-connection"]),
+  state: Schema.Literals(["live", "stale", "ready", "offline", "needs-connection", "error"]),
   detail: Schema.String,
   session: Schema.optional(BrowserSessionView),
   access: Schema.optional(BrowserAccessView),
+  failure: Schema.optional(BrowserStartFailure),
 });
+
+export type BrowserTargetView = typeof BrowserTargetView.Type;
 
 export const BrowserOverview = Schema.Struct({
   providers: Schema.Array(BrowserProviderDefinition),

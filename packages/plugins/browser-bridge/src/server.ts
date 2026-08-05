@@ -54,6 +54,7 @@ import {
 } from "./provider-probe";
 import {
   getRemoteBrowserSession,
+  getRemoteBrowserFailure,
   listRemoteBrowserSessions,
   runRemoteBrowserTool,
   startRemoteBrowserSession,
@@ -65,6 +66,7 @@ import {
   type AddBrowserProviderInput,
   type BrowserAccessView,
   type BrowserConnectionTestView,
+  type BrowserStartFailureView,
   type ReusableCredentialView,
 } from "./shared";
 
@@ -339,6 +341,7 @@ function probeTargetFor(
         provider: config.provider,
         ...(config.auth ? { auth: config.auth } : {}),
         ...(config.teamId ? { teamId: config.teamId } : {}),
+        ...(config.projectId ? { projectId: config.projectId } : {}),
       };
     case "generic-cdp":
       return {
@@ -465,10 +468,11 @@ type BrowserTargetView = {
   readonly provider: BrowserIntegrationConfig["provider"];
   readonly connection?: string;
   readonly address?: string;
-  readonly state: "live" | "stale" | "ready" | "offline" | "needs-connection";
+  readonly state: "live" | "stale" | "ready" | "offline" | "needs-connection" | "error";
   readonly detail: string;
   readonly session?: Omit<ReturnType<typeof listRemoteBrowserSessions>[number], "key">;
   readonly access?: BrowserAccessView;
+  readonly failure?: BrowserStartFailureView;
 };
 
 /**
@@ -574,6 +578,13 @@ function withoutSessionKey(
   return view;
 }
 
+function withoutFailureKey(
+  failure: NonNullable<ReturnType<typeof getRemoteBrowserFailure>>,
+): BrowserStartFailureView {
+  const { key: _key, provider: _provider, ...view } = failure;
+  return view;
+}
+
 function browserOverviewEffect(ctx: PluginCtx) {
   return Effect.gen(function* () {
     const integrations = yield* ctx.core.integrations.list();
@@ -634,6 +645,7 @@ function browserOverviewEffect(ctx: PluginCtx) {
           String(connection.name),
         );
         const session = getRemoteBrowserSession(key);
+        const failure = getRemoteBrowserFailure(key);
         const hostReady = remoteTargetHostReady(record.config);
         targets.push({
           integration: String(record.integration.slug),
@@ -641,13 +653,16 @@ function browserOverviewEffect(ctx: PluginCtx) {
           provider: record.config.provider,
           connection: String(connection.name),
           address: connection.address,
-          state: session ? "live" : hostReady ? "ready" : "offline",
+          state: session ? "live" : failure ? "error" : hostReady ? "ready" : "offline",
           detail: session
             ? `Session ${session.sessionId} is active`
-            : hostReady
-              ? "Configured; starts on first browser call"
-              : "Host authentication is missing; this target cannot start",
+            : failure
+              ? failure.detail
+              : hostReady
+                ? "Configured; starts on first browser call"
+                : "Host authentication is missing; this target cannot start",
           ...(session ? { session: withoutSessionKey(session) } : {}),
+          ...(failure ? { failure: withoutFailureKey(failure) } : {}),
         });
       }
     }
@@ -731,10 +746,8 @@ function browserConfigFromInput(
         ...controls,
         ...(timeoutMs !== undefined ? { timeoutMs } : {}),
         ...(vcpus !== undefined ? { vcpus } : {}),
-        ...(auth === "token" && input.teamId?.trim() ? { teamId: input.teamId.trim() } : {}),
-        ...(auth === "token" && input.projectId?.trim()
-          ? { projectId: input.projectId.trim() }
-          : {}),
+        ...(auth === "token" ? { teamId: requiredText(input.teamId, "Team ID") } : {}),
+        ...(auth === "token" ? { projectId: requiredText(input.projectId, "Project ID") } : {}),
       };
     }
     case "cloudflare-browser-run": {

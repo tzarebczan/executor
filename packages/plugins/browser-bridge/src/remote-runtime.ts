@@ -39,6 +39,23 @@ export interface RemoteBrowserSessionSummary {
   readonly expiresAt?: string;
 }
 
+export type RemoteBrowserFailureReason =
+  | "config"
+  | "auth"
+  | "permission"
+  | "quota"
+  | "network"
+  | "provider";
+
+export interface RemoteBrowserFailure {
+  readonly key: string;
+  readonly provider: Exclude<BrowserIntegrationConfig["provider"], "local-extension">;
+  readonly reason: RemoteBrowserFailureReason;
+  readonly detail: string;
+  readonly hint: string;
+  readonly failedAt: number;
+}
+
 type ConsoleEntry = {
   readonly level: string;
   readonly text: string;
@@ -95,6 +112,148 @@ type RuntimeSession = {
 };
 
 const sessions = new Map<string, RuntimeSession>();
+const failures = new Map<string, RemoteBrowserFailure>();
+
+function failureText(error: unknown): string {
+  const parts: string[] = [];
+  let current: unknown = error;
+  for (let depth = 0; depth < 5 && current; depth += 1) {
+    if (typeof current === "object") {
+      const record = current as {
+        readonly name?: unknown;
+        readonly message?: unknown;
+        cause?: unknown;
+      };
+      if (typeof record.name === "string") parts.push(record.name);
+      if (typeof record.message === "string") parts.push(record.message);
+      current = record.cause;
+    } else {
+      parts.push(String(current));
+      break;
+    }
+  }
+  return parts.join(" ").toLowerCase();
+}
+
+function providerLabel(
+  provider: Exclude<BrowserIntegrationConfig["provider"], "local-extension">,
+): string {
+  switch (provider) {
+    case "vercel-sandbox":
+      return "Vercel Sandbox";
+    case "cloudflare-browser-run":
+      return "Cloudflare Browser Run";
+    case "browser-use":
+      return "Browser Use";
+    case "generic-cdp":
+      return "CDP browser";
+  }
+}
+
+export function classifyRemoteBrowserFailure(
+  key: string,
+  provider: Exclude<BrowserIntegrationConfig["provider"], "local-extension">,
+  error: unknown,
+  failedAt = Date.now(),
+): RemoteBrowserFailure {
+  const text = failureText(error);
+  const label = providerLabel(provider);
+  if (
+    text.includes("teamid") ||
+    text.includes("projectid") ||
+    text.includes("team id") ||
+    text.includes("project id") ||
+    text.includes("missing credentials parameters")
+  ) {
+    return {
+      key,
+      provider,
+      reason: "config",
+      detail: `${label} could not start because its setup is incomplete`,
+      hint: "Add the required team and project IDs, then try the browser again.",
+      failedAt,
+    };
+  }
+  if (
+    text.includes("credit") ||
+    text.includes("billing") ||
+    text.includes("payment required") ||
+    text.includes("insufficient funds") ||
+    text.includes("quota") ||
+    text.includes("resource exhausted") ||
+    text.includes("status 402") ||
+    text.includes("(402)")
+  ) {
+    return {
+      key,
+      provider,
+      reason: "quota",
+      detail: `${label} could not start because the account has no available credits or quota`,
+      hint: "Add provider credits or increase its quota, then try the browser again.",
+      failedAt,
+    };
+  }
+  if (
+    text.includes("unauthorized") ||
+    text.includes("invalid token") ||
+    text.includes("authentication") ||
+    text.includes("status 401") ||
+    text.includes("(401)")
+  ) {
+    return {
+      key,
+      provider,
+      reason: "auth",
+      detail: `${label} rejected the configured credential`,
+      hint: "Replace the credential with a valid provider token and try again.",
+      failedAt,
+    };
+  }
+  if (
+    text.includes("forbidden") ||
+    text.includes("permission") ||
+    text.includes("status 403") ||
+    text.includes("(403)")
+  ) {
+    return {
+      key,
+      provider,
+      reason: "permission",
+      detail: `${label} refused permission to start a browser`,
+      hint: "Grant the credential access to this team and project, then try again.",
+      failedAt,
+    };
+  }
+  if (
+    text.includes("timeout") ||
+    text.includes("timed out") ||
+    text.includes("econn") ||
+    text.includes("enotfound") ||
+    text.includes("network") ||
+    text.includes("fetch failed")
+  ) {
+    return {
+      key,
+      provider,
+      reason: "network",
+      detail: `${label} could not be reached while starting the browser`,
+      hint: "Check Executor's network path to the provider and try again.",
+      failedAt,
+    };
+  }
+  return {
+    key,
+    provider,
+    reason: "provider",
+    detail: `${label} returned an unexpected error while starting the browser`,
+    hint: "Retry once; if it fails again, check the Executor server logs for the provider error.",
+    failedAt,
+  };
+}
+
+export function getRemoteBrowserFailure(key: string): RemoteBrowserFailure | null {
+  return failures.get(key) || null;
+}
 
 /**
  * Idle window for a remote session when the target does not set one.
@@ -381,14 +540,22 @@ export async function startRemoteBrowserSession(
 ): Promise<RemoteBrowserSessionSummary> {
   const existing = sessions.get(key);
   if (existing) {
+    failures.delete(key);
     existing.lastUsedAt = Date.now();
     return summarize(existing);
   }
   const pending = starting.get(key);
   if (pending) return pending;
-  const created = createRemoteBrowserSession(key, config, credential).finally(() =>
-    starting.delete(key),
-  );
+  const created = createRemoteBrowserSession(key, config, credential)
+    .then((session) => {
+      failures.delete(key);
+      return session;
+    })
+    .catch((error) => {
+      failures.set(key, classifyRemoteBrowserFailure(key, config.provider, error));
+      throw error;
+    })
+    .finally(() => starting.delete(key));
   starting.set(key, created);
   return created;
 }
@@ -423,6 +590,7 @@ async function createRemoteBrowserSession(
 }
 
 export async function stopRemoteBrowserSession(key: string): Promise<boolean> {
+  failures.delete(key);
   const session = sessions.get(key);
   if (!session) return false;
   sessions.delete(key);
@@ -434,6 +602,7 @@ export async function stopRemoteBrowserSession(key: string): Promise<boolean> {
 
 export async function stopAllRemoteBrowserSessions(): Promise<void> {
   await Promise.all([...sessions.keys()].map((key) => stopRemoteBrowserSession(key)));
+  failures.clear();
 }
 
 function summarize(session: RuntimeSession): RemoteBrowserSessionSummary {

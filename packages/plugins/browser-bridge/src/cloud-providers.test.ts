@@ -77,14 +77,37 @@ describe("cloud browser providers", () => {
       .mockResolvedValue({ session: "vercel-1", exec: vi.fn(), close: vi.fn() });
 
     await createCloudBrowserSession(
-      { provider: "vercel-sandbox", token: "vercel_abc", teamId: "team_1", vcpus: 4 },
+      {
+        provider: "vercel-sandbox",
+        token: "vercel_abc",
+        teamId: "team_1",
+        projectId: "prj_1",
+        vcpus: 4,
+      },
       { createVercelBrowser: ambient, createTokenVercelBrowser: tokenBrowser },
     );
 
     expect(ambient).not.toHaveBeenCalled();
     expect(tokenBrowser).toHaveBeenCalledWith(
-      expect.objectContaining({ token: "vercel_abc", teamId: "team_1", vcpus: 4 }),
+      expect.objectContaining({
+        token: "vercel_abc",
+        teamId: "team_1",
+        projectId: "prj_1",
+        vcpus: 4,
+      }),
     );
+  });
+
+  it("fails before provisioning when a token target has no Vercel scope", async () => {
+    const tokenBrowser = vi.fn();
+
+    await expect(
+      createCloudBrowserSession(
+        { provider: "vercel-sandbox", token: "vercel_abc" },
+        { createTokenVercelBrowser: tokenBrowser },
+      ),
+    ).rejects.toThrow(/Team ID and Project ID are required/);
+    expect(tokenBrowser).not.toHaveBeenCalled();
   });
 
   it("still uses the ambient identity when no token is configured", async () => {

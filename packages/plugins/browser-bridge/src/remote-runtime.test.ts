@@ -23,6 +23,8 @@ vi.mock("./cloud-providers", () => ({
 import { createCloudBrowserSession } from "./cloud-providers";
 import {
   DEFAULT_IDLE_TIMEOUT_MS,
+  classifyRemoteBrowserFailure,
+  getRemoteBrowserFailure,
   getRemoteBrowserSession,
   idleTimeoutMsFor,
   reapIdleRemoteBrowserSessions,
@@ -113,6 +115,47 @@ describe("remote browser runtime", () => {
       flags: undefined,
       output: "json",
     });
+  });
+
+  it("retains an actionable configuration failure after a cold start fails", async () => {
+    vi.mocked(createCloudBrowserSession).mockRejectedValueOnce({
+      message: "Missing credentials parameters to access the Vercel API: teamId, projectId",
+    });
+    const key = "vercel:missing-scope";
+
+    await expect(
+      runRemoteBrowserTool({
+        key,
+        config: { provider: "vercel-sandbox" },
+        credential: "secret",
+        tool: "tabs.list",
+        args: {},
+      }),
+    ).rejects.toThrow(/teamId, projectId/);
+
+    expect(getRemoteBrowserFailure(key)).toMatchObject({
+      reason: "config",
+      detail: expect.stringContaining("setup is incomplete"),
+      hint: expect.stringContaining("team and project IDs"),
+    });
+  });
+
+  it("classifies provider credit failures without exposing the raw error", () => {
+    const failure = classifyRemoteBrowserFailure(
+      "vercel:no-credit",
+      "vercel-sandbox",
+      { message: "Payment required: insufficient credits for secret account abc" },
+      123,
+    );
+
+    expect(failure).toMatchObject({
+      reason: "quota",
+      detail:
+        "Vercel Sandbox could not start because the account has no available credits or quota",
+      failedAt: 123,
+    });
+    expect(failure.detail).not.toContain("secret account abc");
+    expect(failure.hint).not.toContain("secret account abc");
   });
 });
 

@@ -366,6 +366,7 @@ export type ProbeTarget =
       readonly provider: "vercel-sandbox";
       readonly auth?: "token" | "ambient";
       readonly teamId?: string;
+      readonly projectId?: string;
     }
   | { readonly provider: "cloudflare-browser-run"; readonly accountId: string }
   | { readonly provider: "browser-use" }
@@ -395,6 +396,14 @@ export async function probeProvider(
       // real credential and gets a real probe; ambient OIDC is not a secret at
       // all, so there the only answerable question is whether the host has one.
       if (target.auth === "token") {
+        if (!target.teamId || !target.projectId) {
+          return {
+            ok: false,
+            reason: "config",
+            detail: "Team ID and Project ID are required for token-backed Vercel Sandbox targets",
+            hint: "Remove and re-add this target with both IDs from the Vercel project settings.",
+          };
+        }
         return credential
           ? probeVercelToken(credential, target.teamId, fetchImpl, timeoutMs)
           : {

@@ -115,11 +115,16 @@ export async function createCloudBrowserSession(
   if (config.provider === "vercel-sandbox") {
     // A stored token wins over the ambient identity: it was chosen explicitly,
     // and it is the only path that works when Executor does not run on Vercel.
+    if (config.token && (!config.teamId || !config.projectId)) {
+      throw new Error(
+        "Vercel Team ID and Project ID are required when a browser target uses an API token",
+      );
+    }
     const browser = config.token
       ? await (dependencies.createTokenVercelBrowser || createTokenVercelBrowser)({
           token: config.token,
-          teamId: config.teamId,
-          projectId: config.projectId,
+          teamId: config.teamId!,
+          projectId: config.projectId!,
           timeoutMs: config.timeoutMs,
           vcpus: config.vcpus,
           image: config.image,

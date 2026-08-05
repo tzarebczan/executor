@@ -42,6 +42,7 @@ import {
   type AddBrowserProviderInput,
   type BrowserAccessView,
   type BrowserConnectionTestView,
+  type BrowserTargetView,
   type ReusableCredentialView,
 } from "./shared";
 
@@ -88,6 +89,10 @@ const stateTone: Record<string, { readonly badge: string; readonly dot: string }
     badge: "border-sky-500/40 bg-sky-500/10 text-sky-700 dark:text-sky-300",
     dot: "bg-sky-500",
   },
+  error: {
+    badge: "border-destructive/40 bg-destructive/10 text-destructive",
+    dot: "bg-destructive",
+  },
 };
 
 function StateBadge({ state }: { readonly state: string }) {
@@ -95,7 +100,7 @@ function StateBadge({ state }: { readonly state: string }) {
   return (
     <Badge variant="outline" className={tone?.badge || "text-muted-foreground"}>
       <span className={`size-1.5 rounded-full ${tone?.dot || "bg-muted-foreground/50"}`} />
-      {state.replace("-", " ")}
+      {state === "error" ? "start failed" : state.replace("-", " ")}
     </Badge>
   );
 }
@@ -395,8 +400,8 @@ function ProviderForm({
             <>
               {!reuse && <SecretField name="credential" label={secretLabel!} />}
               <div className="grid gap-3 sm:grid-cols-2">
-                <Field name="teamId" label="Team ID" placeholder="Optional" />
-                <Field name="projectId" label="Project ID" placeholder="Optional" />
+                <Field name="teamId" label="Team ID" placeholder="team_..." required />
+                <Field name="projectId" label="Project ID" placeholder="prj_..." required />
               </div>
             </>
           )}
@@ -650,6 +655,16 @@ function BrowsersPage() {
                         <StateBadge state={target.state} />
                       </div>
                       <p className="mt-1 text-xs text-muted-foreground">{target.detail}</p>
+                      {target.failure && (
+                        <div className="mt-2 border-l-2 border-destructive pl-2">
+                          <p className="text-xs font-medium text-destructive">
+                            {target.failure.hint}
+                          </p>
+                          <p className="mt-1 text-xs text-muted-foreground">
+                            Last start attempt {untilLabel(Date.now(), target.failure.failedAt)} ago
+                          </p>
+                        </div>
+                      )}
                       {target.session && (
                         <p className="mt-1 text-xs text-muted-foreground">
                           Stops after {untilLabel(target.session.idleExpiresAt, Date.now())} idle

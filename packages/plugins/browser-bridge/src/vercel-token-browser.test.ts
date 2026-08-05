@@ -43,16 +43,22 @@ describe("createTokenVercelBrowser", () => {
     );
   });
 
-  it("omits team and project rather than sending empty ones", async () => {
-    // Vercel resolves the scope from the token when these are absent. Sending
-    // an empty string instead would be a lookup for a team that does not exist.
+  it("refuses to start without the Vercel scope", async () => {
     const createSandbox = vi.fn().mockResolvedValue(fakeSandbox());
 
-    await createTokenVercelBrowser({ token: "vercel_abc" }, { createSandbox });
-
-    const options = createSandbox.mock.calls[0]![0] as Record<string, unknown>;
-    expect("teamId" in options).toBe(false);
-    expect("projectId" in options).toBe(false);
+    await expect(
+      createTokenVercelBrowser(
+        { token: "vercel_abc", teamId: "", projectId: "prj_1" },
+        { createSandbox },
+      ),
+    ).rejects.toThrow(/Team ID is required/);
+    await expect(
+      createTokenVercelBrowser(
+        { token: "vercel_abc", teamId: "team_1", projectId: "" },
+        { createSandbox },
+      ),
+    ).rejects.toThrow(/Project ID is required/);
+    expect(createSandbox).not.toHaveBeenCalled();
   });
 
   it("carries the browser environment the CLI expects", async () => {
@@ -61,7 +67,10 @@ describe("createTokenVercelBrowser", () => {
     // sandbox that boots and then fails at the first page load.
     const createSandbox = vi.fn().mockResolvedValue(fakeSandbox());
 
-    await createTokenVercelBrowser({ token: "t" }, { createSandbox });
+    await createTokenVercelBrowser(
+      { token: "t", teamId: "team_1", projectId: "prj_1" },
+      { createSandbox },
+    );
 
     const { env } = createSandbox.mock.calls[0]![0] as { env: Record<string, string> };
     expect(env.AGENT_BROWSER_ARGS).toContain("--no-sandbox");
@@ -71,9 +80,12 @@ describe("createTokenVercelBrowser", () => {
   it("refuses to start without a token", async () => {
     const createSandbox = vi.fn();
 
-    await expect(createTokenVercelBrowser({ token: "" }, { createSandbox })).rejects.toThrow(
-      /Vercel API token is required/,
-    );
+    await expect(
+      createTokenVercelBrowser(
+        { token: "", teamId: "team_1", projectId: "prj_1" },
+        { createSandbox },
+      ),
+    ).rejects.toThrow(/Vercel API token is required/);
     expect(createSandbox).not.toHaveBeenCalled();
   });
 
@@ -84,7 +96,10 @@ describe("createTokenVercelBrowser", () => {
     const sandbox = fakeSandbox();
     const createSandbox = vi.fn().mockResolvedValue(sandbox);
 
-    const browser = await createTokenVercelBrowser({ token: "t" }, { createSandbox });
+    const browser = await createTokenVercelBrowser(
+      { token: "t", teamId: "team_1", projectId: "prj_1" },
+      { createSandbox },
+    );
     await browser.exec("open", { args: ["https://example.com"] });
 
     expect(sandbox.runCommand).toHaveBeenCalledWith(
@@ -96,7 +111,10 @@ describe("createTokenVercelBrowser", () => {
     const sandbox = fakeSandbox();
     const createSandbox = vi.fn().mockResolvedValue(sandbox);
 
-    const browser = await createTokenVercelBrowser({ token: "t" }, { createSandbox });
+    const browser = await createTokenVercelBrowser(
+      { token: "t", teamId: "team_1", projectId: "prj_1" },
+      { createSandbox },
+    );
     await browser.close();
 
     expect(sandbox.stop).toHaveBeenCalled();

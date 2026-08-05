@@ -37,10 +37,10 @@ const DEFAULT_COMMAND_TIMEOUT_MS = 60_000;
 export type TokenVercelBrowserOptions = {
   /** Vercel API token. Required — this path exists to avoid ambient identity. */
   readonly token: string;
-  /** Team the token is scoped to. Resolved by Vercel when omitted. */
-  readonly teamId?: string;
-  /** Sandbox project. Vercel provisions a default one when omitted. */
-  readonly projectId?: string;
+  /** Team the token is scoped to. Required by the Sandbox API. */
+  readonly teamId: string;
+  /** Project that owns the sandbox. Required by the Sandbox API. */
+  readonly projectId: string;
   readonly image?: string;
   readonly timeoutMs?: number;
   readonly vcpus?: number;
@@ -52,8 +52,8 @@ type SandboxHandle = Awaited<ReturnType<typeof Sandbox.create>>;
 /** Injected in tests so the adapter can be exercised without provisioning. */
 export type VercelSandboxFactory = (options: {
   readonly token: string;
-  readonly teamId?: string;
-  readonly projectId?: string;
+  readonly teamId: string;
+  readonly projectId: string;
   readonly image: string;
   readonly timeout: number;
   readonly resources: { readonly vcpus: number };
@@ -139,14 +139,17 @@ export async function createTokenVercelBrowser(
   deps: { readonly createSandbox?: VercelSandboxFactory } = {},
 ): Promise<AgentBrowser> {
   if (!options.token) throw new Error("A Vercel API token is required for this browser target");
+  if (!options.teamId) throw new Error("A Vercel Team ID is required for this browser target");
+  if (!options.projectId)
+    throw new Error("A Vercel Project ID is required for this browser target");
   const env: Record<string, string> = { ...BASE_ENV };
   const create =
     deps.createSandbox ||
     ((input) =>
       Sandbox.create({
         token: input.token,
-        ...(input.teamId ? { teamId: input.teamId } : {}),
-        ...(input.projectId ? { projectId: input.projectId } : {}),
+        teamId: input.teamId,
+        projectId: input.projectId,
         image: input.image,
         resources: input.resources,
         timeout: input.timeout,
@@ -157,8 +160,8 @@ export async function createTokenVercelBrowser(
 
   const sandbox = await create({
     token: options.token,
-    ...(options.teamId ? { teamId: options.teamId } : {}),
-    ...(options.projectId ? { projectId: options.projectId } : {}),
+    teamId: options.teamId,
+    projectId: options.projectId,
     image: options.image || process.env.REMOTE_AGENT_BROWSER_IMAGE || DEFAULT_IMAGE,
     timeout: options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
     resources: { vcpus: options.vcpus ?? 2 },

@@ -157,6 +157,22 @@ describe("remote browser runtime", () => {
     expect(failure.detail).not.toContain("secret account abc");
     expect(failure.hint).not.toContain("secret account abc");
   });
+
+  it("classifies a missing Vercel project or VCR image as setup", () => {
+    const failure = classifyRemoteBrowserFailure(
+      "vercel:missing-image",
+      "vercel-sandbox",
+      { message: "Status code 404 is not ok" },
+      456,
+    );
+
+    expect(failure).toMatchObject({
+      reason: "config",
+      detail: "Vercel Sandbox could not find the configured project or browser image",
+      failedAt: 456,
+    });
+    expect(failure.hint).toContain("Vercel Container Registry");
+  });
 });
 
 describe("idle session reaping", () => {

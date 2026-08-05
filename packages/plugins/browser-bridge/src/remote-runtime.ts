@@ -174,6 +174,16 @@ export function classifyRemoteBrowserFailure(
       failedAt,
     };
   }
+  if (text.includes("status code 404") || text.includes("status 404") || text.includes("(404)")) {
+    return {
+      key,
+      provider,
+      reason: "config",
+      detail: `${label} could not find the configured project or browser image`,
+      hint: "Verify the Project ID and push the configured image to that project's Vercel Container Registry.",
+      failedAt,
+    };
+  }
   if (
     text.includes("credit") ||
     text.includes("billing") ||

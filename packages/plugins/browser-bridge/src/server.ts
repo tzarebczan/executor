@@ -748,6 +748,7 @@ function browserConfigFromInput(
         ...(vcpus !== undefined ? { vcpus } : {}),
         ...(auth === "token" ? { teamId: requiredText(input.teamId, "Team ID") } : {}),
         ...(auth === "token" ? { projectId: requiredText(input.projectId, "Project ID") } : {}),
+        ...(input.image?.trim() ? { image: input.image.trim() } : {}),
       };
     }
     case "cloudflare-browser-run": {

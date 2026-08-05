@@ -88,7 +88,15 @@ export const PROVIDER_SETUP: Record<CloudBrowserProvider, ProviderSetup> = {
         url: "https://vercel.com/account/settings/tokens",
       },
       {
-        text: "Scope the token to the team whose sandboxes you want to use, then give that team ID below.",
+        text:
+          "Scope the token to the team whose sandboxes you want to use, then enter that team ID and " +
+          "the project ID that will own the sandbox.",
+      },
+      {
+        text:
+          "Push a browser-ready image to that project's Vercel Container Registry. The default image " +
+          "name is remote-agent-browser:latest; enter another repository:tag below if needed.",
+        url: "https://vercel.com/docs/sandbox/concepts/images",
       },
       {
         text:

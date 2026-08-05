@@ -103,6 +103,7 @@ export const AddBrowserProviderPayload = Schema.Struct({
   vercelAuth: Schema.optional(Schema.Literals(["token", "ambient"])),
   teamId: Schema.optional(Schema.String),
   projectId: Schema.optional(Schema.String),
+  image: Schema.optional(Schema.String),
   cdpUrl: Schema.optional(Schema.String),
   liveUrl: Schema.optional(Schema.String),
   authHeaderName: Schema.optional(Schema.String),
@@ -161,45 +162,58 @@ export const ReusableCredential = Schema.Struct({
 
 export type ReusableCredentialView = typeof ReusableCredential.Type;
 
+/**
+ * Every failure on these routes is the caller's to fix.
+ *
+ * A bare `Schema.String` error carries no status annotation, and HttpApi
+ * defaults an unannotated error to 500 — so "paste an account ID" and "that
+ * token was rejected" both reached the browser as `POST /api/browsers 500
+ * (Internal Server Error)`. The message was in the body and did render in the
+ * form, but the console said the server had crashed, which is the wrong thing
+ * to tell anyone: it sends them to the server logs for a problem in their
+ * input. Every other plugin in the repo annotates its errors; this one did not.
+ */
+const BrowserControlError = Schema.String.annotate({ httpApiStatus: 400 });
+
 export const BrowserControlApi = HttpApiGroup.make("browserControl")
   .add(
     HttpApiEndpoint.get("overview", "/browsers", {
       success: BrowserOverview,
-      error: Schema.String,
+      error: BrowserControlError,
     }),
   )
   .add(
     HttpApiEndpoint.post("addProvider", "/browsers", {
       payload: AddBrowserProviderPayload,
       success: BrowserTargetView,
-      error: Schema.String,
+      error: BrowserControlError,
     }),
   )
   .add(
     HttpApiEndpoint.post("stopSession", "/browsers/:integration/:connection/stop", {
       params: Schema.Struct({ integration: Schema.String, connection: Schema.String }),
       success: Schema.Struct({ stopped: Schema.Boolean }),
-      error: Schema.String,
+      error: BrowserControlError,
     }),
   )
   .add(
     HttpApiEndpoint.delete("removeTarget", "/browsers/:integration/:connection", {
       params: Schema.Struct({ integration: Schema.String, connection: Schema.String }),
       success: Schema.Struct({ removed: Schema.Boolean }),
-      error: Schema.String,
+      error: BrowserControlError,
     }),
   )
   .add(
     HttpApiEndpoint.get("reusableCredentials", "/browsers/credentials/:provider", {
       params: Schema.Struct({ provider: RemoteBrowserProvider }),
       success: Schema.Array(ReusableCredential),
-      error: Schema.String,
+      error: BrowserControlError,
     }),
   )
   .add(
     HttpApiEndpoint.post("testConnection", "/browsers/:integration/:connection/test", {
       params: Schema.Struct({ integration: Schema.String, connection: Schema.String }),
       success: BrowserConnectionTest,
-      error: Schema.String,
+      error: BrowserControlError,
     }),
   );

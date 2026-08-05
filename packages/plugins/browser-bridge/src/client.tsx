@@ -323,6 +323,7 @@ function ProviderForm({
       liveUrl: text("liveUrl"),
       teamId: text("teamId"),
       projectId: text("projectId"),
+      image: text("image"),
       ...(provider === "vercel-sandbox" ? { vercelAuth: vercelAmbient ? "ambient" : "token" } : {}),
       authHeaderName: text("authHeaderName"),
       authPrefix: text("authPrefix"),
@@ -403,6 +404,11 @@ function ProviderForm({
                 <Field name="teamId" label="Team ID" placeholder="team_..." required />
                 <Field name="projectId" label="Project ID" placeholder="prj_..." required />
               </div>
+              <Field
+                name="image"
+                label="VCR browser image"
+                placeholder="remote-agent-browser:latest (default)"
+              />
             </>
           )}
           <div className="grid gap-3 sm:grid-cols-2">

@@ -2,6 +2,8 @@
 
 import { AgentBrowser, type BrowserCommandResult } from "remote-agent-browser";
 
+import { createTokenVercelBrowser } from "./vercel-token-browser";
+
 export type CloudBrowserProvider =
   | "vercel-sandbox"
   | "cloudflare-browser-run"
@@ -25,6 +27,14 @@ export type CloudBrowserProviderConfig =
       readonly vcpus?: number;
       readonly image?: string;
       readonly args?: readonly string[];
+      /**
+       * A Vercel API token. When present the sandbox is provisioned with it
+       * instead of the host's ambient OIDC identity, which is the difference
+       * between "works anywhere Executor runs" and "works only on Vercel".
+       */
+      readonly token?: string;
+      readonly teamId?: string;
+      readonly projectId?: string;
     }
   | {
       readonly provider: "cloudflare-browser-run";
@@ -79,6 +89,7 @@ export const CLOUD_BROWSER_PROVIDERS = [
 type ProviderDependencies = {
   readonly fetch?: typeof globalThis.fetch;
   readonly createVercelBrowser?: typeof AgentBrowser.create;
+  readonly createTokenVercelBrowser?: typeof createTokenVercelBrowser;
 };
 
 async function jsonRequest(
@@ -102,12 +113,24 @@ export async function createCloudBrowserSession(
   const fetchImpl = dependencies.fetch || globalThis.fetch;
 
   if (config.provider === "vercel-sandbox") {
-    const browser = await (dependencies.createVercelBrowser || AgentBrowser.create)({
-      timeoutMs: config.timeoutMs,
-      vcpus: config.vcpus,
-      image: config.image,
-      args: config.args ? [...config.args] : undefined,
-    });
+    // A stored token wins over the ambient identity: it was chosen explicitly,
+    // and it is the only path that works when Executor does not run on Vercel.
+    const browser = config.token
+      ? await (dependencies.createTokenVercelBrowser || createTokenVercelBrowser)({
+          token: config.token,
+          teamId: config.teamId,
+          projectId: config.projectId,
+          timeoutMs: config.timeoutMs,
+          vcpus: config.vcpus,
+          image: config.image,
+          args: config.args,
+        })
+      : await (dependencies.createVercelBrowser || AgentBrowser.create)({
+          timeoutMs: config.timeoutMs,
+          vcpus: config.vcpus,
+          image: config.image,
+          args: config.args ? [...config.args] : undefined,
+        });
     return {
       session: {
         provider: config.provider,

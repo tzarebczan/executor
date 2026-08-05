@@ -80,7 +80,9 @@ export const makeSelfHostApp = async (options: MakeSelfHostAppOptions = {}) => {
   const mcp = makeSelfHostMcpSeams(dbHandle, betterAuth, config);
 
   // Browser reverse bridge (Executor Browser extension path B).
-  // Same auth as API: cookie, Bearer session, or API key as Bearer / x-api-key.
+  // A presented credential is required — Bearer or x-api-key. The handler
+  // rejects cookie-only requests before this resolver runs, so a page the user
+  // has open cannot reach the bridge with their ambient session.
   //
   // After a session opens we provision tools.browser.user.desktop via MCP
   // `browserBridge.ensureChrome` (static tool) so the Executor UI shows Chrome.

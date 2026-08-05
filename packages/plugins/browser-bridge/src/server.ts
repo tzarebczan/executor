@@ -28,12 +28,13 @@ import {
   toolCallerRef,
 } from "@executor-js/sdk/core";
 
-import { callTool, listSessionsForUser, sessionPublicView } from "./store";
+import { callTool, listSessionsForUser, sessionPublicView, type BridgeSession } from "./store";
 import {
   BROWSER_TOOL_DEFINITIONS,
   BROWSER_TOOL_NAMES,
   browserToolCatalogName,
   browserToolNameFromCatalog,
+  isAdvancedBrowserTool,
   validateBrowserToolCall,
   type BrowserToolName,
 } from "./protocol";
@@ -46,6 +47,12 @@ import {
 } from "./integration-config";
 import { CLOUD_BROWSER_PROVIDERS } from "./cloud-providers";
 import {
+  probeProvider,
+  probeToHealthStatus,
+  type ProbeTarget,
+  type ProviderProbe,
+} from "./provider-probe";
+import {
   getRemoteBrowserSession,
   listRemoteBrowserSessions,
   runRemoteBrowserTool,
@@ -53,7 +60,13 @@ import {
   stopAllRemoteBrowserSessions,
   stopRemoteBrowserSession,
 } from "./remote-runtime";
-import { BrowserControlApi, type AddBrowserProviderInput } from "./shared";
+import {
+  BrowserControlApi,
+  type AddBrowserProviderInput,
+  type BrowserAccessView,
+  type BrowserConnectionTestView,
+  type ReusableCredentialView,
+} from "./shared";
 
 export interface BrowserBridgePluginOptions {
   readonly callTimeoutMs?: number;
@@ -124,128 +137,7 @@ function userIdFromOwner(owner: OwnerLike): string {
   return String(owner.subject || owner.tenant || "anonymous");
 }
 
-function isPlainObject(value: unknown): value is Record<string, unknown> {
-  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
-}
-
-function assertHttpUrl(url: unknown, field = "url"): string {
-  if (typeof url !== "string" || !url.trim()) throw new Error(`${field} is required`);
-  const parsed = new URL(url);
-  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-    throw new Error(`${field} must use http or https`);
-  }
-  return url;
-}
-
-function assertOptionalTabId(args: Record<string, unknown>): void {
-  if (args.tabId === undefined) return;
-  if (typeof args.tabId !== "number" || !Number.isInteger(args.tabId) || args.tabId < 0) {
-    throw new Error("tabId must be a non-negative integer");
-  }
-}
-
-/**
- * Validate generic `call` payload so it cannot bypass per-tool input rules.
- * Returns normalized { tool, args } for the reverse bridge.
- */
-export function validateInnerCallV1(
-  toolRaw: unknown,
-  argsRaw: unknown,
-): { tool: InnerBrowserTool; args: Record<string, unknown> } {
-  const tool = String(toolRaw || "");
-  if (!(INNER_BROWSER_TOOLS as readonly string[]).includes(tool)) {
-    throw new Error(
-      `Unknown or disallowed tool "${tool}". Use one of: ${INNER_BROWSER_TOOLS.join(", ")}`,
-    );
-  }
-  const args = argsRaw === undefined || argsRaw === null ? {} : argsRaw;
-  if (!isPlainObject(args)) {
-    throw new Error("args must be an object");
-  }
-  // Reject unexpected top-level keys per tool (defense in depth)
-  const only = (allowed: string[]) => {
-    for (const key of Object.keys(args)) {
-      if (!allowed.includes(key)) {
-        throw new Error(`Unexpected arg "${key}" for ${tool}`);
-      }
-    }
-  };
-
-  const normalizedTool = tool as InnerBrowserTool;
-  switch (normalizedTool) {
-    case "ping":
-    case "tabs.list":
-      only([]);
-      return { tool: normalizedTool, args: {} };
-    case "snapshot":
-    case "screenshot":
-      only(["tabId"]);
-      assertOptionalTabId(args);
-      return { tool: normalizedTool, args: args.tabId === undefined ? {} : { tabId: args.tabId } };
-    case "tabs.open": {
-      only(["url", "active"]);
-      const url = assertHttpUrl(args.url);
-      const out: Record<string, unknown> = { url };
-      if (args.active !== undefined) {
-        if (typeof args.active !== "boolean") throw new Error("active must be boolean");
-        out.active = args.active;
-      }
-      return { tool: normalizedTool, args: out };
-    }
-    case "navigate": {
-      only(["tabId", "url", "newTab"]);
-      assertOptionalTabId(args);
-      const url = assertHttpUrl(args.url);
-      const out: Record<string, unknown> = { url };
-      if (args.tabId !== undefined) out.tabId = args.tabId;
-      if (args.newTab !== undefined) {
-        if (typeof args.newTab !== "boolean") throw new Error("newTab must be boolean");
-        out.newTab = args.newTab;
-      }
-      return { tool: normalizedTool, args: out };
-    }
-    case "click": {
-      only(["tabId", "x", "y", "selector", "nodeIndex"]);
-      assertOptionalTabId(args);
-      const hasTarget =
-        args.selector != null || args.nodeIndex != null || (args.x != null && args.y != null);
-      if (!hasTarget) {
-        throw new Error("click requires selector, nodeIndex, or x+y");
-      }
-      if (args.selector !== undefined && (typeof args.selector !== "string" || !args.selector)) {
-        throw new Error("selector must be a non-empty string");
-      }
-      if (args.nodeIndex !== undefined) {
-        if (
-          typeof args.nodeIndex !== "number" ||
-          !Number.isInteger(args.nodeIndex) ||
-          args.nodeIndex < 0 ||
-          args.nodeIndex > 199
-        ) {
-          throw new Error("nodeIndex must be an integer 0–199");
-        }
-      }
-      if (args.x !== undefined && typeof args.x !== "number") throw new Error("x must be a number");
-      if (args.y !== undefined && typeof args.y !== "number") throw new Error("y must be a number");
-      return { tool: normalizedTool, args: { ...args } };
-    }
-    case "type": {
-      only(["tabId", "text", "selector", "submit"]);
-      assertOptionalTabId(args);
-      if (typeof args.text !== "string") throw new Error("text is required");
-      if (args.selector !== undefined && (typeof args.selector !== "string" || !args.selector)) {
-        throw new Error("selector must be a non-empty string");
-      }
-      if (args.submit !== undefined && typeof args.submit !== "boolean") {
-        throw new Error("submit must be boolean");
-      }
-      return { tool: normalizedTool, args: { ...args } };
-    }
-    default:
-      throw new Error(`Unhandled tool ${tool}`);
-  }
-}
-
+/** Validate a tool call against the protocol schema before it reaches a bridge. */
 export function validateInnerCall(
   toolRaw: unknown,
   argsRaw: unknown,
@@ -384,7 +276,8 @@ function catalogResult(): ResolveToolsResult {
 const REMOTE_SESSION_TOOLS: readonly ToolDef[] = [
   {
     name: ToolName.make("session_status"),
-    description: "Show the current remote browser session without starting one.",
+    description:
+      "Show the current remote browser session without starting one. `idleExpiresAt` is when the session closes if nothing uses it before then; the replacement session does not keep open tabs or sign-ins.",
     inputSchema: noArgsSchema,
   },
   {
@@ -400,14 +293,64 @@ const REMOTE_SESSION_TOOLS: readonly ToolDef[] = [
   },
 ];
 
-function remoteCatalogResult(): ResolveToolsResult {
+/**
+ * Whether a remote target exposes the Advanced tools.
+ *
+ * The local extension gates evaluate/pdf/console/network behind Advanced mode
+ * and a live control session, because they run inside the user's own signed-in
+ * Chrome. A remote target is a rented, isolated browser with no personal
+ * session to leak, so the same tools are ordinary capability there and default
+ * on. What was wrong before was not the default but the silence: the gate
+ * existed on one side only and nothing said so. It is now a property of the
+ * target, set once and enforced in both the catalog and the call.
+ */
+export function remoteAdvancedAllowed(
+  config: Exclude<BrowserIntegrationConfig, { provider: "local-extension" }>,
+): boolean {
+  return config.allowAdvanced !== false;
+}
+
+export function remoteCatalogResult(
+  config: Exclude<BrowserIntegrationConfig, { provider: "local-extension" }>,
+): ResolveToolsResult {
+  // Withheld rather than published-and-refused: an agent should not see a tool
+  // this target will never run.
+  const names = remoteAdvancedAllowed(config)
+    ? BROWSER_TOOL_NAMES
+    : BROWSER_TOOL_NAMES.filter((name) => !isAdvancedBrowserTool(name));
   return {
-    tools: [...REMOTE_SESSION_TOOLS, ...BROWSER_TOOL_NAMES.map(browserCatalogEntry)],
+    tools: [...REMOTE_SESSION_TOOLS, ...names.map(browserCatalogEntry)],
   };
 }
 
 function remoteSessionKey(owner: OwnerLike, integration: string, connection: string): string {
   return `${userIdFromOwner(owner)}:${integration}:${connection}`;
+}
+
+/** Project a stored integration config onto the probe's input shape. */
+function probeTargetFor(
+  config: Exclude<BrowserIntegrationConfig, { provider: "local-extension" }>,
+): ProbeTarget {
+  switch (config.provider) {
+    case "cloudflare-browser-run":
+      return { provider: config.provider, accountId: config.accountId };
+    case "vercel-sandbox":
+      return {
+        provider: config.provider,
+        ...(config.auth ? { auth: config.auth } : {}),
+        ...(config.teamId ? { teamId: config.teamId } : {}),
+      };
+    case "generic-cdp":
+      return {
+        provider: config.provider,
+        cdpUrl: config.cdpUrl,
+        ...(config.auth?.kind === "header"
+          ? { authHeaderName: config.auth.headerName, authPrefix: config.auth.prefix || "" }
+          : {}),
+      };
+    default:
+      return { provider: config.provider };
+  }
 }
 
 function isRemoteBrowserConfig(
@@ -416,23 +359,148 @@ function isRemoteBrowserConfig(
   return config !== null && config.provider !== "local-extension";
 }
 
+/**
+ * Verdict for the local extension bridge.
+ *
+ * `checkHealth` and the on-demand connection test both report on the same
+ * reverse session, so they read it through this one function rather than each
+ * deciding for itself what "live", "stale", and "absent" mean.
+ */
+export function localBridgeVerdict(
+  sessions: readonly BridgeSession[],
+  now: number,
+): { readonly status: "healthy" | "degraded"; readonly detail: string } {
+  const session = sessions[0];
+  if (!session) {
+    return {
+      status: "degraded",
+      detail: "Extension is not connected. Open the Executor Browser side panel and press Connect.",
+    };
+  }
+  const ageMs = now - session.lastSeenAt;
+  if (ageMs > SESSION_STALE_MS) {
+    return {
+      status: "degraded",
+      detail: [
+        `Extension stopped answering ${Math.round(ageMs / 1000)}s ago`,
+        "Reconnect the Executor Browser side panel.",
+      ].join(" · "),
+    };
+  }
+  const client = (session.client || {}) as { name?: string; version?: string };
+  const toolCount = ((session.capabilities || {}) as { tools?: string[] }).tools?.length ?? 0;
+  // User-facing proof the extension answers. "Reverse"/session-id/ISO-timestamp
+  // was transport vocabulary — true, but it read like a debug dump.
+  const seenSecondsAgo = Math.max(0, Math.round(ageMs / 1000));
+  return {
+    status: "healthy",
+    detail: [
+      "Extension connected",
+      client.name ? `${client.name} ${client.version || ""}`.trim() : null,
+      toolCount ? `${toolCount} tools` : null,
+      seenSecondsAgo <= 5 ? "answering now" : `last answered ${seenSecondsAgo}s ago`,
+    ]
+      .filter(Boolean)
+      .join(" · "),
+  };
+}
+
+/**
+ * Words that suggest an existing connection holds a credential this provider
+ * could use. Deliberately a hint, not a claim: a match only earns the
+ * connection a place in a list the user chooses from, and the secret is not
+ * read until they pick one and it passes a probe.
+ */
+const REUSE_HINTS: Record<
+  Exclude<BrowserIntegrationConfig["provider"], "local-extension">,
+  readonly string[]
+> = {
+  "cloudflare-browser-run": ["cloudflare"],
+  "browser-use": ["browser-use", "browseruse"],
+  // A Vercel API token is one credential across that whole account, so an
+  // integration already holding one can back a sandbox browser too.
+  "vercel-sandbox": ["vercel"],
+  // A CDP endpoint's header value is specific to that endpoint; nothing else
+  // in the catalog can be assumed to carry it.
+  "generic-cdp": [],
+};
+
+export function credentialLooksReusable(
+  provider: Exclude<BrowserIntegrationConfig["provider"], "local-extension">,
+  integrationSlug: string,
+  integrationName: string,
+): boolean {
+  const hints = REUSE_HINTS[provider];
+  if (hints.length === 0) return false;
+  const haystack = `${integrationSlug} ${integrationName}`.toLowerCase();
+  return hints.some((hint) => haystack.includes(hint));
+}
+
+/** Project a provider probe onto the connection-test view the UI renders. */
+export function connectionTestFromProbe(
+  probe: ProviderProbe,
+  providerName: string,
+  checkedAt: number,
+): BrowserConnectionTestView {
+  return probe.ok
+    ? {
+        ok: true,
+        detail: `${providerName}: ${probe.detail}`,
+        verified: probe.permissionVerified,
+        checkedAt,
+      }
+    : {
+        ok: false,
+        reason: probe.reason,
+        detail: `${providerName}: ${probe.detail}`,
+        hint: probe.hint,
+        verified: false,
+        checkedAt,
+      };
+}
+
 type BrowserTargetView = {
   readonly integration: string;
   readonly name: string;
   readonly provider: BrowserIntegrationConfig["provider"];
   readonly connection?: string;
   readonly address?: string;
-  readonly state: "live" | "ready" | "offline" | "needs-connection";
+  readonly state: "live" | "stale" | "ready" | "offline" | "needs-connection";
   readonly detail: string;
   readonly session?: Omit<ReturnType<typeof listRemoteBrowserSessions>[number], "key">;
+  readonly access?: BrowserAccessView;
 };
+
+/**
+ * Read the access scope the extension advertised.
+ *
+ * The extension is the authority on its own limits, so this reports what it
+ * said rather than reconstructing it from the plugin's own settings — which
+ * would agree right up to the moment it mattered.
+ */
+export function accessFromCapabilities(capabilities: unknown): BrowserAccessView | null {
+  const access = (capabilities as { access?: unknown } | null | undefined)?.access;
+  if (!access || typeof access !== "object") return null;
+  const value = access as Record<string, unknown>;
+  if (value.mode !== "limited" && value.mode !== "full") return null;
+  const hosts = Array.isArray(value.allowedHosts)
+    ? value.allowedHosts.filter((host): host is string => typeof host === "string")
+    : [];
+  return {
+    mode: value.mode,
+    sessionActive: value.sessionActive === true,
+    advanced: value.advanced === true,
+    allowedHosts: hosts,
+    ...(typeof value.expiresAt === "number" ? { expiresAt: value.expiresAt } : {}),
+  };
+}
 
 const remoteProviderSetup: Record<
   Exclude<BrowserIntegrationConfig["provider"], "local-extension">,
   { readonly setup: string; readonly note: string }
 > = {
   "vercel-sandbox": {
-    setup: "Vercel login or VERCEL_OIDC_TOKEN",
+    setup: "Vercel API token, or an ambient VERCEL_OIDC_TOKEN on the host",
     note: "Isolated agent-browser session in Vercel Sandbox",
   },
   "cloudflare-browser-run": {
@@ -449,29 +517,48 @@ const remoteProviderSetup: Record<
   },
 };
 
-function remoteProviderHostReady(
-  provider: Exclude<BrowserIntegrationConfig["provider"], "local-extension">,
+/**
+ * Whether this particular target can start given what the host has.
+ *
+ * Only one configuration depends on the host at all: a Vercel target that opted
+ * for the ambient identity. A token-backed target carries its own credential
+ * and is as startable here as anywhere.
+ */
+function remoteTargetHostReady(
+  config: Exclude<BrowserIntegrationConfig, { provider: "local-extension" }>,
 ): boolean {
-  return provider !== "vercel-sandbox" || Boolean(process.env.VERCEL_OIDC_TOKEN);
+  if (config.provider !== "vercel-sandbox") return true;
+  if (config.auth === "token") return true;
+  return Boolean(process.env.VERCEL_OIDC_TOKEN);
 }
 
+/**
+ * How ready a provider is, and what to say about it.
+ *
+ * Vercel used to be reported `unavailable` whenever VERCEL_OIDC_TOKEN was
+ * absent — which is every self-hosted instance — and the UI then disabled the
+ * one button that would have explained how to fix it. It was never true that
+ * the host made the provider impossible: a Vercel API token entered here works
+ * anywhere. The missing OIDC token only decides which of the two setup paths is
+ * open, so it is stated rather than enforced.
+ */
 function remoteProviderAvailability(
   provider: Exclude<BrowserIntegrationConfig["provider"], "local-extension">,
   configured: number,
 ): {
-  readonly availability: "available" | "needs-setup" | "unavailable";
+  readonly availability: "available" | "needs-setup";
   readonly availabilityDetail: string;
 } {
-  if (!remoteProviderHostReady(provider)) {
-    return {
-      availability: "unavailable",
-      availabilityDetail: "VERCEL_OIDC_TOKEN is not set on this Executor host",
-    };
-  }
   if (configured > 0) {
     return {
       availability: "available",
       availabilityDetail: `${configured} target${configured === 1 ? "" : "s"} configured`,
+    };
+  }
+  if (provider === "vercel-sandbox" && !process.env.VERCEL_OIDC_TOKEN) {
+    return {
+      availability: "needs-setup",
+      availabilityDetail: "No ambient Vercel identity here — add a Vercel API token",
     };
   }
   return {
@@ -510,16 +597,21 @@ function browserOverviewEffect(ctx: PluginCtx) {
       : [];
     const localConnection = localConnections[0];
     const localSession = localSessions[0];
+    // The same 90s rule `checkHealth` applies. Without it a session that stopped
+    // polling reads "live" on the card while the health dot says degraded.
+    const localVerdict = localBridgeVerdict(localSessions, Date.now());
+    const localAccess = localSession ? accessFromCapabilities(localSession.capabilities) : null;
     targets.push({
       integration: String(localRecord?.integration.slug || BROWSER_INTEGRATION_SLUG),
       name: localRecord?.integration.name || "Local Chrome",
       provider: "local-extension",
       connection: localConnection ? String(localConnection.name) : BROWSER_CONNECTION_NAME,
       address: localConnection?.address || "tools.browser.user.desktop",
-      state: localSession ? "live" : "offline",
+      state: !localSession ? "offline" : localVerdict.status === "healthy" ? "live" : "stale",
       detail: localSession
         ? `Extension ${String((localSession.client as { version?: string } | undefined)?.version || "connected")} connected · ${localSession.pending.length === 0 ? "no requests waiting" : `${localSession.pending.length} request${localSession.pending.length === 1 ? "" : "s"} waiting`}`
         : "Extension reverse session is not connected",
+      ...(localAccess ? { access: localAccess } : {}),
     });
 
     for (const record of records) {
@@ -542,7 +634,7 @@ function browserOverviewEffect(ctx: PluginCtx) {
           String(connection.name),
         );
         const session = getRemoteBrowserSession(key);
-        const hostReady = remoteProviderHostReady(record.config.provider);
+        const hostReady = remoteTargetHostReady(record.config);
         targets.push({
           integration: String(record.integration.slug),
           name: record.integration.name,
@@ -615,15 +707,36 @@ function optionalNumber(
 function browserConfigFromInput(
   input: AddBrowserProviderInput,
 ): Exclude<BrowserIntegrationConfig, { provider: "local-extension" }> {
+  const idleMinutes = optionalNumber(input.idleTimeoutMinutes, "Idle timeout", {
+    min: 1,
+    max: 240,
+    integer: true,
+  });
+  const controls = {
+    ...(idleMinutes === undefined ? {} : { idleTimeoutMs: idleMinutes * 60_000 }),
+    ...(input.allowAdvanced === undefined ? {} : { allowAdvanced: input.allowAdvanced }),
+  };
   switch (input.provider) {
-    case "vercel-sandbox":
+    case "vercel-sandbox": {
       const timeoutMs = optionalNumber(input.timeoutMs, "Session timeout", { min: 1 });
       const vcpus = optionalNumber(input.vcpus, "vCPUs", { min: 1, integer: true });
+      // Token auth is the default because it is the one that works regardless
+      // of where Executor is deployed. Targets created before this option
+      // existed carry no `auth` and keep the ambient behaviour they were built
+      // with, which is why the absent case is not treated as "token".
+      const auth = input.vercelAuth ?? "token";
       return {
         provider: input.provider,
+        auth,
+        ...controls,
         ...(timeoutMs !== undefined ? { timeoutMs } : {}),
         ...(vcpus !== undefined ? { vcpus } : {}),
+        ...(auth === "token" && input.teamId?.trim() ? { teamId: input.teamId.trim() } : {}),
+        ...(auth === "token" && input.projectId?.trim()
+          ? { projectId: input.projectId.trim() }
+          : {}),
       };
+    }
     case "cloudflare-browser-run": {
       const keepAliveMs = optionalNumber(input.keepAliveMs, "Keep-alive", {
         min: 10_000,
@@ -633,6 +746,7 @@ function browserConfigFromInput(
       return {
         provider: input.provider,
         accountId: requiredText(input.accountId, "Cloudflare account ID"),
+        ...controls,
         ...(keepAliveMs !== undefined ? { keepAliveMs } : {}),
       };
     }
@@ -644,6 +758,7 @@ function browserConfigFromInput(
       });
       return {
         provider: input.provider,
+        ...controls,
         ...(timeoutMinutes !== undefined ? { timeoutMinutes } : {}),
         ...(input.profileId ? { profileId: input.profileId.trim() } : {}),
         ...(input.proxyCountryCode !== undefined
@@ -662,6 +777,7 @@ function browserConfigFromInput(
       return {
         provider: input.provider,
         cdpUrl,
+        ...controls,
         ...(input.liveUrl?.trim() ? { liveUrl: input.liveUrl.trim() } : {}),
         auth: headerName
           ? { kind: "header", headerName, prefix: input.authPrefix || "" }
@@ -671,17 +787,93 @@ function browserConfigFromInput(
   }
 }
 
+/**
+ * Existing connections the user could reuse for this provider.
+ *
+ * Returns names only. Reading a secret out of another integration is a
+ * privilege move, so it happens once, on adoption, after the user picks.
+ */
+function reusableCredentialsEffect(
+  ctx: PluginCtx,
+  provider: Exclude<BrowserIntegrationConfig["provider"], "local-extension">,
+) {
+  return Effect.gen(function* () {
+    if (REUSE_HINTS[provider].length === 0) return [] as readonly ReusableCredentialView[];
+    const integrations = yield* ctx.core.integrations.list();
+    const candidates = integrations.filter((integration) =>
+      credentialLooksReusable(provider, String(integration.slug), integration.name),
+    );
+    const found: ReusableCredentialView[] = [];
+    for (const integration of candidates) {
+      const connections = yield* ctx.connections.list({ integration: integration.slug });
+      for (const connection of connections) {
+        found.push({
+          integration: String(integration.slug),
+          integrationName: integration.name,
+          connection: String(connection.name),
+          address: String(connection.address),
+          ...(connection.identityLabel ? { identityLabel: connection.identityLabel } : {}),
+        });
+      }
+    }
+    return found;
+  });
+}
+
+/**
+ * Resolve the secret to store, either pasted or adopted from another connection.
+ *
+ * Adoption re-checks the same rule the picker uses, because the picker is only
+ * an offer and this is the gate. Without it, a request naming any integration
+ * would copy that integration's secret into a `generic-cdp` target whose auth
+ * header and endpoint URL the same request supplies — which turns a
+ * write-only stored credential into one that can be sent anywhere. The reuse
+ * hints exclude `generic-cdp` and `vercel-sandbox` outright, so that shape is
+ * unreachable rather than merely discouraged.
+ */
+function credentialForNewTarget(
+  ctx: PluginCtx,
+  input: AddBrowserProviderInput,
+  provider: Exclude<BrowserIntegrationConfig["provider"], "local-extension">,
+) {
+  return Effect.gen(function* () {
+    const pasted = input.credential?.trim();
+    if (pasted) return pasted;
+    if (!input.reuseIntegration || !input.reuseConnection) return "";
+    const slug = IntegrationSlug.make(input.reuseIntegration);
+    const source = yield* ctx.core.integrations.get(slug);
+    if (!source || !credentialLooksReusable(provider, String(slug), source.name)) {
+      return yield* new BrowserBridgeError({
+        message: `"${input.reuseIntegration}" is not offered as a credential source for ${browserProviderName(provider)}`,
+      });
+    }
+    const connections = yield* ctx.connections.list({ integration: slug });
+    const row = connections.find((candidate) => String(candidate.name) === input.reuseConnection);
+    if (!row) {
+      return yield* new BrowserBridgeError({
+        message: `No connection "${input.reuseConnection}" on "${input.reuseIntegration}" to reuse`,
+      });
+    }
+    const value = yield* ctx.connections.resolveValue({
+      owner: row.owner,
+      integration: row.integration,
+      name: row.name,
+    });
+    if (!value) {
+      return yield* new BrowserBridgeError({
+        message: `"${input.reuseConnection}" holds no value this plugin can read; paste a credential instead`,
+      });
+    }
+    return value;
+  });
+}
+
 function addBrowserProviderEffect(ctx: PluginCtx, input: AddBrowserProviderInput) {
   return Effect.gen(function* () {
     const config = yield* Effect.try({
       try: () => browserConfigFromInput(input),
       catch: (error) => browserBridgeError(error, "Invalid browser provider configuration"),
     });
-    if (!remoteProviderHostReady(config.provider)) {
-      return yield* new BrowserBridgeError({
-        message: remoteProviderAvailability(config.provider, 0).availabilityDetail,
-      });
-    }
     const requestedSlug = input.slug?.trim();
     const baseSlug = (
       {
@@ -708,10 +900,22 @@ function addBrowserProviderEffect(ctx: PluginCtx, input: AddBrowserProviderInput
     const secretRequired =
       config.provider === "cloudflare-browser-run" ||
       config.provider === "browser-use" ||
+      (config.provider === "vercel-sandbox" && config.auth === "token") ||
       (config.provider === "generic-cdp" && config.auth?.kind === "header");
-    const credential = input.credential?.trim() || "";
+    const credential = yield* credentialForNewTarget(ctx, input, config.provider);
     if (secretRequired && !credential) {
       return yield* new BrowserBridgeError({ message: "Provider credential is required" });
+    }
+
+    // Check the credential before writing anything. A target created around a
+    // rejected token looks configured and fails only at the first browser call,
+    // which is exactly the false-green this refuses to create. Transport
+    // failures are not treated as proof of a bad credential.
+    const probe = yield* Effect.promise(() =>
+      probeProvider(probeTargetFor(config), credential || null),
+    );
+    if (!probe.ok && (probe.reason === "auth" || probe.reason === "permission")) {
+      return yield* new BrowserBridgeError({ message: `${probe.detail} — ${probe.hint}` });
     }
 
     const name = input.name?.trim() || browserProviderName(config.provider);
@@ -724,7 +928,8 @@ function addBrowserProviderEffect(ctx: PluginCtx, input: AddBrowserProviderInput
       canRefresh: true,
     });
     const template =
-      config.provider === "cloudflare-browser-run"
+      config.provider === "cloudflare-browser-run" ||
+      (config.provider === "vercel-sandbox" && config.auth === "token")
         ? "api-token"
         : config.provider === "browser-use"
           ? "api-key"
@@ -732,14 +937,23 @@ function addBrowserProviderEffect(ctx: PluginCtx, input: AddBrowserProviderInput
             ? "header"
             : "none";
     const connectionName = ConnectionName.make(input.connectionName?.trim() || "default");
-    const connection = yield* ctx.connections.create({
-      owner: "user",
-      name: connectionName,
-      integration: slug,
-      template: AuthTemplateSlug.make(template),
-      value: credential,
-      description: `${name} browser target`,
-    });
+    // An integration with no connection is not a browser target — it is a name
+    // that blocks the slug and cannot be called. If the credential fails to
+    // persist, take the integration back out rather than leaving the user to
+    // discover the orphan when their retry reports "already exists".
+    const connection = yield* ctx.connections
+      .create({
+        owner: "user",
+        name: connectionName,
+        integration: slug,
+        template: AuthTemplateSlug.make(template),
+        value: credential,
+        description: `${name} browser target`,
+      })
+      .pipe(
+        Effect.tapError(() => ctx.core.integrations.remove(slug).pipe(Effect.ignore)),
+        Effect.tapDefect(() => ctx.core.integrations.remove(slug).pipe(Effect.ignore)),
+      );
     const overview = yield* browserOverviewEffect(ctx);
     return overview.targets.find(
       (target) =>
@@ -748,10 +962,112 @@ function addBrowserProviderEffect(ctx: PluginCtx, input: AddBrowserProviderInput
   });
 }
 
+/**
+ * Check one target on demand: the reverse session for local Chrome, the stored
+ * credential for a remote provider. Unlike `checkHealth` this always contacts
+ * the provider, because the user asked for the check — a live session proves
+ * the target works but not that the credential is still good.
+ */
+function testBrowserConnectionEffect(ctx: PluginCtx, integration: string, connection: string) {
+  return Effect.gen(function* () {
+    const slug = IntegrationSlug.make(integration);
+    const record = yield* ctx.core.integrations.get(slug);
+    const config = record ? parseBrowserIntegrationConfig(record.config) : null;
+    if (!config) {
+      return yield* new BrowserBridgeError({
+        message: `"${integration}" is not a browser target`,
+      });
+    }
+    const checkedAt = Date.now();
+
+    if (!isRemoteBrowserConfig(config)) {
+      const verdict = localBridgeVerdict(
+        listSessionsForUser(userIdFromOwner(ctx.owner)),
+        checkedAt,
+      );
+      return verdict.status === "healthy"
+        ? { ok: true, detail: verdict.detail, verified: true, checkedAt }
+        : {
+            ok: false,
+            // The credential is not the problem: the browser at the other end
+            // of the bridge is not there.
+            reason: "host" as const,
+            detail: verdict.detail,
+            hint: "Open the Executor Browser side panel and press Connect.",
+            verified: false,
+            checkedAt,
+          };
+    }
+
+    const connections = yield* ctx.connections.list({ integration: slug });
+    const row = connections.find((candidate) => String(candidate.name) === connection);
+    if (!row) {
+      return yield* new BrowserBridgeError({
+        message: `"${integration}" has no connection named "${connection}"`,
+      });
+    }
+    const credential = yield* ctx.connections.resolveValue({
+      owner: row.owner,
+      integration: row.integration,
+      name: row.name,
+    });
+    const probe = yield* Effect.promise(() => probeProvider(probeTargetFor(config), credential));
+    return connectionTestFromProbe(probe, browserProviderName(config.provider), checkedAt);
+  });
+}
+
+/**
+ * Take a browser target out of the catalog: session, connection, integration.
+ *
+ * A target is one integration+connection created by addProvider, so removal
+ * walks the same shape backwards — any live session is stopped first (a
+ * removed target must not leave a provider VM running on the clock), and the
+ * integration goes once its last connection is gone, because an integration
+ * with no connection is just a name squatting on the slug.
+ */
+function removeBrowserTargetEffect(ctx: PluginCtx, integration: string, connection: string) {
+  return Effect.gen(function* () {
+    const slug = IntegrationSlug.make(integration);
+    const record = yield* ctx.core.integrations.get(slug);
+    const config = record ? parseBrowserIntegrationConfig(record.config) : null;
+    if (!config) {
+      return yield* new BrowserBridgeError({
+        message: `"${integration}" is not a browser target`,
+      });
+    }
+    yield* Effect.promise(() =>
+      stopRemoteBrowserSession(remoteSessionKey(ctx.owner, integration, connection)).then(
+        () => undefined,
+      ),
+    );
+    const rows = yield* ctx.connections.list({ integration: slug });
+    const row = rows.find((candidate) => String(candidate.name) === connection);
+    if (row) {
+      yield* ctx.connections.remove({
+        owner: row.owner,
+        integration: row.integration,
+        name: row.name,
+      });
+    }
+    const remaining = yield* ctx.connections.list({ integration: slug });
+    if (remaining.length === 0) {
+      yield* ctx.core.integrations.remove(slug);
+    }
+    return { removed: true };
+  });
+}
+
 const makeBrowserBridgeExtension = (ctx: PluginCtx) => ({
   ensureChrome: () => ensureChromeEffect(ctx),
   overview: () => browserOverviewEffect(ctx),
   addProvider: (input: AddBrowserProviderInput) => addBrowserProviderEffect(ctx, input),
+  removeTarget: (integration: string, connection: string) =>
+    removeBrowserTargetEffect(ctx, integration, connection),
+  reusableCredentials: (
+    provider: Exclude<BrowserIntegrationConfig["provider"], "local-extension">,
+  ) => reusableCredentialsEffect(ctx, provider),
+  testConnection: (integration: string, connection: string) =>
+    testBrowserConnectionEffect(ctx, integration, connection),
   stopSession: (integration: string, connection: string) =>
     Effect.promise(() =>
       stopRemoteBrowserSession(remoteSessionKey(ctx.owner, integration, connection)).then(
@@ -797,6 +1113,36 @@ const BrowserControlHandlers = HttpApiBuilder.group(
         }).pipe(
           Effect.mapError((error) => browserBridgeError(error, "Could not stop browser").message),
         ),
+      )
+      .handle("removeTarget", ({ params }) =>
+        Effect.gen(function* () {
+          const extension = yield* BrowserBridgeExtensionService;
+          return yield* extension.removeTarget(params.integration, params.connection);
+        }).pipe(
+          Effect.mapError(
+            (error) => browserBridgeError(error, "Could not remove this browser").message,
+          ),
+        ),
+      )
+      .handle("reusableCredentials", ({ params }) =>
+        Effect.gen(function* () {
+          const extension = yield* BrowserBridgeExtensionService;
+          return yield* extension.reusableCredentials(params.provider);
+        }).pipe(
+          Effect.mapError(
+            (error) => browserBridgeError(error, "Could not list existing credentials").message,
+          ),
+        ),
+      )
+      .handle("testConnection", ({ params }) =>
+        Effect.gen(function* () {
+          const extension = yield* BrowserBridgeExtensionService;
+          return yield* extension.testConnection(params.integration, params.connection);
+        }).pipe(
+          Effect.mapError(
+            (error) => browserBridgeError(error, "Could not test this browser").message,
+          ),
+        ),
       ),
 );
 
@@ -808,6 +1154,10 @@ async function runTool(
   caller?: { name: string; version?: string } | null,
 ): Promise<unknown> {
   const name = browserToolNameFromCatalog(toolName) || toolName;
+  // The client name is whatever the client said it was. `principal` is what
+  // this request actually authenticated as, so the extension can show the
+  // difference instead of presenting a claim as an identity.
+  const attributed = { name: caller?.name || "unknown", ...caller, principal: userId };
 
   if (name === "status") {
     const sessions = listSessionsForUser(userId).map(sessionPublicView);
@@ -837,7 +1187,7 @@ async function runTool(
       args: validated.args,
       sessionId: typeof body.sessionId === "string" ? body.sessionId : undefined,
       timeoutMs: timeoutOverride,
-      caller: caller ?? undefined,
+      caller: attributed,
     });
   }
   const validated = validateInnerCall(name, args || {});
@@ -846,7 +1196,7 @@ async function runTool(
     tool: validated.tool,
     args: validated.args,
     timeoutMs,
-    caller: caller ?? undefined,
+    caller: attributed,
   });
 }
 
@@ -930,12 +1280,12 @@ export const browserBridgePlugin = definePlugin((options: BrowserBridgePluginOpt
     },
 
     remoteToolCatalog: false,
-    resolveTools: ({ config }) =>
-      Effect.succeed(
-        isRemoteBrowserConfig(parseBrowserIntegrationConfig(config))
-          ? remoteCatalogResult()
-          : catalogResult(),
-      ),
+    resolveTools: ({ config }) => {
+      const parsed = parseBrowserIntegrationConfig(config);
+      return Effect.succeed(
+        isRemoteBrowserConfig(parsed) ? remoteCatalogResult(parsed) : catalogResult(),
+      );
+    },
     validateToolArgs: ({ toolRow, args }) =>
       Effect.try({
         try: () => {
@@ -976,7 +1326,17 @@ export const browserBridgePlugin = definePlugin((options: BrowserBridgePluginOpt
               catch: (error) => browserBridgeError(error, "Could not stop remote browser"),
             });
           }
-          const validated = validateInnerCall(browserToolNameFromCatalog(name) || name, args || {});
+          const validated = yield* Effect.try({
+            try: () => validateInnerCall(browserToolNameFromCatalog(name) || name, args || {}),
+            catch: (error) => browserBridgeError(error, "Invalid browser tool arguments"),
+          });
+          // The catalog already withholds these, so reaching here means a call
+          // by name against a target that disallows them.
+          if (isAdvancedBrowserTool(validated.tool) && !remoteAdvancedAllowed(config)) {
+            return yield* new BrowserBridgeError({
+              message: `Advanced browser tools are turned off for this target, so "${validated.tool}" is not available`,
+            });
+          }
           return yield* Effect.tryPromise({
             try: () =>
               runRemoteBrowserTool({
@@ -1003,7 +1363,7 @@ export const browserBridgePlugin = definePlugin((options: BrowserBridgePluginOpt
       }),
 
     checkHealth: ({ ctx, integration, credential }) =>
-      Effect.sync(() => {
+      Effect.gen(function* () {
         const config = parseBrowserIntegrationConfig(integration.config);
         if (isRemoteBrowserConfig(config)) {
           const key = remoteSessionKey(
@@ -1012,53 +1372,34 @@ export const browserBridgePlugin = definePlugin((options: BrowserBridgePluginOpt
             String(credential.connection),
           );
           const live = getRemoteBrowserSession(key);
+          const name = browserProviderName(config.provider);
+          // A live session is its own proof; only probe when idle, so health
+          // checks never add provider calls on top of active usage.
+          if (live) {
+            return {
+              status: "healthy" as const,
+              checkedAt: Date.now(),
+              detail: `${name} session ${live.sessionId} is active`,
+            };
+          }
+          const probe = yield* Effect.promise(() =>
+            probeProvider(probeTargetFor(config), credential.value),
+          );
           return {
-            status: "healthy" as const,
+            status: probeToHealthStatus(probe),
             checkedAt: Date.now(),
-            detail: live
-              ? `${browserProviderName(config.provider)} session ${live.sessionId} is active`
-              : `${browserProviderName(config.provider)} is configured; session starts on demand`,
+            detail: probe.ok
+              ? `${name}: ${probe.detail}${probe.permissionVerified ? "" : " (session starts on demand)"}`
+              : `${name}: ${probe.detail} — ${probe.hint}`,
           };
         }
-        const userId = userIdFromOwner(ctx.owner);
-        const sessions = listSessionsForUser(userId);
+        // HealthStatus vocab: healthy | expired | degraded | unknown.
         const checkedAt = Date.now();
-        if (sessions.length === 0) {
-          return {
-            // Must use HealthStatus vocab: healthy | expired | degraded | unknown
-            status: "degraded" as const,
-            checkedAt,
-            detail: "No live reverse session. Open Executor Browser extension → Connect (path B).",
-          };
-        }
-        const s = sessions[0]!;
-        const ageMs = checkedAt - s.lastSeenAt;
-        const client = (s.client || {}) as { name?: string; version?: string };
-        const caps = (s.capabilities || {}) as { tools?: string[] };
-        const toolN = caps.tools?.length ?? 0;
-        if (ageMs > SESSION_STALE_MS) {
-          return {
-            status: "degraded" as const,
-            checkedAt,
-            detail: [
-              `Reverse session stale (${Math.round(ageMs / 1000)}s since last poll)`,
-              `session ${s.id.slice(0, 12)}…`,
-              "Reconnect Executor Browser side panel.",
-            ].join(" · "),
-          };
-        }
-        return {
-          status: "healthy" as const,
+        const verdict = localBridgeVerdict(
+          listSessionsForUser(userIdFromOwner(ctx.owner)),
           checkedAt,
-          detail: [
-            `Reverse live · session ${s.id.slice(0, 12)}…`,
-            client.name ? `ext ${client.name}@${client.version || "?"}` : null,
-            toolN ? `${toolN} tools` : null,
-            `lastSeen ${new Date(s.lastSeenAt).toISOString()}`,
-          ]
-            .filter(Boolean)
-            .join(" · "),
-        };
+        );
+        return { status: verdict.status, checkedAt, detail: verdict.detail };
       }),
 
     removeConnection: ({ ctx, integration, connection }) =>

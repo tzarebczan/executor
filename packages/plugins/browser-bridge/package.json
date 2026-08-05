@@ -20,6 +20,7 @@
   },
   "dependencies": {
     "@executor-js/sdk": "workspace:*",
+    "@vercel/sandbox": "^2.9.2",
     "effect": "catalog:",
     "puppeteer-core": "^25.4.0",
     "remote-agent-browser": "^1.0.0"

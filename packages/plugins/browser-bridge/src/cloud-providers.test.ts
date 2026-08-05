@@ -65,4 +65,38 @@ describe("cloud browser providers", () => {
     await handle.close();
     expect(close).toHaveBeenCalledOnce();
   });
+
+  it("uses the stored token instead of the host's ambient identity when one is set", async () => {
+    // The ambient path is the one that only works on Vercel. If a token is
+    // configured and this still fell through to `AgentBrowser.create`, the
+    // target would fail on every self-hosted instance for want of a
+    // VERCEL_OIDC_TOKEN it was never meant to need.
+    const ambient = vi.fn();
+    const tokenBrowser = vi
+      .fn()
+      .mockResolvedValue({ session: "vercel-1", exec: vi.fn(), close: vi.fn() });
+
+    await createCloudBrowserSession(
+      { provider: "vercel-sandbox", token: "vercel_abc", teamId: "team_1", vcpus: 4 },
+      { createVercelBrowser: ambient, createTokenVercelBrowser: tokenBrowser },
+    );
+
+    expect(ambient).not.toHaveBeenCalled();
+    expect(tokenBrowser).toHaveBeenCalledWith(
+      expect.objectContaining({ token: "vercel_abc", teamId: "team_1", vcpus: 4 }),
+    );
+  });
+
+  it("still uses the ambient identity when no token is configured", async () => {
+    const ambient = vi.fn().mockResolvedValue({ session: "v", exec: vi.fn(), close: vi.fn() });
+    const tokenBrowser = vi.fn();
+
+    await createCloudBrowserSession(
+      { provider: "vercel-sandbox" },
+      { createVercelBrowser: ambient, createTokenVercelBrowser: tokenBrowser },
+    );
+
+    expect(tokenBrowser).not.toHaveBeenCalled();
+    expect(ambient).toHaveBeenCalledOnce();
+  });
 });

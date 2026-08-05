@@ -20,7 +20,15 @@ vi.mock("./cloud-providers", () => ({
   })),
 }));
 
-import { runRemoteBrowserTool, stopAllRemoteBrowserSessions } from "./remote-runtime";
+import { createCloudBrowserSession } from "./cloud-providers";
+import {
+  DEFAULT_IDLE_TIMEOUT_MS,
+  getRemoteBrowserSession,
+  idleTimeoutMsFor,
+  reapIdleRemoteBrowserSessions,
+  runRemoteBrowserTool,
+  stopAllRemoteBrowserSessions,
+} from "./remote-runtime";
 
 describe("remote browser runtime", () => {
   afterEach(async () => {
@@ -105,5 +113,141 @@ describe("remote browser runtime", () => {
       flags: undefined,
       output: "json",
     });
+  });
+});
+
+describe("idle session reaping", () => {
+  afterEach(async () => {
+    vi.useRealTimers();
+    await stopAllRemoteBrowserSessions();
+    vi.clearAllMocks();
+  });
+
+  it("never holds a session longer than the provider itself would", () => {
+    expect(idleTimeoutMsFor({ provider: "generic-cdp", cdpUrl: "wss://x" })).toBe(
+      DEFAULT_IDLE_TIMEOUT_MS,
+    );
+    // A two-minute Browser Use session must not be held for the ten-minute default.
+    expect(idleTimeoutMsFor({ provider: "browser-use", timeoutMinutes: 2 })).toBe(120_000);
+    // A longer provider lifetime does not extend our own idle window.
+    expect(idleTimeoutMsFor({ provider: "browser-use", timeoutMinutes: 240 })).toBe(
+      DEFAULT_IDLE_TIMEOUT_MS,
+    );
+    // An explicit setting wins, still bounded by the provider.
+    expect(
+      idleTimeoutMsFor({
+        provider: "cloudflare-browser-run",
+        accountId: "a",
+        idleTimeoutMs: 60_000,
+      }),
+    ).toBe(60_000);
+  });
+
+  it("closes a session that goes unused and leaves a fresh one alone", async () => {
+    mocks.exec.mockResolvedValue({ ok: true, data: {} });
+    const key = "vercel:reap";
+    const config = { provider: "vercel-sandbox" as const, idleTimeoutMs: 60_000 };
+    await runRemoteBrowserTool({ key, config, credential: null, tool: "ping", args: {} });
+
+    const live = getRemoteBrowserSession(key);
+    expect(live?.idleExpiresAt).toBeGreaterThan(Date.now());
+
+    expect(await reapIdleRemoteBrowserSessions(Date.now())).toEqual([]);
+    expect(getRemoteBrowserSession(key)).not.toBeNull();
+
+    expect(await reapIdleRemoteBrowserSessions(Date.now() + 61_000)).toEqual([key]);
+    expect(getRemoteBrowserSession(key)).toBeNull();
+    expect(mocks.close).toHaveBeenCalled();
+  });
+
+  it("does not let repeated use push a session past the provider's own lifetime", async () => {
+    // Browser Use and Vercel measure their timeout from creation, so a session
+    // used every minute must not keep advertising a later and later expiry.
+    mocks.exec.mockResolvedValue({ ok: true, data: {} });
+    const key = "vercel:capped";
+    const config = { provider: "vercel-sandbox" as const, timeoutMs: 120_000 };
+    const start = Date.parse("2026-01-01T00:00:00Z");
+    vi.useFakeTimers();
+    vi.setSystemTime(start);
+    await runRemoteBrowserTool({ key, config, credential: null, tool: "ping", args: {} });
+
+    vi.setSystemTime(start + 90_000);
+    await runRemoteBrowserTool({ key, config, credential: null, tool: "ping", args: {} });
+
+    expect(
+      getRemoteBrowserSession(key)?.idleExpiresAt,
+      "expiry is pinned to creation + the provider's lifetime",
+    ).toBe(start + 120_000);
+    expect(await reapIdleRemoteBrowserSessions(start + 121_000)).toEqual([key]);
+  });
+
+  it("creates one paid session when two calls race a cold target", async () => {
+    mocks.exec.mockResolvedValue({ ok: true, data: {} });
+    const key = "vercel:race";
+    const config = { provider: "vercel-sandbox" as const };
+    const [a, b] = await Promise.all([
+      runRemoteBrowserTool({ key, config, credential: null, tool: "ping", args: {} }),
+      runRemoteBrowserTool({ key, config, credential: null, tool: "ping", args: {} }),
+    ]);
+    expect(a).toBeDefined();
+    expect(b).toBeDefined();
+    // Two provider sessions would mean one is orphaned: unreachable by the
+    // reaper and by stopAll, and billing until the provider gives up.
+    expect(createCloudBrowserSession).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not close a session out from under a call that outruns the window", async () => {
+    // `ping` answers locally, so drive a tool that actually reaches the
+    // provider and hold it open there.
+    let release = () => {};
+    let markStarted = () => {};
+    const started = new Promise((resolve) => {
+      markStarted = () => resolve(undefined);
+    });
+    mocks.exec.mockImplementation(async () => {
+      markStarted();
+      await new Promise((done) => {
+        release = () => done(undefined);
+      });
+      return { ok: true, data: { tabs: [] } };
+    });
+
+    const key = "vercel:slow";
+    const config = { provider: "vercel-sandbox" as const, idleTimeoutMs: 60_000 };
+    const call = runRemoteBrowserTool({
+      key,
+      config,
+      credential: null,
+      tool: "tabs.list",
+      args: {},
+    });
+    await started;
+
+    // Long past the idle window, but the call has not come back yet.
+    expect(await reapIdleRemoteBrowserSessions(Date.now() + 600_000)).toEqual([]);
+    expect(getRemoteBrowserSession(key)).not.toBeNull();
+
+    release();
+    await call;
+    expect(await reapIdleRemoteBrowserSessions(Date.now() + 600_000)).toEqual([key]);
+  });
+
+  it("extends the window when a session is used again before it lapses", async () => {
+    mocks.exec.mockResolvedValue({ ok: true, data: {} });
+    const key = "vercel:kept";
+    const config = { provider: "vercel-sandbox" as const, idleTimeoutMs: 60_000 };
+    const start = Date.parse("2026-01-01T00:00:00Z");
+    vi.useFakeTimers();
+    vi.setSystemTime(start);
+    await runRemoteBrowserTool({ key, config, credential: null, tool: "ping", args: {} });
+
+    vi.setSystemTime(start + 45_000);
+    await runRemoteBrowserTool({ key, config, credential: null, tool: "ping", args: {} });
+
+    // Without the second call this instant is already past the first window's end.
+    expect(await reapIdleRemoteBrowserSessions(start + 70_000)).toEqual([]);
+    expect(getRemoteBrowserSession(key)?.idleExpiresAt).toBe(start + 105_000);
+
+    expect(await reapIdleRemoteBrowserSessions(start + 106_000)).toEqual([key]);
   });
 });

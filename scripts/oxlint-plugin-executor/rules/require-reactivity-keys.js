@@ -21,6 +21,7 @@ const readOnlyMutations = new Set([
   // persist nothing, so there is no cached query for them to invalidate.
   "validateConnection",
   "checkConnectionHealth",
+  "testConnectionAtom",
 ]);
 
 export default {

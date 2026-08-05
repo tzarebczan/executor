@@ -1,4 +1,4 @@
-/* oxlint-disable executor/no-error-constructor, executor/no-promise-reject -- boundary: the in-memory long-poll adapter exposes Promise rejection to HTTP and plugin callers */
+/* oxlint-disable executor/no-error-constructor, executor/no-promise-reject, executor/no-try-catch-or-throw -- boundary: the in-memory long-poll adapter exposes Promise rejection to HTTP and plugin callers, and guards JSON encoding of untrusted extension results */
 
 /**
  * In-process reverse browser-bridge sessions.
@@ -20,8 +20,17 @@ export type BridgeJob = {
 };
 
 export type BridgeCaller = {
+  /**
+   * The MCP client's self-reported name. A claim, not an identity: any client
+   * can send any name, so nothing downstream may present it as verified.
+   */
   name: string;
   version?: string;
+  /**
+   * The authenticated Executor principal the call ran as, derived server-side
+   * from the request's own credentials. This is the part that can be trusted.
+   */
+  principal?: string;
 };
 
 export type BridgeSession = {
@@ -57,6 +66,15 @@ function newId(prefix: string): string {
   return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`;
 }
 
+/**
+ * Record that the EXTENSION was heard from.
+ *
+ * `lastSeenAt` is the only evidence that the browser at the far end is still
+ * there, so only extension-originated traffic may refresh it — polling for
+ * jobs, returning a result, re-advertising scope. Refreshing it from an agent's
+ * own call would make a dead extension look live for as long as something kept
+ * retrying against it, which is exactly when the truth matters most.
+ */
 function touch(session: BridgeSession): void {
   session.lastSeenAt = Date.now();
 }
@@ -122,14 +140,32 @@ export function createSession(input: CreateSessionInput): BridgeSession {
 
 export function getSession(id: string): BridgeSession | undefined {
   gc();
-  const s = sessions.get(id);
-  if (s) touch(s);
-  return s;
+  return sessions.get(id);
 }
 
 export function listSessionsForUser(userId: string): BridgeSession[] {
   gc();
   return [...sessions.values()].filter((s) => s.userId === userId);
+}
+
+/**
+ * Re-advertise what the extension will let through.
+ *
+ * Capabilities are sent when the session opens, but access mode, the host
+ * allowlist, and the control session all change while it is open. Without this
+ * the console would keep showing the scope that applied at connect time, which
+ * is worse than showing none.
+ */
+export function updateSessionCapabilities(
+  id: string,
+  userId: string,
+  capabilities: unknown,
+): boolean {
+  const s = sessions.get(id);
+  if (!s || s.userId !== userId) return false;
+  s.capabilities = capabilities;
+  touch(s);
+  return true;
 }
 
 export function deleteSession(id: string, userId?: string): boolean {
@@ -151,7 +187,9 @@ export function takeJobs(
   sessionId: string,
   userId: string,
   waitMs = 25_000,
-): Promise<Array<{ id: string; tool: string; args: Record<string, unknown>; caller?: BridgeCaller }>> {
+): Promise<
+  Array<{ id: string; tool: string; args: Record<string, unknown>; caller?: BridgeCaller }>
+> {
   const s = getSession(sessionId);
   if (!s || s.userId !== userId) {
     return Promise.reject(new Error("session not found"));
@@ -286,7 +324,9 @@ export function callTool(input: CallToolInput): Promise<unknown> {
       ),
     );
   }
-  touch(s);
+  // Deliberately no `touch`: this is the agent calling in, not the extension
+  // checking in. Stamping here let a retry loop hold a dead extension at
+  // "healthy" indefinitely while every call timed out.
 
   const timeoutMs = input.timeoutMs ?? DEFAULT_CALL_TIMEOUT_MS;
   const jobId = newId("job");

@@ -1,4 +1,4 @@
-/* oxlint-disable executor/no-error-constructor -- protocol validation reports precise caller errors */
+/* oxlint-disable executor/no-error-constructor, executor/no-try-catch-or-throw, executor/no-switch-statement -- boundary: this is the untrusted-input parser for the tool protocol; it throws precise caller errors that every call site converts into typed failures, and dispatches on JSON Schema's `type` string rather than a tagged union */
 
 export const BROWSER_PROTOCOL_VERSION = 2 as const;
 
@@ -143,12 +143,71 @@ export interface BrowserSnapshotNode {
   readonly value?: string;
 }
 
+/**
+ * Stable machine-readable reasons a browser tool call failed.
+ *
+ * Prose changes; these do not. An agent deciding whether to retry, ask the user
+ * to widen access, or give up needs to tell "the tab is gone" from "you are not
+ * allowed to touch it" — and a message string cannot carry that reliably.
+ */
+export const BROWSER_ERROR_CODES = Object.freeze({
+  /** Advanced mode is off in the extension's settings. */
+  advancedDisabled: "ADVANCED_MODE_DISABLED",
+  /** A control session must be running before this tool is permitted. */
+  sessionRequired: "CONTROL_SESSION_REQUIRED",
+  /** The tab exists but is outside the Executor tab group. */
+  outsideGroup: "TAB_OUTSIDE_EXECUTOR_GROUP",
+  /** The tab's host is not in the Limited-mode allowlist. */
+  hostNotAllowed: "HOST_NOT_IN_ALLOWLIST",
+  /** No tab matched — genuinely absent, as opposed to refused. */
+  noTab: "NO_TARGET_TAB",
+  /** This target does not publish the requested tool. */
+  unsupported: "TOOL_NOT_SUPPORTED",
+  /** The tool ran and the browser reported a failure. */
+  failed: "TOOL_FAILED",
+});
+
+export type BrowserErrorCode = (typeof BROWSER_ERROR_CODES)[keyof typeof BROWSER_ERROR_CODES];
+
 export type BrowserToolError = {
   readonly ok: false;
   readonly error: string;
-  readonly code?: string;
+  /** Optional only for compatibility with older extensions; always sent now. */
+  readonly code?: BrowserErrorCode | (string & {});
   readonly supported?: readonly BrowserToolName[];
 };
+
+/**
+ * Captured page telemetry. Spelled out rather than left as an untyped bag: the
+ * shapes are a contract with agents, and `Record<string, unknown>[]` told them
+ * nothing about what they would get or what had been redacted out of it.
+ */
+export interface BrowserConsoleEntry {
+  readonly level: string;
+  /** Redacted before capture — see the extension's `redact` module. */
+  readonly text: string;
+  readonly timestamp: number;
+  readonly tabId: number;
+}
+
+export interface BrowserNetworkEntry {
+  readonly method: string;
+  /** Origin and path only; query and fragment are stripped at capture time. */
+  readonly url: string;
+  readonly resourceType: string;
+  readonly timestamp: number;
+  readonly tabId: number;
+  readonly status?: number;
+}
+
+export interface BrowserDownloadEntry {
+  readonly id: string;
+  readonly filename: string;
+  readonly state: "in_progress" | "complete" | "interrupted";
+  readonly startedAt: number;
+  readonly completedAt?: number;
+  readonly bytes?: number;
+}
 
 export interface BrowserToolSuccessMap {
   readonly ping: {
@@ -204,16 +263,16 @@ export interface BrowserToolSuccessMap {
   readonly upload: { readonly ok: true; readonly tabId: number; readonly files: readonly string[] };
   readonly "downloads.list": {
     readonly ok: true;
-    readonly downloads: readonly Record<string, unknown>[];
+    readonly downloads: readonly BrowserDownloadEntry[];
   };
   readonly "dialog.handle": { readonly ok: true; readonly handled: true };
   readonly "console.list": {
     readonly ok: true;
-    readonly messages: readonly Record<string, unknown>[];
+    readonly messages: readonly BrowserConsoleEntry[];
   };
   readonly "network.list": {
     readonly ok: true;
-    readonly requests: readonly Record<string, unknown>[];
+    readonly requests: readonly BrowserNetworkEntry[];
   };
   readonly evaluate: { readonly ok: true; readonly value: unknown; readonly type?: string };
   readonly pdf: {
@@ -238,10 +297,19 @@ export interface BrowserCapabilityAdvertisement {
   readonly protocolVersion: typeof BROWSER_PROTOCOL_VERSION;
   readonly mode: "extension-reverse" | "cloud";
   readonly tools: readonly BrowserToolName[];
+  /**
+   * What the extension will actually let through, as it sees it. Declared in
+   * full — the console shows this to the user, so a field the extension sends
+   * and this type omits is a scope the user cannot see.
+   */
   readonly access?: {
     readonly mode: "limited" | "full";
     readonly sessionActive: boolean;
     readonly advanced: boolean;
+    /** Hosts reachable in limited mode. Empty or absent means no host limit. */
+    readonly allowedHosts?: readonly string[];
+    /** Epoch ms when the control session lapses; null when none is running. */
+    readonly expiresAt?: number | null;
   };
 }
 
@@ -545,6 +613,14 @@ export const BROWSER_TOOL_NAMES = Object.freeze(
   Object.keys(BROWSER_TOOL_DEFINITIONS) as BrowserToolName[],
 );
 
+/**
+ * Tools the local extension gates behind Advanced mode, and that a remote
+ * target may withhold. Read through this rather than off the frozen literal,
+ * whose per-tool types only carry `advanced` where it is set.
+ */
+export const isAdvancedBrowserTool = (name: BrowserToolName): boolean =>
+  (BROWSER_TOOL_DEFINITIONS[name] as BrowserToolDefinition).advanced === true;
+
 export const browserToolCatalogName = (name: BrowserToolName): string => name.replaceAll(".", "_");
 
 export const browserToolNameFromCatalog = (name: string): BrowserToolName | undefined =>
@@ -636,11 +712,13 @@ function validateSchema(value: unknown, schema: JsonSchema, path: string): void 
       return;
   }
 
-  const numberValue = value as number;
-  if (schema.minimum != null && numberValue < schema.minimum) {
+  // Only the integer/number cases fall through to here, and both already
+  // rejected non-numbers, so this narrow always holds.
+  if (typeof value !== "number") return;
+  if (schema.minimum != null && value < schema.minimum) {
     throw new Error(`${path} must be at least ${schema.minimum}`);
   }
-  if (schema.maximum != null && numberValue > schema.maximum) {
+  if (schema.maximum != null && value > schema.maximum) {
     throw new Error(`${path} must be at most ${schema.maximum}`);
   }
 }

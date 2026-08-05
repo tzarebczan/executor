@@ -363,7 +363,19 @@ function SidebarContent(
         : [],
     ),
   );
-  const navItems = [...(props.navItems ?? defaultShellNavItems), ...pluginNavItems];
+  const baseNavItems = props.navItems ?? defaultShellNavItems;
+  // Plugin surfaces slot in directly under Integrations rather than after the
+  // host's tail items (API keys, Admin): a plugin page like Browsers manages
+  // integrations, and burying it below account chrome made it read as missing.
+  const integrationsIndex = baseNavItems.findIndex((item) => item.to === "/");
+  const navItems =
+    integrationsIndex === -1
+      ? [...baseNavItems, ...pluginNavItems]
+      : [
+          ...baseNavItems.slice(0, integrationsIndex + 1),
+          ...pluginNavItems,
+          ...baseNavItems.slice(integrationsIndex + 1),
+        ];
   return (
     <>
       {props.showBrand !== false && (

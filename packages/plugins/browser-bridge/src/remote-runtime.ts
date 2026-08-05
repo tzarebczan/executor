@@ -32,6 +32,8 @@ export interface RemoteBrowserSessionSummary {
   readonly transport: "agent-browser" | "cdp";
   readonly createdAt: number;
   readonly lastUsedAt: number;
+  /** Epoch ms at which this session is closed if nothing uses it before then. */
+  readonly idleExpiresAt: number;
   readonly liveUrl?: string;
   readonly recordingUrl?: string;
   readonly expiresAt?: string;
@@ -83,6 +85,8 @@ type RuntimeSession = {
   readonly handle: CloudBrowserHandle;
   readonly createdAt: number;
   lastUsedAt: number;
+  /** Tool calls currently running against this session. Never reap above zero. */
+  inFlight: number;
   readonly cdp?: CdpRuntime;
   readonly vercelTabRefs: Map<number, string>;
   readonly vercelSnapshotRefs: Map<number, string>;
@@ -91,6 +95,99 @@ type RuntimeSession = {
 };
 
 const sessions = new Map<string, RuntimeSession>();
+
+/**
+ * Idle window for a remote session when the target does not set one.
+ *
+ * Long enough that an agent pausing to think does not lose its browser, short
+ * enough that a forgotten session is not billed all afternoon. Reaping is not
+ * free: the next tool call starts a fresh browser, which loses open tabs and
+ * any signed-in state, so callers are told when a session will go
+ * (`idleExpiresAt`) rather than finding out afterwards.
+ */
+export const DEFAULT_IDLE_TIMEOUT_MS = 10 * 60_000;
+const REAP_INTERVAL_MS = 30_000;
+
+/**
+ * A total lifetime the provider grants from creation, where it grants one.
+ *
+ * Vercel's sandbox timeout and Browser Use's session timeout are measured from
+ * when the session started, not from when it was last touched — using them as
+ * an idle window would let a session that is used every minute advertise an
+ * expiry that keeps sliding past the moment the provider actually kills it.
+ * Cloudflare's `keep_alive` is genuinely idle-based, so it is not one of these.
+ */
+function providerTotalLifetimeMs(
+  config: Exclude<BrowserIntegrationConfig, { provider: "local-extension" }>,
+): number | undefined {
+  if (config.provider === "browser-use") {
+    return config.timeoutMinutes ? config.timeoutMinutes * 60_000 : undefined;
+  }
+  if (config.provider === "vercel-sandbox") return config.timeoutMs;
+  return undefined;
+}
+
+/**
+ * How long this target's session may sit unused.
+ *
+ * Capped by the provider's own idle allowance where it has one, because
+ * holding a handle past that point only hides the failure until the next call.
+ */
+export function idleTimeoutMsFor(
+  config: Exclude<BrowserIntegrationConfig, { provider: "local-extension" }>,
+): number {
+  const requested =
+    config.idleTimeoutMs && config.idleTimeoutMs > 0
+      ? config.idleTimeoutMs
+      : DEFAULT_IDLE_TIMEOUT_MS;
+  const providerIdleMs =
+    config.provider === "cloudflare-browser-run" ? config.keepAliveMs : undefined;
+  const total = providerTotalLifetimeMs(config);
+  return Math.min(requested, providerIdleMs ?? Infinity, total ?? Infinity);
+}
+
+/**
+ * When this session goes: whichever comes first, our idle window running out or
+ * the provider's own total lifetime expiring.
+ */
+function idleExpiresAt(session: RuntimeSession): number {
+  const idle = session.lastUsedAt + idleTimeoutMsFor(session.config);
+  const total = providerTotalLifetimeMs(session.config);
+  return total === undefined ? idle : Math.min(idle, session.createdAt + total);
+}
+
+let reaper: ReturnType<typeof setInterval> | null = null;
+
+/**
+ * Close every session whose idle window has elapsed.
+ *
+ * A session with work in flight is never idle, whatever the clock says: a call
+ * that outruns the window — a slow navigation, a large PDF — must not have the
+ * browser closed out from under it.
+ */
+export async function reapIdleRemoteBrowserSessions(now = Date.now()): Promise<readonly string[]> {
+  const expired = [...sessions.values()]
+    .filter((session) => session.inFlight === 0 && now >= idleExpiresAt(session))
+    .map((session) => session.key);
+  await Promise.all(expired.map((key) => stopRemoteBrowserSession(key)));
+  return expired;
+}
+
+function startReaper(): void {
+  if (reaper) return;
+  reaper = setInterval(() => {
+    void reapIdleRemoteBrowserSessions();
+  }, REAP_INTERVAL_MS);
+  // A background sweep must never be the reason the process stays alive.
+  reaper.unref?.();
+}
+
+function stopReaperIfIdle(): void {
+  if (reaper && sessions.size === 0) {
+    clearInterval(reaper);
+    reaper = null;
+  }
+}
 
 function toolResult<Name extends BrowserToolName>(value: unknown): BrowserToolResult<Name> {
   return value as BrowserToolResult<Name>;
@@ -124,6 +221,10 @@ function cloudConfig(
 ) {
   switch (config.provider) {
     case "vercel-sandbox":
+      if (config.auth === "token") {
+        if (!credential) throw new Error("Vercel API token is required");
+        return { ...config, token: credential };
+      }
       return config;
     case "cloudflare-browser-run":
       if (!credential) throw new Error("Cloudflare API token is required");
@@ -262,6 +363,17 @@ async function connectCdp(handle: CloudBrowserHandle): Promise<CdpRuntime> {
   return runtime;
 }
 
+/**
+ * In-flight cold starts, keyed by target.
+ *
+ * Creating a session is check-await-set, so two calls arriving together on a
+ * cold target would both see an empty map, both pay for a browser, and the
+ * second `set` would orphan the first — unreachable by the reaper or by
+ * `stopAll`, and billing until the provider itself gave up. Callers share one
+ * creation instead.
+ */
+const starting = new Map<string, Promise<RemoteBrowserSessionSummary>>();
+
 export async function startRemoteBrowserSession(
   key: string,
   config: Exclude<BrowserIntegrationConfig, { provider: "local-extension" }>,
@@ -272,6 +384,20 @@ export async function startRemoteBrowserSession(
     existing.lastUsedAt = Date.now();
     return summarize(existing);
   }
+  const pending = starting.get(key);
+  if (pending) return pending;
+  const created = createRemoteBrowserSession(key, config, credential).finally(() =>
+    starting.delete(key),
+  );
+  starting.set(key, created);
+  return created;
+}
+
+async function createRemoteBrowserSession(
+  key: string,
+  config: Exclude<BrowserIntegrationConfig, { provider: "local-extension" }>,
+  credential: string | null,
+): Promise<RemoteBrowserSessionSummary> {
   const handle = await createCloudBrowserSession(cloudConfig(config, credential));
   try {
     const session: RuntimeSession = {
@@ -280,6 +406,7 @@ export async function startRemoteBrowserSession(
       handle,
       createdAt: Date.now(),
       lastUsedAt: Date.now(),
+      inFlight: 0,
       vercelTabRefs: new Map(),
       vercelSnapshotRefs: new Map(),
       nextVercelTabId: 1,
@@ -287,6 +414,7 @@ export async function startRemoteBrowserSession(
       ...(handle.session.transport === "cdp" ? { cdp: await connectCdp(handle) } : {}),
     };
     sessions.set(key, session);
+    startReaper();
     return summarize(session);
   } catch (error) {
     await handle.close().catch(() => {});
@@ -298,6 +426,7 @@ export async function stopRemoteBrowserSession(key: string): Promise<boolean> {
   const session = sessions.get(key);
   if (!session) return false;
   sessions.delete(key);
+  stopReaperIfIdle();
   await session.cdp?.browser.close().catch(() => {});
   await session.handle.close().catch(() => {});
   return true;
@@ -315,6 +444,7 @@ function summarize(session: RuntimeSession): RemoteBrowserSessionSummary {
     transport: session.handle.session.transport,
     createdAt: session.createdAt,
     lastUsedAt: session.lastUsedAt,
+    idleExpiresAt: idleExpiresAt(session),
     ...(session.handle.session.liveUrl ? { liveUrl: session.handle.session.liveUrl } : {}),
     ...(session.handle.session.recordingUrl
       ? { recordingUrl: session.handle.session.recordingUrl }
@@ -1133,7 +1263,15 @@ export async function runRemoteBrowserTool<Name extends BrowserToolName>(input: 
   await startRemoteBrowserSession(input.key, input.config, input.credential);
   const session = sessions.get(input.key)!;
   session.lastUsedAt = Date.now();
-  return session.cdp
-    ? runCdpTool(session.cdp, input.tool, input.args)
-    : runVercelTool(session, input.tool, input.args);
+  session.inFlight += 1;
+  try {
+    return await (session.cdp
+      ? runCdpTool(session.cdp, input.tool, input.args)
+      : runVercelTool(session, input.tool, input.args));
+  } finally {
+    session.inFlight -= 1;
+    // The window runs from when the session was last finished with, not from
+    // when the call started.
+    session.lastUsedAt = Date.now();
+  }
 }

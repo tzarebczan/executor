@@ -6,6 +6,7 @@ import {
   listSessionsForUser,
   postResult,
   takeJobs,
+  updateSessionCapabilities,
 } from "./store";
 
 beforeEach(() => {
@@ -19,6 +20,38 @@ describe("browser-bridge store", () => {
     expect(listSessionsForUser("u1")).toHaveLength(1);
     expect(listSessionsForUser("u1")[0]!.id).toBe(b.id);
     expect(a.id).not.toBe(b.id);
+  });
+
+  it("does not treat an agent's own call as evidence the extension is alive", async () => {
+    const s = createSession({ userId: "u1" });
+    const stale = Date.now() - 5 * 60_000;
+    s.lastSeenAt = stale;
+
+    // Enqueue work and let it time out; nothing here came from the extension.
+    const call = callTool({ userId: "u1", tool: "ping", args: {}, timeoutMs: 10 });
+    await call.then(
+      () => undefined,
+      () => undefined,
+    );
+    expect(listSessionsForUser("u1")[0]!.lastSeenAt).toBe(stale);
+
+    // The extension polling IS evidence, and does refresh it.
+    await takeJobs(s.id, "u1", 1);
+    expect(listSessionsForUser("u1")[0]!.lastSeenAt).toBeGreaterThan(stale);
+  });
+
+  it("re-advertises access without reopening the session", () => {
+    const s = createSession({ userId: "u1", capabilities: { access: { mode: "limited" } } });
+    expect(updateSessionCapabilities(s.id, "u1", { access: { mode: "full" } })).toBe(true);
+    expect(listSessionsForUser("u1")[0]!.capabilities).toEqual({ access: { mode: "full" } });
+    // Same session — the long-poll is not disturbed.
+    expect(listSessionsForUser("u1")[0]!.id).toBe(s.id);
+  });
+
+  it("will not let one user rewrite another user's advertised scope", () => {
+    const s = createSession({ userId: "u1", capabilities: { access: { mode: "limited" } } });
+    expect(updateSessionCapabilities(s.id, "u2", { access: { mode: "full" } })).toBe(false);
+    expect(listSessionsForUser("u1")[0]!.capabilities).toEqual({ access: { mode: "limited" } });
   });
 
   it("round-trips a tool call via long-poll + result", async () => {

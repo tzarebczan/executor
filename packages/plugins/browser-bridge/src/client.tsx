@@ -1,5 +1,6 @@
 import { useState, type FormEvent } from "react";
 import * as Exit from "effect/Exit";
+import * as Atom from "effect/unstable/reactivity/Atom";
 import {
   AsyncResult,
   createPluginAtomClient,
@@ -21,18 +22,28 @@ import { Input } from "@executor-js/react/components/input";
 import { Label } from "@executor-js/react/components/label";
 import { messageFromExit } from "@executor-js/react/api/error-reporting";
 import {
+  AlertTriangle,
+  CheckCircle2,
   ChevronRight,
   CircleStop,
   Cloud,
   ExternalLink,
   Monitor,
   Plus,
+  PlugZap,
   RefreshCw,
   Server,
   X,
 } from "lucide-react";
 
-import { BrowserControlApi, type AddBrowserProviderInput } from "./shared";
+import { PROVIDER_SETUP } from "./provider-setup";
+import {
+  BrowserControlApi,
+  type AddBrowserProviderInput,
+  type BrowserAccessView,
+  type BrowserConnectionTestView,
+  type ReusableCredentialView,
+} from "./shared";
 
 const BrowserClient = createPluginAtomClient(BrowserControlApi);
 const overviewAtom = BrowserClient.query("browserControl", "overview", {
@@ -41,6 +52,17 @@ const overviewAtom = BrowserClient.query("browserControl", "overview", {
 });
 const addProviderAtom = BrowserClient.mutation("browserControl", "addProvider");
 const stopSessionAtom = BrowserClient.mutation("browserControl", "stopSession");
+const removeTargetAtom = BrowserClient.mutation("browserControl", "removeTarget");
+const testConnectionAtom = BrowserClient.mutation("browserControl", "testConnection");
+
+/** `Atom.family` because the form re-renders: a fresh atom per render refetches in a loop. */
+const reusableCredentialsAtom = Atom.family((provider: RemoteProvider) =>
+  BrowserClient.query("browserControl", "reusableCredentials", {
+    params: { provider },
+    timeToLive: "30 seconds",
+    reactivityKeys: ["browser-control"],
+  }),
+);
 
 type RemoteProvider = AddBrowserProviderInput["provider"];
 
@@ -51,48 +73,208 @@ const providerLabels: Record<RemoteProvider, string> = {
   "generic-cdp": "Generic CDP",
 };
 
+const stateTone: Record<string, { readonly badge: string; readonly dot: string }> = {
+  live: {
+    badge: "border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300",
+    dot: "bg-emerald-500",
+  },
+  // Distinct from both live and offline: the session exists but has stopped
+  // answering, which is a different thing to do about than "not connected".
+  stale: {
+    badge: "border-amber-500/40 bg-amber-500/10 text-amber-700 dark:text-amber-300",
+    dot: "bg-amber-500",
+  },
+  ready: {
+    badge: "border-sky-500/40 bg-sky-500/10 text-sky-700 dark:text-sky-300",
+    dot: "bg-sky-500",
+  },
+};
+
 function StateBadge({ state }: { readonly state: string }) {
-  const live = state === "live";
-  const ready = state === "ready";
+  const tone = stateTone[state];
   return (
-    <Badge
-      variant="outline"
-      className={
-        live
-          ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
-          : ready
-            ? "border-sky-500/40 bg-sky-500/10 text-sky-700 dark:text-sky-300"
-            : "text-muted-foreground"
-      }
-    >
-      <span
-        className={`size-1.5 rounded-full ${live ? "bg-emerald-500" : ready ? "bg-sky-500" : "bg-muted-foreground/50"}`}
-      />
+    <Badge variant="outline" className={tone?.badge || "text-muted-foreground"}>
+      <span className={`size-1.5 rounded-full ${tone?.dot || "bg-muted-foreground/50"}`} />
       {state.replace("-", " ")}
     </Badge>
   );
 }
 
+/**
+ * The scope the extension is enforcing, as the extension reports it.
+ *
+ * Shown because the console previously received this and dropped it, leaving
+ * the user to infer from a refusal which of several limits had applied.
+ */
+function AccessSummary({ access }: { readonly access: BrowserAccessView }) {
+  const hosts = access.allowedHosts;
+  return (
+    <div className="mt-2 flex flex-wrap items-center gap-1.5">
+      <Badge variant="secondary">{access.mode === "full" ? "Full access" : "Limited access"}</Badge>
+      <Badge variant="secondary">
+        {access.sessionActive ? "Control session running" : "No control session"}
+      </Badge>
+      {access.advanced && <Badge variant="secondary">Advanced on</Badge>}
+      {access.mode === "limited" && (
+        <Badge variant="secondary" title={hosts.join(", ")}>
+          {hosts.length === 0
+            ? "Executor tab group only"
+            : `${hosts.length} allowed host${hosts.length === 1 ? "" : "s"}`}
+        </Badge>
+      )}
+      {access.expiresAt && (
+        <Badge variant="secondary">Ends in {untilLabel(access.expiresAt, Date.now())}</Badge>
+      )}
+    </div>
+  );
+}
+
+/**
+ * There is no "unavailable" any more.
+ *
+ * That state existed for Vercel without an ambient identity on the host, and it
+ * disabled the provider outright. Since a Vercel API token works on any host,
+ * every provider here can be set up from this page — so the only question left
+ * is whether it already has been.
+ */
 function AvailabilityBadge({
   availability,
 }: {
-  readonly availability: "available" | "needs-setup" | "unavailable";
+  readonly availability: "available" | "needs-setup";
 }) {
   const available = availability === "available";
-  const unavailable = availability === "unavailable";
   return (
     <Badge
       variant="outline"
       className={
         available
           ? "border-emerald-500/40 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
-          : unavailable
-            ? "border-destructive/40 bg-destructive/10 text-destructive"
-            : "text-muted-foreground"
+          : "text-muted-foreground"
       }
     >
-      {available ? "Configured" : unavailable ? "Unavailable" : "Needs setup"}
+      {available ? "Configured" : "Needs setup"}
     </Badge>
+  );
+}
+
+/**
+ * The prompt that tells an agent this browser exists and how to use it.
+ *
+ * The tool address alone is copyable already, but on its own it is a string
+ * with no instructions attached: an agent handed `tools.browser.user.desktop`
+ * still does not know it should prefer snapshots, that only certain tabs are
+ * reachable, or that it must not invent page state. This is the paste that
+ * makes the target usable, and it is never shown — nobody reads a wall of
+ * instructions written for a machine.
+ */
+function agentPromptFor(target: BrowserTargetView): string {
+  const local = target.provider === "local-extension";
+  const lines = [
+    local
+      ? "You can control my Chrome browser through Executor."
+      : `You can control a remote browser (${target.name}) through Executor.`,
+    "",
+    `Browser tools: ${target.address} (tabs, navigate, snapshot, click, type, screenshot).`,
+    "",
+    "How to use it:",
+    "- Prefer snapshot over screenshots: it is cheaper and describes structure.",
+  ];
+  if (local) {
+    lines.push(
+      "- Only tabs in my Executor tab group are controllable; others are refused.",
+      "- Normal http(s) pages only; chrome:// pages are refused.",
+    );
+  } else {
+    lines.push(
+      "- This browser is fresh: it holds no sign-ins or cookies of mine.",
+      "- An idle session is closed to stop it billing, and the next call starts a new one, so do not assume open tabs survive a pause.",
+    );
+  }
+  if (target.access?.mode === "limited" && target.access.allowedHosts.length > 0) {
+    lines.push(`- Only these sites are allowed: ${target.access.allowedHosts.join(", ")}.`);
+  }
+  lines.push("- If a tool returns an error, report it — do not guess what the page shows.");
+  return lines.join("\n");
+}
+
+/** Rough countdown — enough to decide whether to act, not a clock. */
+function untilLabel(at: number, now: number): string {
+  const seconds = Math.max(0, Math.round((at - now) / 1000));
+  return seconds >= 90 ? `${Math.round(seconds / 60)} min` : `${seconds}s`;
+}
+
+/**
+ * Outcome of a manual connection test.
+ *
+ * Three outcomes, not two: a credential can be accepted without proving it
+ * carries the permission the target needs, and saying so is more useful than
+ * rounding it up to a pass. Every failure carries its remedy, because "failed"
+ * on its own leaves the user with nowhere to go.
+ */
+function ConnectionTestResult({ result }: { readonly result: BrowserConnectionTestView }) {
+  const tone = !result.ok
+    ? "text-destructive"
+    : result.verified
+      ? "text-emerald-700 dark:text-emerald-300"
+      : "text-amber-700 dark:text-amber-300";
+  const Icon = result.ok && result.verified ? CheckCircle2 : AlertTriangle;
+  return (
+    <div className="mt-3 rounded border bg-muted/40 px-2.5 py-2">
+      <p className={`flex items-start gap-1.5 text-xs ${tone}`}>
+        <Icon className="mt-px size-3.5 shrink-0" />
+        <span className="min-w-0 break-words">{result.detail}</span>
+      </p>
+      {result.hint && (
+        <p className="mt-1 break-words pl-5 text-xs text-muted-foreground">{result.hint}</p>
+      )}
+    </div>
+  );
+}
+
+/**
+ * What to do before filling the form in.
+ *
+ * Providers issue many kinds of token and only one kind works, so the exact
+ * permission is stated rather than left for the user to guess and then
+ * discover through a failed session.
+ */
+function SetupGuide({ provider }: { readonly provider: RemoteProvider }) {
+  const setup = PROVIDER_SETUP[provider];
+  return (
+    <div className="grid gap-3 rounded-md border bg-muted/30 p-3">
+      <ol className="grid list-decimal gap-1.5 pl-4 text-xs text-muted-foreground">
+        {setup.steps.map((step) => (
+          <li key={step.text} className="min-w-0">
+            <span>{step.text}</span>
+            {step.url && (
+              <a
+                href={step.url}
+                target="_blank"
+                rel="noreferrer"
+                className="ml-1 inline-flex items-center gap-0.5 font-medium text-foreground underline underline-offset-2"
+              >
+                Open
+                <ExternalLink className="size-3" />
+              </a>
+            )}
+          </li>
+        ))}
+      </ol>
+      {setup.permission && (
+        <p className="text-xs">
+          <span className="text-muted-foreground">Required permission: </span>
+          <code className="rounded bg-muted px-1 py-0.5">{setup.permission}</code>
+        </p>
+      )}
+      {setup.agentPrompt && (
+        <div className="flex items-center justify-between gap-2 rounded border bg-background px-2.5 py-2">
+          <span className="min-w-0 text-xs text-muted-foreground">
+            {setup.agentPromptLabel || "Setup prompt for an agent"}
+          </span>
+          <CopyButton value={setup.agentPrompt} />
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -106,8 +288,14 @@ function ProviderForm({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [recording, setRecording] = useState(false);
+  const [allowAdvanced, setAllowAdvanced] = useState(true);
   const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [reuse, setReuse] = useState<ReusableCredentialView | null>(null);
+  const [vercelAmbient, setVercelAmbient] = useState(false);
   const addProvider = useAtomSet(addProviderAtom, { mode: "promiseExit" });
+  const reusable = useAtomValue(reusableCredentialsAtom(provider));
+  const candidates = AsyncResult.isSuccess(reusable) ? reusable.value : [];
+  const secretLabel = PROVIDER_SETUP[provider].credentialLabel;
 
   const submit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
@@ -128,15 +316,21 @@ function ProviderForm({
       accountId: text("accountId"),
       cdpUrl: text("cdpUrl"),
       liveUrl: text("liveUrl"),
+      teamId: text("teamId"),
+      projectId: text("projectId"),
+      ...(provider === "vercel-sandbox" ? { vercelAuth: vercelAmbient ? "ambient" : "token" } : {}),
       authHeaderName: text("authHeaderName"),
       authPrefix: text("authPrefix"),
       timeoutMs: number("timeoutMs"),
+      idleTimeoutMinutes: number("idleTimeoutMinutes"),
       vcpus: number("vcpus"),
       keepAliveMs: number("keepAliveMs"),
       timeoutMinutes: number("timeoutMinutes"),
       profileId: text("profileId"),
       proxyCountryCode: text("proxyCountryCode"),
       enableRecording: recording,
+      allowAdvanced,
+      ...(reuse ? { reuseIntegration: reuse.integration, reuseConnection: reuse.connection } : {}),
     };
     const exit = await addProvider({ payload, reactivityKeys: ["browser-control"] });
     setBusy(false);
@@ -149,23 +343,80 @@ function ProviderForm({
 
   return (
     <form onSubmit={submit} className="grid gap-4 border-t pt-5">
-      {provider === "vercel-sandbox" && (
-        <div className="grid gap-3 sm:grid-cols-2">
-          <Field
-            name="timeoutMs"
-            label="Session timeout (ms)"
-            placeholder="600000"
-            type="number"
-            min={1}
-            step={1000}
-          />
-          <Field name="vcpus" label="vCPUs" placeholder="2" type="number" min={1} step={1} />
+      <SetupGuide provider={provider} />
+      {candidates.length > 0 && (
+        <div className="grid gap-2 rounded-md border p-3">
+          <p className="text-xs text-muted-foreground">
+            You already have credentials that may work here. Reusing one copies its value now — it
+            will not follow later changes to the original. The copy is checked before this target is
+            created.
+          </p>
+          {candidates.map((candidate) => {
+            const chosen = reuse?.address === candidate.address;
+            return (
+              <div key={candidate.address} className="flex items-center gap-2">
+                <Button
+                  type="button"
+                  variant={chosen ? "secondary" : "outline"}
+                  size="sm"
+                  onClick={() => setReuse(chosen ? null : candidate)}
+                >
+                  {chosen ? "Selected" : "Reuse"}
+                </Button>
+                <span className="min-w-0 truncate text-xs">
+                  {candidate.integrationName} · {candidate.connection}
+                  {candidate.identityLabel ? ` (${candidate.identityLabel})` : ""}
+                </span>
+              </div>
+            );
+          })}
         </div>
+      )}
+      {provider === "vercel-sandbox" && (
+        <>
+          {/* Ambient identity is offered second because it is the path that
+              works on exactly one kind of deployment. A token works on all of
+              them, so it is what an empty form asks for. */}
+          <Label htmlFor="browser-vercel-ambient" className="flex items-start gap-2 text-sm">
+            <Checkbox
+              id="browser-vercel-ambient"
+              checked={vercelAmbient}
+              onCheckedChange={(checked) => setVercelAmbient(checked === true)}
+            />
+            <span className="min-w-0">
+              Use this host&apos;s ambient Vercel identity instead of a token
+              <span className="block text-xs text-muted-foreground">
+                Only works when Executor runs on Vercel, or VERCEL_OIDC_TOKEN is in the
+                server&apos;s environment.
+              </span>
+            </span>
+          </Label>
+          {!vercelAmbient && (
+            <>
+              {!reuse && <SecretField name="credential" label={secretLabel!} />}
+              <div className="grid gap-3 sm:grid-cols-2">
+                <Field name="teamId" label="Team ID" placeholder="Optional" />
+                <Field name="projectId" label="Project ID" placeholder="Optional" />
+              </div>
+            </>
+          )}
+          <div className="grid gap-3 sm:grid-cols-2">
+            <Field
+              name="timeoutMs"
+              label="Session timeout (ms)"
+              placeholder="600000"
+              type="number"
+              min={1}
+              step={1000}
+            />
+            <Field name="vcpus" label="vCPUs" placeholder="2" type="number" min={1} step={1} />
+          </div>
+        </>
       )}
       {provider === "cloudflare-browser-run" && (
         <>
           <Field name="accountId" label="Cloudflare account ID" required />
-          <SecretField name="credential" label="API token" />
+          {!reuse && <SecretField name="credential" label={secretLabel!} />}
           <Field
             name="keepAliveMs"
             label="Keep-alive (ms)"
@@ -179,7 +430,7 @@ function ProviderForm({
       )}
       {provider === "browser-use" && (
         <>
-          <SecretField name="credential" label="API key" />
+          {!reuse && <SecretField name="credential" label={secretLabel!} />}
           <div className="grid gap-3 sm:grid-cols-2">
             <Field
               name="timeoutMinutes"
@@ -227,9 +478,37 @@ function ProviderForm({
             <Field name="name" label="Display name" placeholder={providerLabels[provider]} />
             <Field name="connectionName" label="Connection" placeholder="default" />
           </div>
-          <div className="mt-3">
+          <div className="mt-3 grid gap-3 sm:grid-cols-2">
             <Field name="slug" label="Tool namespace" placeholder="Generated automatically" />
+            <Field
+              name="idleTimeoutMinutes"
+              label="Idle timeout (minutes)"
+              placeholder="10"
+              type="number"
+              min={1}
+              max={240}
+              step={1}
+            />
           </div>
+          <p className="mt-2 text-xs text-muted-foreground">
+            An unused session is closed after the idle timeout so it stops costing money. The next
+            browser call starts a fresh one, which does not keep open tabs or sign-ins.
+          </p>
+          <Label htmlFor="browser-allow-advanced" className="mt-3 flex items-start gap-2 text-sm">
+            <Checkbox
+              id="browser-allow-advanced"
+              checked={allowAdvanced}
+              onCheckedChange={(checked) => setAllowAdvanced(checked !== false)}
+            />
+            <span>
+              Advanced tools
+              <span className="block text-xs font-normal text-muted-foreground">
+                evaluate, PDF, console, network, dialogs, viewport. On by default for remote
+                browsers, which are isolated and hold no personal session. Turning this off removes
+                them from the tool catalog for this target.
+              </span>
+            </span>
+          </Label>
         </CollapsibleContent>
       </Collapsible>
       {error && <p className="text-sm text-destructive">{error}</p>}
@@ -288,7 +567,7 @@ function SecretField(props: {
   readonly required?: boolean;
 }) {
   return (
-    <div className="grid gap-2">
+    <div className="grid min-w-0 gap-2">
       <Label htmlFor={`browser-${props.name}`}>{props.label}</Label>
       <Input
         id={`browser-${props.name}`}
@@ -305,154 +584,267 @@ function BrowsersPage() {
   const overview = useAtomValue(overviewAtom);
   const refresh = useAtomRefresh(overviewAtom);
   const stopSession = useAtomSet(stopSessionAtom, { mode: "promiseExit" });
+  const removeTarget = useAtomSet(removeTargetAtom, { mode: "promiseExit" });
+  const testConnection = useAtomSet(testConnectionAtom, { mode: "promiseExit" });
   const [adding, setAdding] = useState<RemoteProvider | null>(null);
   const [stopping, setStopping] = useState<string | null>(null);
+  const [removing, setRemoving] = useState<string | null>(null);
+  const [removeErrors, setRemoveErrors] = useState<Record<string, string>>({});
+  const [testing, setTesting] = useState<string | null>(null);
+  const [tests, setTests] = useState<Record<string, BrowserConnectionTestView>>({});
   const value = AsyncResult.isSuccess(overview) ? overview.value : null;
   const liveTargets = value?.targets.filter((target) => target.state === "live").length || 0;
 
   return (
-    <div className="mx-auto flex w-full max-w-6xl flex-col gap-8 px-5 py-7 md:px-8">
-      <header className="flex flex-wrap items-start justify-between gap-4">
-        <div>
-          <h1 className="text-2xl font-semibold">Browsers</h1>
-          <p className="mt-1 text-sm text-muted-foreground">
-            Local Chrome and isolated remote targets exposed as separate Executor tool addresses.
-          </p>
-        </div>
-        <Button variant="outline" size="icon" onClick={() => refresh()} title="Refresh browsers">
-          <RefreshCw className="size-4" />
-        </Button>
-      </header>
+    // The shell's <main> is overflow-hidden and every page owns its own
+    // scrolling. Without this container the page could not scroll at all:
+    // anything past the fold was clipped and unreachable.
+    <div className="flex min-h-0 flex-1 flex-col overflow-y-auto">
+      <div className="mx-auto flex w-full min-w-0 max-w-6xl flex-col gap-8 px-5 py-7 md:px-8">
+        <header className="flex flex-wrap items-start justify-between gap-4">
+          <div className="min-w-0">
+            <h1 className="text-2xl font-semibold">Browsers</h1>
+            <p className="mt-1 text-sm text-muted-foreground">
+              Local Chrome and isolated remote targets exposed as separate Executor tool addresses.
+            </p>
+          </div>
+          <Button
+            variant="outline"
+            size="icon"
+            onClick={() => refresh()}
+            aria-label="Refresh browsers"
+            title="Refresh browsers"
+          >
+            <RefreshCw className="size-4" />
+          </Button>
+        </header>
 
-      {AsyncResult.isFailure(overview) && (
-        <div className="rounded-md border border-destructive/40 p-4 text-sm text-destructive">
-          Browser availability could not be loaded.
-        </div>
-      )}
+        {AsyncResult.isFailure(overview) && (
+          <div className="rounded-md border border-destructive/40 p-4 text-sm text-destructive">
+            Browser availability could not be loaded.
+          </div>
+        )}
 
-      <section className="grid gap-3">
-        <div className="flex items-center justify-between">
-          <h2 className="text-sm font-semibold uppercase text-muted-foreground">Browser targets</h2>
-          <span className="text-xs text-muted-foreground">
-            {value ? `${liveTargets} live · ${value.targets.length} configured` : "Loading"}
-          </span>
-        </div>
-        <div className="grid gap-3 md:grid-cols-2">
-          {value?.targets.map((target) => {
-            const key = `${target.integration}:${target.connection || "none"}`;
-            const Icon = target.provider === "local-extension" ? Monitor : Cloud;
-            return (
-              <article key={key} className="rounded-md border bg-card p-4">
-                <div className="flex items-start gap-3">
-                  <span className="grid size-9 shrink-0 place-items-center rounded-md bg-muted">
-                    <Icon className="size-4" />
-                  </span>
-                  <div className="min-w-0 flex-1">
-                    <div className="flex flex-wrap items-center justify-between gap-2">
-                      <h3 className="truncate text-sm font-semibold">{target.name}</h3>
-                      <StateBadge state={target.state} />
-                    </div>
-                    <p className="mt-1 text-xs text-muted-foreground">{target.detail}</p>
-                    {target.address && (
-                      <div className="mt-3 flex min-w-0 items-center rounded bg-muted pl-2">
-                        <code className="min-w-0 flex-1 truncate py-1.5 text-xs">
-                          {target.address}
-                        </code>
-                        <CopyButton value={target.address} className="mr-1" />
+        <section className="grid gap-3">
+          <div className="flex items-center justify-between">
+            <h2 className="text-sm font-semibold uppercase text-muted-foreground">
+              Browser targets
+            </h2>
+            <span className="text-xs text-muted-foreground">
+              {value ? `${liveTargets} live · ${value.targets.length} configured` : "Loading"}
+            </span>
+          </div>
+          <div className="grid gap-3 md:grid-cols-2">
+            {value?.targets.map((target) => {
+              const key = `${target.integration}:${target.connection || "none"}`;
+              const Icon = target.provider === "local-extension" ? Monitor : Cloud;
+              return (
+                <article key={key} className="rounded-md border bg-card p-4">
+                  <div className="flex items-start gap-3">
+                    <span className="grid size-9 shrink-0 place-items-center rounded-md bg-muted">
+                      <Icon className="size-4" />
+                    </span>
+                    <div className="min-w-0 flex-1">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <h3 className="truncate text-sm font-semibold">{target.name}</h3>
+                        <StateBadge state={target.state} />
                       </div>
-                    )}
-                    <div className="mt-3 flex items-center gap-2">
-                      {target.session?.liveUrl && (
-                        <Button variant="outline" size="sm" asChild>
-                          <a href={target.session.liveUrl} target="_blank" rel="noreferrer">
-                            Live view <ExternalLink className="size-3.5" />
-                          </a>
-                        </Button>
+                      <p className="mt-1 text-xs text-muted-foreground">{target.detail}</p>
+                      {target.session && (
+                        <p className="mt-1 text-xs text-muted-foreground">
+                          Stops after {untilLabel(target.session.idleExpiresAt, Date.now())} idle
+                        </p>
                       )}
-                      {target.state === "live" &&
-                        target.provider !== "local-extension" &&
-                        target.connection && (
+                      {target.access && <AccessSummary access={target.access} />}
+                      {target.address && (
+                        <div className="mt-3 grid gap-1.5">
+                          <div className="flex min-w-0 items-center rounded bg-muted pl-2">
+                            <code className="min-w-0 flex-1 truncate py-1.5 text-xs">
+                              {target.address}
+                            </code>
+                            <CopyButton value={target.address} className="mr-1" />
+                          </div>
+                          <p className="text-xs text-muted-foreground">
+                            The tool address agents call. Paste it into a prompt to name this
+                            browser.
+                          </p>
+                        </div>
+                      )}
+                      <div className="mt-3 flex flex-wrap items-center gap-2">
+                        {target.address && (
+                          <CopyButton
+                            value={agentPromptFor(target)}
+                            label="Copy prompt"
+                            className="h-8 border px-2.5 text-foreground"
+                          />
+                        )}
+                        {target.connection && (
                           <Button
                             variant="outline"
                             size="sm"
-                            disabled={stopping === key}
+                            disabled={testing === key}
                             onClick={async () => {
-                              setStopping(key);
-                              await stopSession({
+                              setTesting(key);
+                              const exit = await testConnection({
+                                params: {
+                                  integration: target.integration,
+                                  connection: target.connection!,
+                                },
+                              });
+                              setTests((previous) => ({
+                                ...previous,
+                                [key]: Exit.isSuccess(exit)
+                                  ? exit.value
+                                  : {
+                                      ok: false,
+                                      detail: messageFromExit(exit, "Could not test this browser"),
+                                      verified: false,
+                                      checkedAt: Date.now(),
+                                    },
+                              }));
+                              setTesting(null);
+                            }}
+                          >
+                            <PlugZap className="size-3.5" />
+                            {testing === key ? "Testing..." : "Test"}
+                          </Button>
+                        )}
+                        {target.session?.liveUrl && (
+                          <Button variant="outline" size="sm" asChild>
+                            <a href={target.session.liveUrl} target="_blank" rel="noreferrer">
+                              Live view <ExternalLink className="size-3.5" />
+                            </a>
+                          </Button>
+                        )}
+                        {target.state === "live" &&
+                          target.provider !== "local-extension" &&
+                          target.connection && (
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              disabled={stopping === key}
+                              onClick={async () => {
+                                setStopping(key);
+                                await stopSession({
+                                  params: {
+                                    integration: target.integration,
+                                    connection: target.connection!,
+                                  },
+                                  reactivityKeys: ["browser-control"],
+                                });
+                                setStopping(null);
+                              }}
+                            >
+                              <CircleStop className="size-3.5" />
+                              Stop
+                            </Button>
+                          )}
+                        {/* Local Chrome is not removable here: its lifecycle
+                            belongs to the extension, and ensureChrome would
+                            re-register it anyway — a Remove that undoes itself
+                            reads as a bug. */}
+                        {target.provider !== "local-extension" && target.connection && (
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            className="text-destructive hover:text-destructive"
+                            disabled={removing === key}
+                            onClick={async () => {
+                              if (
+                                !window.confirm(
+                                  `Remove "${target.name}"? Any running session is stopped and its credential is deleted.`,
+                                )
+                              ) {
+                                return;
+                              }
+                              setRemoving(key);
+                              const exit = await removeTarget({
                                 params: {
                                   integration: target.integration,
                                   connection: target.connection!,
                                 },
                                 reactivityKeys: ["browser-control"],
                               });
-                              setStopping(null);
+                              setRemoveErrors((previous) => {
+                                const next = { ...previous };
+                                if (Exit.isSuccess(exit)) delete next[key];
+                                else
+                                  next[key] = messageFromExit(
+                                    exit,
+                                    "Could not remove this browser",
+                                  );
+                                return next;
+                              });
+                              setRemoving(null);
                             }}
                           >
-                            <CircleStop className="size-3.5" />
-                            Stop
+                            <X className="size-3.5" />
+                            {removing === key ? "Removing..." : "Remove"}
                           </Button>
                         )}
-                    </div>
-                  </div>
-                </div>
-              </article>
-            );
-          })}
-        </div>
-      </section>
-
-      <section className="grid gap-3">
-        <div>
-          <h2 className="text-sm font-semibold uppercase text-muted-foreground">
-            Remote providers
-          </h2>
-          <p className="mt-1 text-xs text-muted-foreground">
-            Availability reflects this Executor host. Configured sessions start on first use.
-          </p>
-        </div>
-        <div className="divide-y rounded-md border">
-          {value?.providers.map((provider) => {
-            const open = adding === provider.id;
-            return (
-              <div key={provider.id} className="px-4 py-4">
-                <div className="flex flex-wrap items-center gap-3">
-                  <Server className="size-4 shrink-0 text-muted-foreground" />
-                  <div className="min-w-0 flex-1">
-                    <div className="flex flex-wrap items-center gap-2">
-                      <h3 className="text-sm font-medium">{provider.name}</h3>
-                      <AvailabilityBadge availability={provider.availability} />
-                      <Badge variant="secondary">
-                        {provider.transport === "cdp" ? "CDP" : "agent-browser"}
-                      </Badge>
-                      {provider.configured > 0 && (
-                        <Badge variant="secondary">{provider.configured} configured</Badge>
+                      </div>
+                      {removeErrors[key] && (
+                        <p className="mt-2 text-xs text-destructive">{removeErrors[key]}</p>
                       )}
+                      {tests[key] && <ConnectionTestResult result={tests[key]!} />}
                     </div>
-                    <p className="mt-1 text-xs text-muted-foreground">
-                      {provider.note} · {provider.availabilityDetail}
-                    </p>
                   </div>
-                  <Button
-                    variant={open ? "ghost" : "outline"}
-                    size="sm"
-                    disabled={provider.availability === "unavailable"}
-                    title={
-                      provider.availability === "unavailable"
-                        ? provider.availabilityDetail
-                        : undefined
-                    }
-                    onClick={() => setAdding(open ? null : provider.id)}
-                  >
-                    {open ? <X className="size-4" /> : <Plus className="size-4" />}
-                    {open ? "Close" : provider.configured > 0 ? "Add target" : "Configure"}
-                  </Button>
+                </article>
+              );
+            })}
+          </div>
+        </section>
+
+        <section className="grid gap-3">
+          <div>
+            <h2 className="text-sm font-semibold uppercase text-muted-foreground">
+              Remote providers
+            </h2>
+            <p className="mt-1 text-xs text-muted-foreground">
+              Availability reflects this Executor host. Configured sessions start on first use.
+            </p>
+          </div>
+          <div className="divide-y rounded-md border">
+            {value?.providers.map((provider) => {
+              const open = adding === provider.id;
+              return (
+                <div key={provider.id} className="px-4 py-4">
+                  <div className="flex flex-wrap items-center gap-3">
+                    <Server className="size-4 shrink-0 text-muted-foreground" />
+                    <div className="min-w-0 flex-1">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <h3 className="text-sm font-medium">{provider.name}</h3>
+                        <AvailabilityBadge availability={provider.availability} />
+                        <Badge variant="secondary">
+                          {provider.transport === "cdp" ? "CDP" : "agent-browser"}
+                        </Badge>
+                        {provider.configured > 0 && (
+                          <Badge variant="secondary">{provider.configured} configured</Badge>
+                        )}
+                      </div>
+                      <p className="mt-1 text-xs text-muted-foreground">
+                        {provider.note} · {provider.availabilityDetail}
+                      </p>
+                    </div>
+                    {/* Never disabled. This used to be greyed out for a provider
+                        the host could not run, which hid the only instructions
+                        for making it runnable behind the very state they fix. */}
+                    <Button
+                      variant={open ? "ghost" : "outline"}
+                      size="sm"
+                      onClick={() => setAdding(open ? null : provider.id)}
+                    >
+                      {open ? <X className="size-4" /> : <Plus className="size-4" />}
+                      {open ? "Close" : provider.configured > 0 ? "Add target" : "Configure"}
+                    </Button>
+                  </div>
+                  {open && <ProviderForm provider={provider.id} onDone={() => setAdding(null)} />}
                 </div>
-                {open && <ProviderForm provider={provider.id} onDone={() => setAdding(null)} />}
-              </div>
-            );
-          })}
-        </div>
-      </section>
+              );
+            })}
+          </div>
+        </section>
+      </div>
     </div>
   );
 }

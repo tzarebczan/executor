@@ -6,32 +6,64 @@ import type { CloudBrowserProvider } from "./cloud-providers";
 
 export type BrowserProvider = "local-extension" | CloudBrowserProvider;
 
+/**
+ * Controls every remote target carries, and the local extension does not.
+ *
+ * The local browser is the user's own signed-in Chrome, governed by the
+ * extension's own settings. A remote target is a rented, isolated browser, so
+ * its limits are stored with the integration instead.
+ */
+type RemoteTargetControls = {
+  /**
+   * How long an idle session is kept before it is closed. Remote browsers bill
+   * for wall-clock time, so this is what stops an abandoned session from
+   * becoming a standing charge.
+   */
+  readonly idleTimeoutMs?: number;
+  /**
+   * Whether the Advanced tools (evaluate, pdf, console, network, dialogs,
+   * viewport) are available. Defaults to on: unlike the local extension, a
+   * remote browser holds no personal session to protect. Set false to withhold
+   * them from the catalog entirely.
+   */
+  readonly allowAdvanced?: boolean;
+};
+
 export type BrowserIntegrationConfig =
   | {
       readonly provider: "local-extension";
       readonly transport: "reverse";
       readonly kind: "extension";
     }
-  | {
+  | (RemoteTargetControls & {
       readonly provider: "vercel-sandbox";
       readonly timeoutMs?: number;
       readonly vcpus?: number;
       readonly image?: string;
       readonly args?: readonly string[];
-    }
-  | {
+      /**
+       * How the sandbox authenticates. `token` reads a Vercel API token from
+       * this target's connection; `ambient` relies on the Executor host's own
+       * Vercel identity, which only exists when Executor runs on Vercel or
+       * something has put VERCEL_OIDC_TOKEN in the server's environment.
+       */
+      readonly auth?: "token" | "ambient";
+      readonly teamId?: string;
+      readonly projectId?: string;
+    })
+  | (RemoteTargetControls & {
       readonly provider: "cloudflare-browser-run";
       readonly accountId: string;
       readonly keepAliveMs?: number;
-    }
-  | {
+    })
+  | (RemoteTargetControls & {
       readonly provider: "browser-use";
       readonly timeoutMinutes?: number;
       readonly profileId?: string;
       readonly proxyCountryCode?: string | null;
       readonly enableRecording?: boolean;
-    }
-  | {
+    })
+  | (RemoteTargetControls & {
       readonly provider: "generic-cdp";
       readonly cdpUrl: string;
       readonly liveUrl?: string;
@@ -42,13 +74,20 @@ export type BrowserIntegrationConfig =
             readonly headerName: string;
             readonly prefix?: string;
           };
-    };
+    });
 
 export const LOCAL_BROWSER_CONFIG: BrowserIntegrationConfig = {
   provider: "local-extension",
   transport: "reverse",
   kind: "extension",
 };
+
+function remoteControls(config: Record<string, unknown>): RemoteTargetControls {
+  return {
+    ...(typeof config.idleTimeoutMs === "number" ? { idleTimeoutMs: config.idleTimeoutMs } : {}),
+    ...(typeof config.allowAdvanced === "boolean" ? { allowAdvanced: config.allowAdvanced } : {}),
+  };
+}
 
 export function parseBrowserIntegrationConfig(value: unknown): BrowserIntegrationConfig | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
@@ -60,9 +99,13 @@ export function parseBrowserIntegrationConfig(value: unknown): BrowserIntegratio
   if (config.provider === "vercel-sandbox") {
     return {
       provider: config.provider,
+      ...remoteControls(config),
       ...(typeof config.timeoutMs === "number" ? { timeoutMs: config.timeoutMs } : {}),
       ...(typeof config.vcpus === "number" ? { vcpus: config.vcpus } : {}),
       ...(typeof config.image === "string" ? { image: config.image } : {}),
+      ...(config.auth === "token" || config.auth === "ambient" ? { auth: config.auth } : {}),
+      ...(typeof config.teamId === "string" ? { teamId: config.teamId } : {}),
+      ...(typeof config.projectId === "string" ? { projectId: config.projectId } : {}),
       ...(Array.isArray(config.args) && config.args.every((arg) => typeof arg === "string")
         ? { args: config.args }
         : {}),
@@ -72,12 +115,14 @@ export function parseBrowserIntegrationConfig(value: unknown): BrowserIntegratio
     return {
       provider: config.provider,
       accountId: config.accountId,
+      ...remoteControls(config),
       ...(typeof config.keepAliveMs === "number" ? { keepAliveMs: config.keepAliveMs } : {}),
     };
   }
   if (config.provider === "browser-use") {
     return {
       provider: config.provider,
+      ...remoteControls(config),
       ...(typeof config.timeoutMinutes === "number"
         ? { timeoutMinutes: config.timeoutMinutes }
         : {}),
@@ -107,6 +152,7 @@ export function parseBrowserIntegrationConfig(value: unknown): BrowserIntegratio
     return {
       provider: config.provider,
       cdpUrl: config.cdpUrl,
+      ...remoteControls(config),
       ...(typeof config.liveUrl === "string" ? { liveUrl: config.liveUrl } : {}),
       ...(auth ? { auth } : {}),
     };
@@ -134,8 +180,20 @@ export function browserAuthMethods(
 ): readonly AuthMethodDescriptor[] {
   switch (config.provider) {
     case "local-extension":
-    case "vercel-sandbox":
       return [{ id: "none", label: "No account secret", kind: "none", template: "none" }];
+    case "vercel-sandbox":
+      // The token is handed to the Vercel SDK rather than placed on a request
+      // by us, so this declares the secret without a carrier placement.
+      return config.auth === "token"
+        ? [
+            {
+              id: "api-token",
+              label: "Vercel API token",
+              kind: "apikey",
+              template: "api-token",
+            },
+          ]
+        : [{ id: "none", label: "No account secret", kind: "none", template: "none" }];
     case "cloudflare-browser-run":
       return [
         {

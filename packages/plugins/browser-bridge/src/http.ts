@@ -18,6 +18,7 @@ import {
   postResult,
   sessionPublicView,
   takeJobs,
+  updateSessionCapabilities,
 } from "./store";
 
 export type AuthSession = {
@@ -48,7 +49,35 @@ const json = (value: unknown, status = 200) =>
     },
   });
 
-const unauthorized = () => json({ error: "unauthorized" }, 401);
+const unauthorized = (error = "unauthorized") => json({ error }, 401);
+
+/**
+ * The bridge is a machine surface, not a page.
+ *
+ * The extension always dials out with an API key, so requiring that credential
+ * explicitly costs it nothing — and it keeps any page the user happens to have
+ * open from reaching these routes on the strength of an ambient cookie. That
+ * matters most for `POST /session/:id/result` and `PATCH /session/:id`, which
+ * inject tool results and the advertised access scope.
+ *
+ * Presence alone is not the test. An identity resolver that falls back to the
+ * cookie when a bearer value does not resolve would let `Authorization: Bearer
+ * anything` re-open the door, so the cookie is *removed* before the request is
+ * handed on: the presented credential is then the only thing that can
+ * authenticate, whatever the resolver would otherwise have accepted.
+ */
+function hasPresentedCredential(request: Request): boolean {
+  return Boolean(
+    request.headers.get("authorization")?.trim() || request.headers.get("x-api-key")?.trim(),
+  );
+}
+
+function withoutAmbientCookie(request: Request): Request {
+  if (!request.headers.has("cookie")) return request;
+  const headers = new Headers(request.headers);
+  headers.delete("cookie");
+  return new Request(request, { headers });
+}
 const notFound = (msg = "not found") => json({ error: msg }, 404);
 const badRequest = (msg: string) => json({ error: msg }, 400);
 
@@ -76,7 +105,12 @@ export function makeBrowserBridgeHandler(deps: BrowserBridgeHttpDeps) {
       }
     }
 
-    const auth = await deps.getSession(request);
+    if (!hasPresentedCredential(request)) {
+      return unauthorized(
+        "browser bridge requires an API key (Authorization: Bearer … or x-api-key); a browser session cookie is not accepted",
+      );
+    }
+    const auth = await deps.getSession(withoutAmbientCookie(request));
     if (!auth?.user?.id) return unauthorized();
     const userId = auth.user.id;
     const organizationId = auth.session?.activeOrganizationId || undefined;
@@ -156,6 +190,15 @@ export function makeBrowserBridgeHandler(deps: BrowserBridgeHttpDeps) {
         const s = getSession(sessionId);
         if (!s || s.userId !== userId) return notFound("session not found");
         return json(sessionPublicView(s));
+      }
+
+      // Re-advertise capabilities without reopening the channel, so a change to
+      // access mode or the control session is visible immediately.
+      if (!sub && request.method === "PATCH") {
+        const body = (await readJson(request)) as { capabilities?: unknown } | null;
+        if (body?.capabilities === undefined) return badRequest("capabilities required");
+        const ok = updateSessionCapabilities(sessionId, userId, body.capabilities);
+        return ok ? json({ ok: true }) : notFound("session not found");
       }
 
       if (sub === "jobs" && request.method === "GET") {

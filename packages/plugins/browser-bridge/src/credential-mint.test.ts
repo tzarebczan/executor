@@ -80,9 +80,42 @@ describe("readMintScriptResult", () => {
     });
   });
 
+  it("reads JSON out of a markdown fence, or with prose in front of it", () => {
+    // The same value comes back bare, fenced, and prefixed depending on the
+    // server. Parsing only the whole string handled one of the three.
+    const fenced = readMintScriptResult({
+      content: [
+        {
+          type: "text",
+          text: '```json\n{"minted":true,"token":"cf_a","permission":"Browser Rendering Edit"}\n```',
+        },
+      ],
+    });
+    const prefixed = readMintScriptResult({
+      content: [{ type: "text", text: 'Result: {"minted":true,"token":"cf_b"}' }],
+    });
+
+    expect(fenced).toMatchObject({ ok: true, token: "cf_a" });
+    expect(prefixed).toMatchObject({ ok: true, token: "cf_b" });
+  });
+
+  it("quotes what the server said when it cannot be read", () => {
+    // "The Cloudflare MCP server returned a result this could not read" gave
+    // the person holding it nothing to act on and nothing to report.
+    const outcome = readMintScriptResult({
+      isError: true,
+      content: [{ type: "text", text: "Error: permission_groups is not readable by this token" }],
+    });
+
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) return;
+    expect(outcome.detail).toContain("permission_groups is not readable");
+    expect(outcome.reason).toBe("permission");
+  });
+
   it("does not claim success from a result it could not read", () => {
     expect(readMintScriptResult(null)).toMatchObject({ ok: false, reason: "provider" });
-    expect(readMintScriptResult({ content: [{ type: "text", text: "not json" }] })).toMatchObject({
+    expect(readMintScriptResult({ content: [{ type: "text", text: "" }] })).toMatchObject({
       ok: false,
       reason: "provider",
     });

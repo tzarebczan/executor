@@ -91,10 +91,17 @@ export function cloudflareMintScript(options: {
 export function readMintScriptResult(raw: unknown): MintOutcome {
   const found = findMintPayload(raw);
   if (!found) {
+    // Quoting what actually came back, rather than only saying it could not be
+    // read. An MCP server can answer with an error envelope, a formatted
+    // string, or JSON inside a code fence, and "could not read" leaves the
+    // person holding it with nothing to act on and nothing to report.
+    const excerpt = textFromResult(raw);
     return {
       ok: false,
-      reason: "provider",
-      detail: "The Cloudflare MCP server returned a result this could not read",
+      reason: isErrorResult(raw) ? "permission" : "provider",
+      detail: excerpt
+        ? `Cloudflare MCP said: ${excerpt}`
+        : "The Cloudflare MCP server returned a result this could not read",
     };
   }
   if (found.minted === true && typeof found.token === "string" && found.token) {
@@ -157,21 +164,78 @@ function findMintPayload(raw: unknown): MintPayload | null {
     for (const block of content) {
       const text = (block as { text?: unknown })?.text;
       if (typeof text !== "string") continue;
-      const parsed = parseJsonObject(text);
-      const nested = parsed && findMintPayload(parsed);
-      if (nested) return nested;
+      for (const candidate of jsonObjectsIn(text)) {
+        const nested = findMintPayload(candidate);
+        if (nested) return nested;
+      }
     }
   }
   return null;
 }
 
+/**
+ * Every JSON object embedded in a block of text, outermost first.
+ *
+ * MCP servers return the same value as bare JSON, as JSON inside a markdown
+ * fence, and as JSON with a sentence in front of it. Parsing the whole string
+ * handles only the first, so the braces are scanned instead.
+ */
+function jsonObjectsIn(text: string): Record<string, unknown>[] {
+  const trimmed = text.trim();
+  const found: Record<string, unknown>[] = [];
+  const whole = parseJsonObject(trimmed);
+  if (whole) found.push(whole);
+
+  for (let start = trimmed.indexOf("{"); start !== -1; start = trimmed.indexOf("{", start + 1)) {
+    // Longest match first: an outer object carrying the payload beats an inner
+    // fragment that happens to parse on its own.
+    for (let end = trimmed.lastIndexOf("}"); end > start; end = trimmed.lastIndexOf("}", end - 1)) {
+      const parsed = parseJsonObject(trimmed.slice(start, end + 1));
+      if (parsed) {
+        found.push(parsed);
+        break;
+      }
+    }
+    if (found.length > 4) break;
+  }
+  return found;
+}
+
 function parseJsonObject(text: string): Record<string, unknown> | null {
   try {
     const value: unknown = JSON.parse(text);
-    return value && typeof value === "object" ? (value as Record<string, unknown>) : null;
+    return value && typeof value === "object" && !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : null;
   } catch {
     return null;
   }
+}
+
+/** The MCP execution-error envelope: the call ran and the tool reported failure. */
+function isErrorResult(raw: unknown): boolean {
+  return Boolean(raw && typeof raw === "object" && (raw as { isError?: unknown }).isError === true);
+}
+
+/** A short, readable excerpt of whatever the server sent, for an error message. */
+function textFromResult(raw: unknown): string {
+  if (typeof raw === "string") return clip(raw);
+  if (!raw || typeof raw !== "object") return "";
+  const content = (raw as { content?: unknown }).content;
+  if (Array.isArray(content)) {
+    const text = content
+      .map((block) => (block as { text?: unknown })?.text)
+      .filter((value): value is string => typeof value === "string")
+      .join(" ")
+      .trim();
+    if (text) return clip(text);
+  }
+  return "";
+}
+
+function clip(text: string): string {
+  const flat = text.replace(/\s+/g, " ").trim();
+  return flat.length > 300 ? `${flat.slice(0, 300)}...` : flat;
 }
 
 export type MintDeps = {

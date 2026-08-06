@@ -525,7 +525,7 @@ function ProviderForm({
               <Field
                 name="image"
                 label="Browser image"
-                placeholder="remote-agent-browser:latest (default)"
+                placeholder="Installed on first use if blank"
               />
               <div className="grid gap-3 sm:grid-cols-2">
                 <Field

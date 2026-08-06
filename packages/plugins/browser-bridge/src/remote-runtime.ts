@@ -192,8 +192,12 @@ export function classifyRemoteBrowserFailure(
       key,
       provider,
       reason: "config",
+      // The image is only consulted when the target names one; without it the
+      // sandbox boots from a stock runtime and installs the browser itself. So
+      // this hint leads with the remedy that applies to a default target, and
+      // mentions the registry only for people who chose an image on purpose.
       detail: `${label} could not find the configured project or browser image`,
-      hint: "Verify the Project ID and push the configured image to that project's Vercel Container Registry.",
+      hint: "Clear the Browser image setting to let the sandbox install its own, or push that image to the project's Vercel Container Registry.",
       failedAt,
     };
   }

@@ -32,7 +32,6 @@ const BASE_ENV = {
 } as const;
 
 const DEFAULT_TIMEOUT_MS = 10 * 60 * 1000;
-const DEFAULT_IMAGE = "remote-agent-browser:latest";
 const DEFAULT_COMMAND_TIMEOUT_MS = 60_000;
 
 export type TokenVercelBrowserOptions = {
@@ -61,11 +60,60 @@ export type VercelSandboxFactory = (options: {
   readonly token: string;
   readonly teamId: string;
   readonly projectId: string;
-  readonly image: string;
+  /** Mutually exclusive with `runtime`, exactly as the Sandbox API requires. */
+  readonly image?: string;
+  readonly runtime?: string;
   readonly timeout: number;
   readonly resources: { readonly vcpus: number };
   readonly env: Record<string, string>;
 }) => Promise<SandboxHandle>;
+
+/**
+ * Stock runtime used when no browser image is configured.
+ *
+ * `image` and `runtime` are mutually exclusive in the Sandbox API: a sandbox
+ * boots from one or the other. Omitting the image is what makes the Container
+ * Registry unnecessary.
+ */
+const BOOTSTRAP_RUNTIME = "node24";
+
+/** Install commands are one-off and slow; the browser download dominates. */
+const BOOTSTRAP_TIMEOUT_MS = 6 * 60 * 1000;
+
+/**
+ * Put `agent-browser` and a Chrome into a stock sandbox.
+ *
+ * The alternative is the documented path: build a browser image, push it to the
+ * project's Vercel Container Registry, and keep it current. That is a real
+ * chore, it is invisible from this UI, and getting it wrong surfaces much later
+ * as a bare 404 from the sandbox API. Since the CLI publishes to npm and can
+ * fetch its own Chrome from Chrome for Testing, the sandbox can assemble itself
+ * instead, and a Vercel browser needs nothing but a token.
+ *
+ * The cost is real and paid on every cold start: an npm install plus a browser
+ * download, which is why a configured image still wins when one exists.
+ */
+async function bootstrapAgentBrowser(runner: TokenSandboxRunner): Promise<void> {
+  const install = await runner.run("npm", ["install", "-g", "agent-browser"], {
+    timeoutMs: BOOTSTRAP_TIMEOUT_MS,
+  });
+  if (install.exitCode !== 0) {
+    throw new Error(
+      `Could not install agent-browser in the sandbox: ${install.stderr.trim() || install.stdout.trim()}`,
+    );
+  }
+  // `--with-deps` is what makes this work on a stock image: Chrome needs shared
+  // libraries a plain Node runtime does not ship, and without them the browser
+  // downloads successfully and then fails to launch.
+  const browser = await runner.run("agent-browser", ["install", "--with-deps"], {
+    timeoutMs: BOOTSTRAP_TIMEOUT_MS,
+  });
+  if (browser.exitCode !== 0) {
+    throw new Error(
+      `Could not install Chrome in the sandbox: ${browser.stderr.trim() || browser.stdout.trim()}`,
+    );
+  }
+}
 
 /**
  * `CommandRunner` over one sandbox.
@@ -192,7 +240,9 @@ export async function createTokenVercelBrowser(
         token: input.token,
         teamId: input.teamId,
         projectId: input.projectId,
-        image: input.image,
+        // Exactly one of these is set. Passing `image: undefined` alongside a
+        // runtime is still passing the key, and the API rejects the pair.
+        ...(input.image ? { image: input.image } : { runtime: input.runtime }),
         resources: input.resources,
         timeout: input.timeout,
         ports: [],
@@ -200,17 +250,34 @@ export async function createTokenVercelBrowser(
         persistent: false,
       } as Parameters<typeof Sandbox.create>[0]));
 
+  // An image is used when one is configured, and only then. The default used to
+  // be `remote-agent-browser:latest`, which nobody had pushed, so the first
+  // session of every new target failed on a registry lookup for an image the
+  // user had never heard of.
+  const image = options.image?.trim() || process.env.REMOTE_AGENT_BROWSER_IMAGE?.trim() || "";
   const sandbox = await create({
     token: options.token,
     teamId: scope.teamId,
     projectId: scope.projectId,
-    image: options.image || process.env.REMOTE_AGENT_BROWSER_IMAGE || DEFAULT_IMAGE,
+    ...(image ? { image } : { runtime: BOOTSTRAP_RUNTIME }),
     timeout: options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
     resources: { vcpus: options.vcpus ?? 2 },
     env,
   });
 
-  return createBrowserClient(new TokenSandboxRunner(sandbox, env), {
+  const runner = new TokenSandboxRunner(sandbox, env);
+  if (!image) {
+    try {
+      await bootstrapAgentBrowser(runner);
+    } catch (error) {
+      // A half-built sandbox bills for as long as its timeout allows, and this
+      // one can never serve a request.
+      await sandbox.stop().catch(() => {});
+      throw error;
+    }
+  }
+
+  return createBrowserClient(runner, {
     args: options.args ? [...options.args] : undefined,
   });
 }

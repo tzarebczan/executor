@@ -86,11 +86,11 @@ export const PROVIDER_SETUP: Record<CloudBrowserProvider, ProviderSetup> = {
         url: "https://vercel.com/account/settings/tokens",
       },
       {
-        text: "Push a browser image to that project's Container Registry, named remote-agent-browser:latest.",
-        url: "https://vercel.com/docs/sandbox/concepts/images",
+        text: "That is all. The sandbox installs its own browser on first use, which adds about a minute to a cold start.",
       },
       {
-        text: "Running Executor on Vercel? Tick ambient identity instead and skip the token.",
+        text: "To skip that wait, push a browser image to the project's Container Registry and name it under Advanced.",
+        url: "https://vercel.com/docs/sandbox/concepts/images",
       },
     ],
     agentPrompt: VERCEL_OIDC_PROMPT,

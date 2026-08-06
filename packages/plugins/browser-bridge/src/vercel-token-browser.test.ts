@@ -149,3 +149,66 @@ describe("createTokenVercelBrowser", () => {
     expect(sandbox.stop).toHaveBeenCalled();
   });
 });
+
+describe("provisioning without a browser image", () => {
+  const runOf = (sandbox: { runCommand: ReturnType<typeof vi.fn> }) =>
+    sandbox.runCommand.mock.calls.map(([input]) => (input as { cmd: string }).cmd);
+
+  it("boots a stock runtime and installs the browser itself", async () => {
+    // The documented path is to build an image and push it to the project's
+    // Container Registry. Defaulting to an image nobody pushed made the first
+    // session of every new target fail on a registry lookup for a name the user
+    // had never heard of.
+    const sandbox = fakeSandbox();
+    const createSandbox = vi.fn().mockResolvedValue(sandbox);
+
+    await createTokenVercelBrowser(
+      { token: "t", teamId: "team_1", projectId: "prj_1" },
+      { createSandbox },
+    );
+
+    const created = createSandbox.mock.calls[0]![0] as Record<string, unknown>;
+    expect(created.runtime).toBe("node24");
+    // `image` and `runtime` are mutually exclusive: passing the key at all,
+    // even as undefined, is rejected by the Sandbox API.
+    expect("image" in created).toBe(false);
+    expect(runOf(sandbox)).toEqual(expect.arrayContaining(["npm", "agent-browser"]));
+  });
+
+  it("uses a configured image and skips the install entirely", async () => {
+    const sandbox = fakeSandbox();
+    const createSandbox = vi.fn().mockResolvedValue(sandbox);
+
+    await createTokenVercelBrowser(
+      { token: "t", teamId: "team_1", projectId: "prj_1", image: "my-browser:v2" },
+      { createSandbox },
+    );
+
+    const created = createSandbox.mock.calls[0]![0] as Record<string, unknown>;
+    expect(created.image).toBe("my-browser:v2");
+    expect("runtime" in created).toBe(false);
+    expect(runOf(sandbox)).not.toContain("npm");
+  });
+
+  it("stops the sandbox when the install fails", async () => {
+    // A half-built sandbox bills until its timeout and can never serve a
+    // request, so leaving it running turns a setup error into a charge.
+    const sandbox = fakeSandbox({
+      runCommand: vi.fn().mockResolvedValue({
+        wait: () => Promise.resolve({ exitCode: 1 }),
+        output: (stream: string) =>
+          Promise.resolve(stream === "stderr" ? "network unreachable" : ""),
+        kill: () => Promise.resolve(),
+      }),
+    });
+    const createSandbox = vi.fn().mockResolvedValue(sandbox);
+
+    await expect(
+      createTokenVercelBrowser(
+        { token: "t", teamId: "team_1", projectId: "prj_1" },
+        { createSandbox },
+      ),
+    ).rejects.toThrow(/could not install agent-browser/i);
+    expect(sandbox.stop).toHaveBeenCalled();
+  });
+});

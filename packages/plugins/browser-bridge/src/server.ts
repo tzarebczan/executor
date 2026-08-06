@@ -454,10 +454,23 @@ export function credentialLooksReusable(
  * Static credentials only, then. An OAuth connection belongs to the app that
  * minted it.
  */
-export function connectionOffersReusableSecret(connection: {
-  readonly oauthClient?: string | null;
-  readonly expiresAt?: number | null;
-}): boolean {
+export function connectionOffersReusableSecret(
+  connection: {
+    readonly oauthClient?: string | null;
+    readonly expiresAt?: number | null;
+  },
+  integration: { readonly kind: string } = { kind: "" },
+): boolean {
+  // An MCP connection's credential authenticates to an MCP *server*, not to the
+  // provider's REST API. "Cloudflare MCP" holds a bearer for Cloudflare's MCP
+  // endpoint; copying it into a browser target produced exactly one outcome,
+  // `Cloudflare rejected the API token (401)`, which blamed the user's token for
+  // a choice this code made for them.
+  //
+  // Checked by owning plugin because the connection row itself does not say:
+  // the one under test carried no `oauthClient`, no `expiresAt`, and a custom
+  // template slug, so every property-level guess about it was wrong.
+  if (integration.kind === "mcp") return false;
   // `expiresAt` is checked as well as `oauthClient` because it is the property
   // that actually matters: a credential with an expiry is a session, and a copy
   // of it stops working without anything having changed on this target.
@@ -898,7 +911,7 @@ function reusableCredentialsEffect(
         // are usually the MCP connection the user already set up, and hiding
         // them left the page silent about the credential most likely to be able
         // to solve the problem.
-        const usage = connectionOffersReusableSecret(connection) ? "copy" : "mint";
+        const usage = connectionOffersReusableSecret(connection, integration) ? "copy" : "mint";
         if (usage === "mint" && !providerCanMint(provider)) continue;
         found.push({
           integration: String(integration.slug),

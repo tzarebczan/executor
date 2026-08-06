@@ -1,4 +1,4 @@
-/* oxlint-disable executor/no-try-catch-or-throw, executor/no-promise-catch, executor/no-instanceof-error, executor/no-unknown-error-message -- boundary: this is the fetch adapter for Cloudflare's token API; it converts network and HTTP failures into the typed MintOutcome that callers consume */
+/* oxlint-disable executor/no-try-catch-or-throw, executor/no-promise-catch, executor/no-instanceof-error, executor/no-unknown-error-message, executor/no-json-parse -- boundary: this is the adapter for Cloudflare's token API and for MCP tool results; it converts network, HTTP, and untyped MCP content into the typed MintOutcome that callers consume, and an MCP text block is arbitrary text that has to be probed rather than decoded */
 
 /**
  * Mint a browser credential from one the user already has.
@@ -24,6 +24,155 @@
  */
 
 const CLOUDFLARE_API = "https://api.cloudflare.com/client/v4";
+
+/**
+ * The same mint, run inside the provider's own MCP server.
+ *
+ * An MCP connection's stored credential authenticates to the MCP *server*, not
+ * to `api.cloudflare.com`, so using it as a bearer against the REST API fails
+ * at the first call with "cannot read the permission list". The account's real
+ * authority lives behind the MCP server, reachable only by calling its tools.
+ *
+ * Cloudflare's MCP server exposes `execute`, which runs a JavaScript arrow
+ * function against the Cloudflare API using the grant the user already
+ * approved. So the minting logic moves into that function rather than being
+ * denied the credential to run it here.
+ *
+ * The code is a single self-contained expression on purpose: it is a string
+ * crossing a tool boundary, and anything it needs from this process has to be
+ * interpolated in. Only an account ID and a label are, both non-secret.
+ */
+export function cloudflareMintScript(options: {
+  readonly accountId: string;
+  readonly label: string;
+}): string {
+  // Cloudflare's `execute` tool pre-binds `accountId` to the account its grant
+  // covers. When the user named no account, that binding is the right answer,
+  // and referencing the identifier is how the script asks for it. Falling back
+  // to an empty string would build the policy resource
+  // `com.cloudflare.api.account.` and mint a token scoped to nothing.
+  const account = options.accountId ? JSON.stringify(options.accountId) : "accountId";
+  const label = JSON.stringify(options.label);
+  return `async () => {
+  const groups = await cloudflare.request({
+    method: "GET",
+    path: "/user/tokens/permission_groups",
+    query: { per_page: 200 },
+  });
+  const all = Array.isArray(groups.result) ? groups.result : [];
+  const browser = all.filter((g) => /browser rendering/i.test(String(g && g.name)));
+  const group = browser.find((g) => /edit|write/i.test(String(g.name)));
+  if (!group) {
+    return { minted: false, reason: browser.length ? "read-only" : "unavailable",
+             seen: browser.map((g) => g.name) };
+  }
+  const created = await cloudflare.request({
+    method: "POST",
+    path: "/user/tokens",
+    body: {
+      name: ${label},
+      policies: [{
+        effect: "allow",
+        resources: { ["com.cloudflare.api.account." + ${account}]: "*" },
+        permission_groups: [{ id: group.id }],
+      }],
+    },
+  });
+  if (!created.success || !created.result || !created.result.value) {
+    return { minted: false, reason: "rejected", status: created.status,
+             errors: created.errors, permission: group.name };
+  }
+  return { minted: true, token: created.result.value, permission: group.name,
+           accountId: ${account} };
+}`;
+}
+
+/** Whatever the MCP tool returned, reduced to the shape this module needs. */
+export function readMintScriptResult(raw: unknown): MintOutcome {
+  const found = findMintPayload(raw);
+  if (!found) {
+    return {
+      ok: false,
+      reason: "provider",
+      detail: "The Cloudflare MCP server returned a result this could not read",
+    };
+  }
+  if (found.minted === true && typeof found.token === "string" && found.token) {
+    return {
+      ok: true,
+      token: found.token,
+      detail: `Created a Cloudflare token scoped to ${String(found.permission || "Browser Rendering")} on this account`,
+    };
+  }
+  if (found.reason === "unavailable" || found.reason === "read-only") {
+    return {
+      ok: false,
+      reason: "not-found",
+      detail:
+        found.reason === "read-only"
+          ? "Cloudflare offers no writable Browser Rendering permission for this account"
+          : "Browser Rendering is not available on this Cloudflare account",
+    };
+  }
+  const errors = Array.isArray(found.errors)
+    ? found.errors
+        .map((entry) => (entry as { message?: unknown })?.message)
+        .filter((message): message is string => typeof message === "string")
+        .join("; ")
+    : "";
+  return {
+    ok: false,
+    reason: "permission",
+    detail:
+      errors ||
+      "Cloudflare refused to create the token. The MCP connection may not carry the API Tokens Write permission.",
+  };
+}
+
+type MintPayload = {
+  minted?: unknown;
+  token?: unknown;
+  reason?: unknown;
+  permission?: unknown;
+  errors?: unknown;
+};
+
+/**
+ * MCP results arrive in more than one shape: a structured object, or content
+ * blocks carrying JSON as text. Both are searched rather than assuming one,
+ * because guessing wrong here reads as "the mint failed" when it succeeded and
+ * would leave a real token created on the account with nothing holding it.
+ */
+function findMintPayload(raw: unknown): MintPayload | null {
+  if (!raw || typeof raw !== "object") return null;
+  const record = raw as Record<string, unknown>;
+  if ("minted" in record) return record as MintPayload;
+
+  for (const key of ["structuredContent", "result", "output", "value", "data"]) {
+    const nested = findMintPayload(record[key]);
+    if (nested) return nested;
+  }
+  const content = record.content;
+  if (Array.isArray(content)) {
+    for (const block of content) {
+      const text = (block as { text?: unknown })?.text;
+      if (typeof text !== "string") continue;
+      const parsed = parseJsonObject(text);
+      const nested = parsed && findMintPayload(parsed);
+      if (nested) return nested;
+    }
+  }
+  return null;
+}
+
+function parseJsonObject(text: string): Record<string, unknown> | null {
+  try {
+    const value: unknown = JSON.parse(text);
+    return value && typeof value === "object" ? (value as Record<string, unknown>) : null;
+  } catch {
+    return null;
+  }
+}
 
 export type MintDeps = {
   readonly fetch?: typeof globalThis.fetch;

@@ -2,7 +2,92 @@
 
 import { describe, expect, it, vi } from "@effect/vitest";
 
-import { cloudflareBrowserPermissionGroup, mintCloudflareBrowserToken } from "./credential-mint";
+import {
+  cloudflareBrowserPermissionGroup,
+  cloudflareMintScript,
+  mintCloudflareBrowserToken,
+  readMintScriptResult,
+} from "./credential-mint";
+
+describe("cloudflareMintScript", () => {
+  it("scopes the policy to a named account", () => {
+    const code = cloudflareMintScript({ accountId: "acct_9", label: "Lab" });
+
+    expect(code).toContain('"com.cloudflare.api.account." + "acct_9"');
+    expect(code).toContain('name: "Lab"');
+  });
+
+  it("defers to the account the MCP grant already covers when none is named", () => {
+    // Cloudflare's `execute` tool pre-binds `accountId`. Interpolating an empty
+    // string instead would build the resource "com.cloudflare.api.account."
+    // and mint a token scoped to nothing, which fails much later as a 403.
+    const code = cloudflareMintScript({ accountId: "", label: "Lab" });
+
+    expect(code).toContain('"com.cloudflare.api.account." + accountId');
+    expect(code).not.toContain('+ ""');
+  });
+});
+
+describe("readMintScriptResult", () => {
+  it("reads a token out of an MCP text content block", () => {
+    // MCP servers return JSON as text as often as they return it structured,
+    // and misreading a success would leave a real token created on the account
+    // with nothing holding it.
+    const outcome = readMintScriptResult({
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify({
+            minted: true,
+            token: "cf_minted",
+            permission: "Browser Rendering Edit",
+          }),
+        },
+      ],
+    });
+
+    expect(outcome).toMatchObject({ ok: true, token: "cf_minted" });
+  });
+
+  it("reads a structured result just as well", () => {
+    const outcome = readMintScriptResult({
+      structuredContent: { minted: true, token: "cf_minted", permission: "Browser Rendering Edit" },
+    });
+
+    expect(outcome).toMatchObject({ ok: true, token: "cf_minted" });
+  });
+
+  it("reports Cloudflare's own refusal rather than a generic failure", () => {
+    const outcome = readMintScriptResult({
+      minted: false,
+      reason: "rejected",
+      errors: [{ code: 9109, message: "Invalid access token" }],
+    });
+
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) return;
+    expect(outcome.detail).toContain("Invalid access token");
+  });
+
+  it("distinguishes a read-only permission from an absent one", () => {
+    expect(readMintScriptResult({ minted: false, reason: "read-only" })).toMatchObject({
+      ok: false,
+      reason: "not-found",
+    });
+    expect(readMintScriptResult({ minted: false, reason: "unavailable" })).toMatchObject({
+      ok: false,
+      reason: "not-found",
+    });
+  });
+
+  it("does not claim success from a result it could not read", () => {
+    expect(readMintScriptResult(null)).toMatchObject({ ok: false, reason: "provider" });
+    expect(readMintScriptResult({ content: [{ type: "text", text: "not json" }] })).toMatchObject({
+      ok: false,
+      reason: "provider",
+    });
+  });
+});
 
 const GROUPS = "/user/tokens/permission_groups";
 const TOKENS = "/user/tokens";

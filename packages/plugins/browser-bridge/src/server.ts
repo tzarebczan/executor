@@ -21,6 +21,7 @@ import {
   ConnectionName,
   IntegrationSlug,
   AuthTemplateSlug,
+  ToolAddress,
   type StaticToolSchema,
   type PluginCtx,
   type ResolveToolsResult,
@@ -46,7 +47,11 @@ import {
   type BrowserIntegrationConfig,
 } from "./integration-config";
 import { CLOUD_BROWSER_PROVIDERS } from "./cloud-providers";
-import { mintCloudflareBrowserToken } from "./credential-mint";
+import {
+  cloudflareMintScript,
+  mintCloudflareBrowserToken,
+  readMintScriptResult,
+} from "./credential-mint";
 import {
   inferCloudflareAccountId,
   probeProvider,
@@ -975,6 +980,34 @@ function mintCredentialForNewTarget(
         message: `No connection "${input.mintConnection}" on "${input.mintIntegration}"`,
       });
     }
+    const label = `${input.name?.trim() || "Executor browser"}`;
+
+    // An MCP connection's credential does not authenticate to the provider's
+    // REST API, so it cannot mint from this process at all. The authority the
+    // user granted lives behind the MCP server, and `execute` is how it is
+    // reached. `ctx.execute` keeps policy, approval, and credential resolution
+    // in the core path rather than reaching around them.
+    if (source.kind === "mcp") {
+      const accountId = input.accountId?.trim();
+      const script = cloudflareMintScript({
+        // Cloudflare's own `execute` tool pre-binds `accountId`, so an empty
+        // one here resolves inside the sandbox to the account the MCP grant is
+        // already scoped to, which is the account the user means.
+        accountId: accountId || "",
+        label,
+      });
+      const raw = yield* ctx
+        .execute(ToolAddress.make(`${String(row.address)}.execute`), { code: script })
+        .pipe(
+          Effect.mapError((error) =>
+            browserBridgeError(error, `Could not run "execute" on "${input.mintIntegration}"`),
+          ),
+        );
+      const outcome = readMintScriptResult(raw);
+      if (!outcome.ok) return yield* new BrowserBridgeError({ message: outcome.detail });
+      return outcome.token;
+    }
+
     const existing = yield* ctx.connections.resolveValue({
       owner: row.owner,
       integration: row.integration,
@@ -999,7 +1032,7 @@ function mintCredentialForNewTarget(
     }
 
     const minted = yield* Effect.promise(() =>
-      mintCloudflareBrowserToken({ token: existing, accountId, label: input.name?.trim() }),
+      mintCloudflareBrowserToken({ token: existing, accountId, label }),
     );
     if (!minted.ok) return yield* new BrowserBridgeError({ message: minted.detail });
     return minted.token;

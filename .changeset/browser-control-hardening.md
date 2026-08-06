@@ -50,6 +50,13 @@ accepted, entitlement not confirmed", because entitlement is not readable from t
 Only starting one can tell you the thing browses, so that is offered separately rather
 than folded into a check that is safe to run casually.
 
+A credential that cannot be copied can now often create one that can. An MCP or OAuth
+connection to the same provider is listed with **Create token using existing credentials**
+rather than hidden: for Cloudflare it looks up the Browser Rendering permission group and
+creates an API token scoped to that permission on one account, and nothing else. The
+existing credential is never copied and never leaves the server, the minting happens only
+on an explicit click, and the offer is not made for providers whose API cannot do it.
+
 An endpoint that fails with a bare string used to reach the page as the caller's generic
 fallback, because the shared exit-to-message helper decoded only `{ message }` objects. So
 "Enter the Cloudflare account ID" was shown as "Could not add this browser provider", which

@@ -333,6 +333,7 @@ function ProviderForm({
   const [allowAdvanced, setAllowAdvanced] = useState(true);
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [reuse, setReuse] = useState<ReusableCredentialView | null>(null);
+  const [mint, setMint] = useState<ReusableCredentialView | null>(null);
   const [vercelAmbient, setVercelAmbient] = useState(false);
   const addProvider = useAtomSet(addProviderAtom, { mode: "promiseExit" });
   const reusable = useAtomValue(reusableCredentialsAtom(provider));
@@ -374,6 +375,7 @@ function ProviderForm({
       enableRecording: recording,
       allowAdvanced,
       ...(reuse ? { reuseIntegration: reuse.integration, reuseConnection: reuse.connection } : {}),
+      ...(mint ? { mintIntegration: mint.integration, mintConnection: mint.connection } : {}),
     };
     const exit = await addProvider({ payload, reactivityKeys: ["browser-control"] });
     setBusy(false);
@@ -391,16 +393,37 @@ function ProviderForm({
         <div className="grid gap-2 rounded-md border p-3">
           <p className="text-xs font-medium">Auth from Integration</p>
           {candidates.map((candidate) => {
-            const chosen = reuse?.address === candidate.address;
+            const chosen =
+              candidate.usage === "mint"
+                ? mint?.address === candidate.address
+                : reuse?.address === candidate.address;
+            // The two are mutually exclusive: a target gets one credential, and
+            // choosing either has to clear the other or the request would carry
+            // both and the server would have to pick.
+            const choose = () => {
+              if (candidate.usage === "mint") {
+                setReuse(null);
+                setMint(chosen ? null : candidate);
+              } else {
+                setMint(null);
+                setReuse(chosen ? null : candidate);
+              }
+            };
             return (
               <div key={candidate.address} className="flex items-center gap-2">
                 <Button
                   type="button"
                   variant={chosen ? "secondary" : "outline"}
                   size="sm"
-                  onClick={() => setReuse(chosen ? null : candidate)}
+                  onClick={choose}
                 >
-                  {chosen ? "Using" : "Use"}
+                  {candidate.usage === "mint"
+                    ? chosen
+                      ? "Will create token"
+                      : "Create token using existing credentials"
+                    : chosen
+                      ? "Using"
+                      : "Use"}
                 </Button>
                 <span className="min-w-0 truncate text-xs">
                   {candidate.integrationName} · {candidate.connection}
@@ -410,7 +433,9 @@ function ProviderForm({
             );
           })}
           <p className="text-xs text-muted-foreground">
-            Copies the value now, so later changes to the original will not follow.
+            {mint
+              ? "Creates a new API token on your provider account, scoped to browser use only, and stores it here. Your existing credential is not copied."
+              : "Copies the value now, so later changes to the original will not follow."}
           </p>
         </div>
       )}
@@ -430,15 +455,17 @@ function ProviderForm({
               <span>This host has its own Vercel identity. Use it instead of a token.</span>
             </Label>
           )}
-          {!vercelAmbient && !reuse && <SecretField name="credential" label={secretLabel!} />}
+          {!vercelAmbient && !reuse && !mint && (
+            <SecretField name="credential" label={secretLabel!} />
+          )}
         </>
       )}
-      {provider === "cloudflare-browser-run" && !reuse && (
+      {provider === "cloudflare-browser-run" && !reuse && !mint && (
         <SecretField name="credential" label={secretLabel!} />
       )}
       {provider === "browser-use" && (
         <>
-          {!reuse && <SecretField name="credential" label={secretLabel!} />}
+          {!reuse && !mint && <SecretField name="credential" label={secretLabel!} />}
           <div className="grid gap-3 sm:grid-cols-2">
             <Field
               name="timeoutMinutes"

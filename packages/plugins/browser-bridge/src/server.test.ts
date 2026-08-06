@@ -7,6 +7,7 @@ import {
   connectionOffersReusableSecret,
   credentialLooksReusable,
   integrationIsBrowserTarget,
+  providerCanMint,
   localBridgeVerdict,
   remoteAdvancedAllowed,
   remoteCatalogResult,
@@ -240,6 +241,17 @@ describe("integrationIsBrowserTarget", () => {
     // real Vercel integration, with nothing to tell the two apart.
     expect(integrationIsBrowserTarget({ kind: "browser-bridge" })).toBe(true);
     expect(integrationIsBrowserTarget({ kind: "openapi" })).toBe(false);
+  });
+});
+
+describe("providerCanMint", () => {
+  it("offers to create a token only where the provider's API can", () => {
+    // Vercel issues API tokens through its dashboard. A button that always
+    // fails is worse than no button, so the offer is not made there.
+    expect(providerCanMint("cloudflare-browser-run")).toBe(true);
+    expect(providerCanMint("vercel-sandbox")).toBe(false);
+    expect(providerCanMint("browser-use")).toBe(false);
+    expect(providerCanMint("generic-cdp")).toBe(false);
   });
 });
 

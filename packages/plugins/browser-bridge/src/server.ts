@@ -46,6 +46,7 @@ import {
   type BrowserIntegrationConfig,
 } from "./integration-config";
 import { CLOUD_BROWSER_PROVIDERS } from "./cloud-providers";
+import { mintCloudflareBrowserToken } from "./credential-mint";
 import {
   inferCloudflareAccountId,
   probeProvider,
@@ -478,6 +479,20 @@ export function integrationIsBrowserTarget(integration: { readonly kind: string 
 /** The `kind` every integration this plugin registers carries. */
 export const BROWSER_BRIDGE_PLUGIN_ID = "browser-bridge";
 
+/**
+ * Whether a provider has an API for creating a browser credential.
+ *
+ * Only Cloudflare does: `POST /user/tokens` takes a policy and returns the
+ * secret. Vercel issues API tokens through its dashboard, so offering the
+ * button there would promise something that cannot be delivered, and a button
+ * that always fails is worse than no button.
+ */
+export function providerCanMint(
+  provider: Exclude<BrowserIntegrationConfig["provider"], "local-extension">,
+): boolean {
+  return provider === "cloudflare-browser-run";
+}
+
 /** Project a provider probe onto the connection-test view the UI renders. */
 export function connectionTestFromProbe(
   probe: ProviderProbe,
@@ -879,12 +894,18 @@ function reusableCredentialsEffect(
     for (const integration of candidates) {
       const connections = yield* ctx.connections.list({ integration: integration.slug });
       for (const connection of connections) {
-        if (!connectionOffersReusableSecret(connection)) continue;
+        // Connections that cannot be copied are still listed, as `mint`. They
+        // are usually the MCP connection the user already set up, and hiding
+        // them left the page silent about the credential most likely to be able
+        // to solve the problem.
+        const usage = connectionOffersReusableSecret(connection) ? "copy" : "mint";
+        if (usage === "mint" && !providerCanMint(provider)) continue;
         found.push({
           integration: String(integration.slug),
           integrationName: integration.name,
           connection: String(connection.name),
           address: String(connection.address),
+          usage,
           ...(connection.identityLabel ? { identityLabel: connection.identityLabel } : {}),
         });
       }
@@ -904,6 +925,74 @@ function reusableCredentialsEffect(
  * hints exclude `generic-cdp` and `vercel-sandbox` outright, so that shape is
  * unreachable rather than merely discouraged.
  */
+/**
+ * Create a provider token using a credential the user already holds.
+ *
+ * Reached only when the request names a connection to mint from, which only an
+ * explicit click sets. The same `credentialLooksReusable` gate that guards
+ * copying guards this too: without it a request could name any integration in
+ * the catalog and have its secret used to create tokens elsewhere.
+ *
+ * The account must be known before minting, because the token is scoped to one
+ * account and a policy needs a concrete ID. That is the one case where the
+ * account cannot be inferred afterwards from the token we are about to create.
+ */
+function mintCredentialForNewTarget(
+  ctx: PluginCtx,
+  input: AddBrowserProviderInput,
+  provider: Exclude<BrowserIntegrationConfig["provider"], "local-extension">,
+) {
+  return Effect.gen(function* () {
+    if (!providerCanMint(provider)) {
+      return yield* new BrowserBridgeError({
+        message: `${browserProviderName(provider)} tokens cannot be created through its API. Create one in the dashboard and paste it here.`,
+      });
+    }
+    const slug = IntegrationSlug.make(input.mintIntegration!);
+    const source = yield* ctx.core.integrations.get(slug);
+    if (!source || !credentialLooksReusable(provider, String(slug), source.name)) {
+      return yield* new BrowserBridgeError({
+        message: `"${input.mintIntegration}" is not offered as a credential source for ${browserProviderName(provider)}`,
+      });
+    }
+    const connections = yield* ctx.connections.list({ integration: slug });
+    const row = connections.find((candidate) => String(candidate.name) === input.mintConnection);
+    if (!row) {
+      return yield* new BrowserBridgeError({
+        message: `No connection "${input.mintConnection}" on "${input.mintIntegration}"`,
+      });
+    }
+    const existing = yield* ctx.connections.resolveValue({
+      owner: row.owner,
+      integration: row.integration,
+      name: row.name,
+    });
+    if (!existing) {
+      return yield* new BrowserBridgeError({
+        message: `"${input.mintConnection}" holds no value this plugin can read`,
+      });
+    }
+
+    const accountId =
+      input.accountId?.trim() ||
+      (yield* Effect.promise(() => inferCloudflareAccountId(existing)).pipe(
+        Effect.map((found) => ("accountId" in found ? found.accountId : "")),
+      ));
+    if (!accountId) {
+      return yield* new BrowserBridgeError({
+        message:
+          "Could not work out which Cloudflare account to scope the new token to. Enter the account ID and try again.",
+      });
+    }
+
+    const minted = yield* Effect.promise(() =>
+      mintCloudflareBrowserToken({ token: existing, accountId, label: input.name?.trim() }),
+    );
+    if (!minted.ok) return yield* new BrowserBridgeError({ message: minted.detail });
+    return minted.token;
+  });
+}
+
 function credentialForNewTarget(
   ctx: PluginCtx,
   input: AddBrowserProviderInput,
@@ -912,6 +1001,9 @@ function credentialForNewTarget(
   return Effect.gen(function* () {
     const pasted = input.credential?.trim();
     if (pasted) return pasted;
+    if (input.mintIntegration && input.mintConnection) {
+      return yield* mintCredentialForNewTarget(ctx, input, provider);
+    }
     if (!input.reuseIntegration || !input.reuseConnection) return "";
     const slug = IntegrationSlug.make(input.reuseIntegration);
     const source = yield* ctx.core.integrations.get(slug);

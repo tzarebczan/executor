@@ -103,6 +103,11 @@ export const AddBrowserProviderPayload = Schema.Struct({
    *  are required together, and only ever set by an explicit user choice. */
   reuseIntegration: Schema.optional(Schema.String),
   reuseConnection: Schema.optional(Schema.String),
+  /** Create a new provider token using this connection's credential rather than
+   *  copying it. Both halves are required together, and only ever set by an
+   *  explicit user choice: it creates a credential on the user's own account. */
+  mintIntegration: Schema.optional(Schema.String),
+  mintConnection: Schema.optional(Schema.String),
   accountId: Schema.optional(Schema.String),
   /** Vercel: `token` reads this target's connection secret, `ambient` uses the
    *  host's own Vercel identity. Defaults to `token`, which works anywhere. */
@@ -190,6 +195,17 @@ export const ReusableCredential = Schema.Struct({
   connection: Schema.String,
   address: Schema.String,
   identityLabel: Schema.optional(Schema.String),
+  /**
+   * How this credential can be used here.
+   *
+   * `copy` is a static secret the target can hold its own copy of. `mint` is a
+   * credential that cannot be copied, usually an OAuth or MCP connection whose
+   * token is the wrong kind and expires anyway, but which may be able to create
+   * a token that is right. The two are offered by different buttons because
+   * they do very different things: one duplicates a secret, the other creates
+   * one on the user's provider account.
+   */
+  usage: Schema.Literals(["copy", "mint"]),
 });
 
 export type ReusableCredentialView = typeof ReusableCredential.Type;

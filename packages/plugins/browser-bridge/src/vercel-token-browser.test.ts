@@ -43,22 +43,51 @@ describe("createTokenVercelBrowser", () => {
     );
   });
 
-  it("refuses to start without the Vercel scope", async () => {
+  it("infers team and project from the token when neither is given", async () => {
+    // The whole point of the token path: a pasted token is enough. Requiring
+    // both IDs made three fields mandatory to reach a browser when the SDK can
+    // answer two of them from the token itself.
     const createSandbox = vi.fn().mockResolvedValue(fakeSandbox());
+    const inferScope = vi.fn().mockResolvedValue({ teamId: "team_inferred", projectId: "prj_new" });
 
-    await expect(
-      createTokenVercelBrowser(
-        { token: "vercel_abc", teamId: "", projectId: "prj_1" },
-        { createSandbox },
-      ),
-    ).rejects.toThrow(/Team ID is required/);
-    await expect(
-      createTokenVercelBrowser(
-        { token: "vercel_abc", teamId: "team_1", projectId: "" },
-        { createSandbox },
-      ),
-    ).rejects.toThrow(/Project ID is required/);
-    expect(createSandbox).not.toHaveBeenCalled();
+    await createTokenVercelBrowser({ token: "vercel_abc" }, { createSandbox, inferScope });
+
+    expect(inferScope).toHaveBeenCalledWith({ token: "vercel_abc" });
+    expect(createSandbox).toHaveBeenCalledWith(
+      expect.objectContaining({ teamId: "team_inferred", projectId: "prj_new" }),
+    );
+  });
+
+  it("keeps an explicitly named team while inferring the project under it", async () => {
+    // A token with access to several teams resolves to the default one, so a
+    // named team has to survive inference rather than be replaced by it, and
+    // has to be passed down so the project is looked up in the right place.
+    const createSandbox = vi.fn().mockResolvedValue(fakeSandbox());
+    const inferScope = vi.fn().mockResolvedValue({ teamId: "team_default", projectId: "prj_x" });
+
+    await createTokenVercelBrowser(
+      { token: "vercel_abc", teamId: "team_chosen" },
+      { createSandbox, inferScope },
+    );
+
+    expect(inferScope).toHaveBeenCalledWith({ token: "vercel_abc", teamId: "team_chosen" });
+    expect(createSandbox).toHaveBeenCalledWith(
+      expect.objectContaining({ teamId: "team_chosen", projectId: "prj_x" }),
+    );
+  });
+
+  it("does not call out to Vercel when both IDs are already known", async () => {
+    // Inference costs an API round trip on every session start, and it would
+    // also be free to override a deliberate choice. Neither is acceptable.
+    const createSandbox = vi.fn().mockResolvedValue(fakeSandbox());
+    const inferScope = vi.fn();
+
+    await createTokenVercelBrowser(
+      { token: "vercel_abc", teamId: "team_1", projectId: "prj_1" },
+      { createSandbox, inferScope },
+    );
+
+    expect(inferScope).not.toHaveBeenCalled();
   });
 
   it("carries the browser environment the CLI expects", async () => {

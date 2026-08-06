@@ -32,7 +32,7 @@ export type BrowserBridgeHttpDeps = {
   /**
    * After a reverse session opens, provision the visible Chrome integration +
    * connection in the Executor catalog (so the site shows "Chrome / desktop").
-   * Best-effort — must not fail the session open.
+   * Best-effort, must not fail the session open.
    */
   readonly ensureCatalog?: (request: Request) => Promise<{
     ok: boolean;
@@ -55,7 +55,7 @@ const unauthorized = (error = "unauthorized") => json({ error }, 401);
  * The bridge is a machine surface, not a page.
  *
  * The extension always dials out with an API key, so requiring that credential
- * explicitly costs it nothing — and it keeps any page the user happens to have
+ * explicitly costs it nothing, and it keeps any page the user happens to have
  * open from reaching these routes on the strength of an ambient cookie. That
  * matters most for `POST /session/:id/result` and `PATCH /session/:id`, which
  * inject tool results and the advertised access scope.
@@ -115,7 +115,7 @@ export function makeBrowserBridgeHandler(deps: BrowserBridgeHttpDeps) {
     const userId = auth.user.id;
     const organizationId = auth.session?.activeOrganizationId || undefined;
 
-    // POST /session — open reverse channel + ensure catalog shows Chrome
+    // POST /session, open reverse channel + ensure catalog shows Chrome
     if (path === "/session" && request.method === "POST") {
       const body = (await readJson(request)) as Record<string, unknown> | null;
       const session = createSession({
@@ -150,7 +150,7 @@ export function makeBrowserBridgeHandler(deps: BrowserBridgeHttpDeps) {
       });
     }
 
-    // POST /install — re-run catalog ensure without a new session
+    // POST /install, re-run catalog ensure without a new session
     if (path === "/install" && request.method === "POST") {
       if (!deps.ensureCatalog) {
         return json({ ok: false, error: "catalog ensure not wired on this host" }, 501);

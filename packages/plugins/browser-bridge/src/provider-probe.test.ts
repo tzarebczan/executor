@@ -2,7 +2,12 @@
 
 import { describe, expect, it, vi } from "@effect/vitest";
 
-import { cdpHttpProbeUrl, probeProvider, probeToHealthStatus } from "./provider-probe";
+import {
+  cdpHttpProbeUrl,
+  inferCloudflareAccountId,
+  probeProvider,
+  probeToHealthStatus,
+} from "./provider-probe";
 
 const respond = (routes: Record<string, { status: number; body?: unknown }>) =>
   vi.fn<typeof globalThis.fetch>().mockImplementation((input) => {
@@ -208,7 +213,7 @@ describe("probeProvider", () => {
 
   it("does not claim a Vercel token proves sandbox entitlement", async () => {
     // Vercel exposes no way to read this, so reporting it as verified would be
-    // an invention — the same false green this whole probe layer exists to stop.
+    // an invention, the same false green this whole probe layer exists to stop.
     const probe = await probeProvider(
       {
         provider: "vercel-sandbox",
@@ -247,17 +252,26 @@ describe("probeProvider", () => {
     expect(probe.reason).toBe("config");
   });
 
-  it("reports legacy Vercel token targets with no scope as configuration failures", async () => {
-    const fetch = vi.fn<typeof globalThis.fetch>();
+  it("checks a Vercel token target that names no team or project", async () => {
+    // Both are inferred from the token at start time, so their absence is the
+    // ordinary case. Reporting it as a misconfiguration told people to re-add a
+    // working target and skipped the check that would have found a bad token.
     const probe = await probeProvider({ provider: "vercel-sandbox", auth: "token" }, "vercel_abc", {
-      fetch,
+      fetch: respond({ "/v2/user": { status: 200, body: { user: { id: "u1" } } } }),
     });
 
-    expect(probe.ok).toBe(false);
-    if (probe.ok) return;
-    expect(probe.reason).toBe("config");
-    expect(probe.detail).toContain("Team ID and Project ID");
-    expect(fetch).not.toHaveBeenCalled();
+    expect(probe.ok).toBe(true);
+  });
+
+  it("does not read a team the target never named", async () => {
+    // The team read exists to catch a personal token aimed at a team project.
+    // With no team configured there is nothing to check against, and calling
+    // `/v2/teams/undefined` would fail the probe over a URL we built ourselves.
+    const fetch = respond({ "/v2/user": { status: 200, body: { user: { id: "u1" } } } });
+    await probeProvider({ provider: "vercel-sandbox", auth: "token" }, "vercel_abc", { fetch });
+
+    const urls = fetch.mock.calls.map(([url]) => String(url));
+    expect(urls.some((url) => url.includes("/v2/teams/"))).toBe(false);
   });
 
   it("sends the configured auth header to a generic CDP endpoint", async () => {
@@ -307,5 +321,45 @@ describe("cdpHttpProbeUrl", () => {
   it("rejects endpoints that are not CDP URLs", () => {
     expect(cdpHttpProbeUrl("not a url")).toBeNull();
     expect(cdpHttpProbeUrl("ftp://cdp.test")).toBeNull();
+  });
+});
+
+describe("inferCloudflareAccountId", () => {
+  it("reads the account from the token when there is exactly one", () => {
+    // The common case. Asking for an ID that the token already names made a
+    // second field mandatory to reach a browser.
+    return inferCloudflareAccountId("cf_token", {
+      fetch: respond({ "/accounts": { status: 200, body: { result: [{ id: "acct_1" }] } } }),
+    }).then((found) => {
+      expect(found).toEqual({ accountId: "acct_1" });
+    });
+  });
+
+  it("refuses to choose when the token spans several accounts", async () => {
+    // Taking the first would silently point the browser at the wrong account,
+    // and surface later as a 403 that reads like a bad token.
+    const found = await inferCloudflareAccountId("cf_token", {
+      fetch: respond({
+        "/accounts": { status: 200, body: { result: [{ id: "acct_1" }, { id: "acct_2" }] } },
+      }),
+    });
+
+    expect(found).toEqual({ reason: "ambiguous" });
+  });
+
+  it("reports an unreadable account list rather than inventing one", async () => {
+    const denied = await inferCloudflareAccountId("cf_token", {
+      fetch: respond({ "/accounts": { status: 403 } }),
+    });
+    const offline = await inferCloudflareAccountId("cf_token", {
+      fetch: rejecting("ECONNREFUSED"),
+    });
+    const empty = await inferCloudflareAccountId("cf_token", {
+      fetch: respond({ "/accounts": { status: 200, body: { result: [] } } }),
+    });
+
+    expect(denied).toEqual({ reason: "unreadable" });
+    expect(offline).toEqual({ reason: "unreadable" });
+    expect(empty).toEqual({ reason: "none" });
   });
 });

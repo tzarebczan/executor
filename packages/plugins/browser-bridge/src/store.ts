@@ -5,7 +5,7 @@
  *
  * Extension (path B) opens a session and long-polls for jobs.
  * Agents enqueue tools via plugin tools (tools.browser.user.desktop.*) and wait for results.
- * There is no raw HTTP /browser-bridge/call — only session/jobs/result.
+ * There is no raw HTTP /browser-bridge/call, only session/jobs/result.
  */
 
 export type BridgeJob = {
@@ -70,7 +70,7 @@ function newId(prefix: string): string {
  * Record that the EXTENSION was heard from.
  *
  * `lastSeenAt` is the only evidence that the browser at the far end is still
- * there, so only extension-originated traffic may refresh it — polling for
+ * there, so only extension-originated traffic may refresh it, polling for
  * jobs, returning a result, re-advertising scope. Refreshing it from an agent's
  * own call would make a dead extension look live for as long as something kept
  * retrying against it, which is exactly when the truth matters most.
@@ -284,7 +284,7 @@ export function postResult(
   }
   const job = s.inflight.get(jobId);
   if (!job) {
-    // maybe still pending (race) — only accept if owned by this session/user
+    // maybe still pending (race), only accept if owned by this session/user
     const idx = s.pending.findIndex((j) => j.id === jobId);
     if (idx >= 0) {
       const j = s.pending.splice(idx, 1)[0]!;

@@ -44,7 +44,7 @@ describe("browser-bridge store", () => {
     const s = createSession({ userId: "u1", capabilities: { access: { mode: "limited" } } });
     expect(updateSessionCapabilities(s.id, "u1", { access: { mode: "full" } })).toBe(true);
     expect(listSessionsForUser("u1")[0]!.capabilities).toEqual({ access: { mode: "full" } });
-    // Same session — the long-poll is not disturbed.
+    // Same session, the long-poll is not disturbed.
     expect(listSessionsForUser("u1")[0]!.id).toBe(s.id);
   });
 

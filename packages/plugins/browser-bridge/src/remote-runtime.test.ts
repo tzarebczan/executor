@@ -310,3 +310,32 @@ describe("idle session reaping", () => {
     expect(await reapIdleRemoteBrowserSessions(start + 106_000)).toEqual([key]);
   });
 });
+
+describe("classifyRemoteBrowserFailure across providers", () => {
+  it("does not send Cloudflare users to a Vercel Container Registry", () => {
+    // A 404 from Cloudflare means a wrong account ID or a disabled feature.
+    // The Vercel-shaped remedy is not just unhelpful there, it is a wrong
+    // instruction: there is no project or VCR image in that setup to fix.
+    const failure = classifyRemoteBrowserFailure(
+      "cf:missing",
+      "cloudflare-browser-run",
+      { message: "Cloud browser request failed (404): not found" },
+      1,
+    );
+
+    expect(failure.hint).not.toContain("Vercel Container Registry");
+    expect(failure.hint).not.toContain("Project ID");
+    expect(failure.detail).not.toContain("browser image");
+  });
+
+  it("does not tell a Browser Use target to add team and project IDs", () => {
+    const failure = classifyRemoteBrowserFailure(
+      "bu:oops",
+      "browser-use",
+      { message: "Invalid project id supplied" },
+      1,
+    );
+
+    expect(failure.hint).not.toContain("team and project IDs");
+  });
+});

@@ -200,10 +200,16 @@ export const FrontendErrorReporterProvider = (
 export const useReportHandledError = (): FrontendErrorReporter =>
   React.useContext(FrontendErrorReporterContext);
 
+/**
+ * Delegates to `messageFromUnknown` so a failure value that is simply a string
+ * survives. An HttpApi endpoint declared with `error: Schema.String` fails with
+ * the string itself; decoding only `{ message }` here silently discarded those
+ * and showed the caller's generic fallback in their place.
+ */
 export const messageFromExit = (exit: Exit.Exit<unknown, unknown>, fallback: string): string =>
-  Option.match(Option.flatMap(Exit.findErrorOption(exit), decodeErrorMessage), {
+  Option.match(Exit.findErrorOption(exit), {
     onNone: () => fallback,
-    onSome: ({ message }) => message,
+    onSome: (error) => messageFromUnknown(error, fallback),
   });
 
 export const reportExitFailure = (

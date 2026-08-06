@@ -26,9 +26,35 @@ against the Vercel API before the target is created. Each provider's setup guida
 the page that issues the right credential; Vercel and Cloudflare also offer a copy-only
 prompt to hand the whole setup to an agent.
 
-The console now shows the access scope the extension is actually enforcing — mode,
-control session, Advanced, allowed hosts, expiry — and the extension re-advertises that
+The console now shows the access scope the extension is actually enforcing, mode,
+control session, Advanced, allowed hosts, expiry, and the extension re-advertises that
 scope when it changes instead of only at connect time. Browser tool failures carry stable
 codes, so a refusal is distinguishable from a missing tab. Every browser target has a
-**Copy prompt** button that puts a ready-to-paste agent briefing on the clipboard —
-the tool address plus the target's actual limits — rather than only the bare address.
+**Copy prompt** button that puts a ready-to-paste agent briefing on the clipboard:
+the tool address plus the target's actual limits, rather than only the bare address.
+
+A Vercel Sandbox target now needs only a token. Team and project are inferred from it
+through the SDK's own `inferScope`, which also provisions a default sandbox project, and
+both fields move to Advanced for the cases where a specific team has to be named. Session
+tuning moves there with them, leaving the form at one credential.
+
+Cloudflare gets the same treatment: the account ID is read from the token through
+`/accounts` when the field is left blank, and only refuses to guess when a token spans
+several accounts. The ambient-Vercel option is offered only on hosts that actually carry a
+`VERCEL_OIDC_TOKEN`, since the server already knows and asking the user to work it out
+meant explaining OIDC to people whose host could never use it.
+
+Each target gains a **Test run** that starts a real session, loads a page, and stops it
+again. The credential check answers "is this token live"; for Vercel it stops at "token
+accepted, entitlement not confirmed", because entitlement is not readable from the API.
+Only starting one can tell you the thing browses, so that is offered separately rather
+than folded into a check that is safe to run casually.
+
+An endpoint that fails with a bare string used to reach the page as the caller's generic
+fallback, because the shared exit-to-message helper decoded only `{ message }` objects. So
+"Enter the Cloudflare account ID" was shown as "Could not add this browser provider", which
+named nothing the user could act on. The helper now keeps a string failure, and the reuse
+picker no longer offers OAuth-minted or expiring connections: a Cloudflare MCP access token
+matched the name filter but is not a Browser Rendering API token and cannot be made into
+one. Nor does a target offer its own credential back, which it did because the name filter
+matched the target's own name.

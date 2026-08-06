@@ -4,7 +4,7 @@
  * Chrome desktop reverse channel (path B).
  *
  * One catalog entry only: DB integration `browser` + connection `desktop`
- * (created by ensureChrome). No static `browser` integration — that duplicated
+ * (created by ensureChrome). No static `browser` integration, that duplicated
  * the row in the UI with no status dot.
  */
 
@@ -47,12 +47,14 @@ import {
 } from "./integration-config";
 import { CLOUD_BROWSER_PROVIDERS } from "./cloud-providers";
 import {
+  inferCloudflareAccountId,
   probeProvider,
   probeToHealthStatus,
   type ProbeTarget,
   type ProviderProbe,
 } from "./provider-probe";
 import {
+  classifyRemoteBrowserFailure,
   getRemoteBrowserSession,
   getRemoteBrowserFailure,
   listRemoteBrowserSessions,
@@ -393,7 +395,7 @@ export function localBridgeVerdict(
   const client = (session.client || {}) as { name?: string; version?: string };
   const toolCount = ((session.capabilities || {}) as { tools?: string[] }).tools?.length ?? 0;
   // User-facing proof the extension answers. "Reverse"/session-id/ISO-timestamp
-  // was transport vocabulary — true, but it read like a debug dump.
+  // was transport vocabulary, true, but it read like a debug dump.
   const seenSecondsAgo = Math.max(0, Math.round(ageMs / 1000));
   return {
     status: "healthy",
@@ -439,6 +441,43 @@ export function credentialLooksReusable(
   return hints.some((hint) => haystack.includes(hint));
 }
 
+/**
+ * Whether a connection's secret is the kind another target could adopt.
+ *
+ * `REUSE_HINTS` matches on the integration's name, so "Cloudflare MCP" is as
+ * good a match as "Cloudflare DNS". The first holds an OAuth access token,
+ * which is not a Browser Rendering API token and expires besides; copying one
+ * into a browser target produces a credential that cannot work and reports
+ * itself as a rejected token rather than the wrong credential.
+ *
+ * Static credentials only, then. An OAuth connection belongs to the app that
+ * minted it.
+ */
+export function connectionOffersReusableSecret(connection: {
+  readonly oauthClient?: string | null;
+  readonly expiresAt?: number | null;
+}): boolean {
+  // `expiresAt` is checked as well as `oauthClient` because it is the property
+  // that actually matters: a credential with an expiry is a session, and a copy
+  // of it stops working without anything having changed on this target.
+  return !connection.oauthClient && !connection.expiresAt;
+}
+
+/**
+ * Whether this integration is one of our own browser targets.
+ *
+ * `REUSE_HINTS` matches on the integration's name, and a Vercel Sandbox target
+ * is itself named "Vercel Sandbox", so every target offered its own credential
+ * back for reuse. Adding a second target then listed the first alongside the
+ * real Vercel integration, with nothing to tell them apart.
+ */
+export function integrationIsBrowserTarget(integration: { readonly kind: string }): boolean {
+  return integration.kind === BROWSER_BRIDGE_PLUGIN_ID;
+}
+
+/** The `kind` every integration this plugin registers carries. */
+export const BROWSER_BRIDGE_PLUGIN_ID = "browser-bridge";
+
 /** Project a provider probe onto the connection-test view the UI renders. */
 export function connectionTestFromProbe(
   probe: ProviderProbe,
@@ -479,7 +518,7 @@ type BrowserTargetView = {
  * Read the access scope the extension advertised.
  *
  * The extension is the authority on its own limits, so this reports what it
- * said rather than reconstructing it from the plugin's own settings — which
+ * said rather than reconstructing it from the plugin's own settings, which
  * would agree right up to the moment it mattered.
  */
 export function accessFromCapabilities(capabilities: unknown): BrowserAccessView | null {
@@ -533,6 +572,16 @@ function remoteTargetHostReady(
 ): boolean {
   if (config.provider !== "vercel-sandbox") return true;
   if (config.auth === "token") return true;
+  return hostHasVercelIdentity();
+}
+
+/**
+ * Whether the server process itself can authenticate to Vercel.
+ *
+ * Read at call time rather than at module load: the token is short-lived and
+ * may be rotated into the environment while the process is running.
+ */
+export function hostHasVercelIdentity(): boolean {
   return Boolean(process.env.VERCEL_OIDC_TOKEN);
 }
 
@@ -540,7 +589,7 @@ function remoteTargetHostReady(
  * How ready a provider is, and what to say about it.
  *
  * Vercel used to be reported `unavailable` whenever VERCEL_OIDC_TOKEN was
- * absent — which is every self-hosted instance — and the UI then disabled the
+ * absent, which is every self-hosted instance, and the UI then disabled the
  * one button that would have explained how to fix it. It was never true that
  * the host made the provider impossible: a Vercel API token entered here works
  * anywhere. The missing OIDC token only decides which of the two setup paths is
@@ -562,7 +611,7 @@ function remoteProviderAvailability(
   if (provider === "vercel-sandbox" && !process.env.VERCEL_OIDC_TOKEN) {
     return {
       availability: "needs-setup",
-      availabilityDetail: "No ambient Vercel identity here — add a Vercel API token",
+      availabilityDetail: "No ambient Vercel identity here; add a Vercel API token",
     };
   }
   return {
@@ -686,6 +735,7 @@ function browserOverviewEffect(ctx: PluginCtx) {
               ? provider.note
               : remoteProviderSetup[provider.id].note,
           configured: count,
+          hostIdentity: provider.id === "vercel-sandbox" && hostHasVercelIdentity(),
         };
       }),
       targets,
@@ -746,8 +796,11 @@ function browserConfigFromInput(
         ...controls,
         ...(timeoutMs !== undefined ? { timeoutMs } : {}),
         ...(vcpus !== undefined ? { vcpus } : {}),
-        ...(auth === "token" ? { teamId: requiredText(input.teamId, "Team ID") } : {}),
-        ...(auth === "token" ? { projectId: requiredText(input.projectId, "Project ID") } : {}),
+        // Optional on purpose: the Sandbox SDK infers both from the token, so
+        // requiring them here would reintroduce two fields the user does not
+        // have to hand. Stored only when explicitly overridden.
+        ...(input.teamId?.trim() ? { teamId: input.teamId.trim() } : {}),
+        ...(input.projectId?.trim() ? { projectId: input.projectId.trim() } : {}),
         ...(input.image?.trim() ? { image: input.image.trim() } : {}),
       };
     }
@@ -759,7 +812,10 @@ function browserConfigFromInput(
       });
       return {
         provider: input.provider,
-        accountId: requiredText(input.accountId, "Cloudflare account ID"),
+        // Left empty when the user did not supply one. `resolveCloudflareAccount`
+        // fills it from the token before anything is stored, and refuses the add
+        // if it cannot, so an empty account ID never reaches the database.
+        accountId: input.accountId?.trim() || "",
         ...controls,
         ...(keepAliveMs !== undefined ? { keepAliveMs } : {}),
       };
@@ -814,13 +870,16 @@ function reusableCredentialsEffect(
   return Effect.gen(function* () {
     if (REUSE_HINTS[provider].length === 0) return [] as readonly ReusableCredentialView[];
     const integrations = yield* ctx.core.integrations.list();
-    const candidates = integrations.filter((integration) =>
-      credentialLooksReusable(provider, String(integration.slug), integration.name),
+    const candidates = integrations.filter(
+      (integration) =>
+        credentialLooksReusable(provider, String(integration.slug), integration.name) &&
+        !integrationIsBrowserTarget(integration),
     );
     const found: ReusableCredentialView[] = [];
     for (const integration of candidates) {
       const connections = yield* ctx.connections.list({ integration: integration.slug });
       for (const connection of connections) {
+        if (!connectionOffersReusableSecret(connection)) continue;
         found.push({
           integration: String(integration.slug),
           integrationName: integration.name,
@@ -840,7 +899,7 @@ function reusableCredentialsEffect(
  * Adoption re-checks the same rule the picker uses, because the picker is only
  * an offer and this is the gate. Without it, a request naming any integration
  * would copy that integration's secret into a `generic-cdp` target whose auth
- * header and endpoint URL the same request supplies — which turns a
+ * header and endpoint URL the same request supplies, which turns a
  * write-only stored credential into one that can be sent anywhere. The reuse
  * hints exclude `generic-cdp` and `vercel-sandbox` outright, so that shape is
  * unreachable rather than merely discouraged.
@@ -879,6 +938,33 @@ function credentialForNewTarget(
       });
     }
     return value;
+  });
+}
+
+/**
+ * Supply the Cloudflare account ID from the token when the user left it blank.
+ *
+ * Only the single-account case is inferred. When a token spans several accounts
+ * there is no safe default, and the error says which choice is missing rather
+ * than letting the target be built around a guess.
+ */
+function resolveCloudflareAccount<
+  T extends { readonly provider: string; readonly accountId?: string },
+>(config: T, credential: string | null) {
+  return Effect.gen(function* () {
+    if (config.provider !== "cloudflare-browser-run" || config.accountId || !credential) {
+      return config;
+    }
+    const found = yield* Effect.promise(() => inferCloudflareAccountId(credential));
+    if ("accountId" in found) return { ...config, accountId: found.accountId };
+    return yield* new BrowserBridgeError({
+      message:
+        found.reason === "ambiguous"
+          ? "This token can reach more than one Cloudflare account. Enter the account ID for the one to use."
+          : found.reason === "none"
+            ? "This token can reach no Cloudflare account. Check the token, or enter the account ID."
+            : "Could not read the account for this token. Enter the Cloudflare account ID.",
+    });
   });
 }
 
@@ -921,23 +1007,31 @@ function addBrowserProviderEffect(ctx: PluginCtx, input: AddBrowserProviderInput
       return yield* new BrowserBridgeError({ message: "Provider credential is required" });
     }
 
+    // Fill in the Cloudflare account from the token when the user left it
+    // blank, so a pasted token is enough. Deliberately after the credential is
+    // resolved and before the probe, since the probe reads the account too and
+    // would otherwise fail on the empty ID we are about to supply.
+    const resolved = yield* resolveCloudflareAccount(config, credential);
+
     // Check the credential before writing anything. A target created around a
     // rejected token looks configured and fails only at the first browser call,
     // which is exactly the false-green this refuses to create. Transport
     // failures are not treated as proof of a bad credential.
     const probe = yield* Effect.promise(() =>
-      probeProvider(probeTargetFor(config), credential || null),
+      probeProvider(probeTargetFor(resolved), credential || null),
     );
     if (!probe.ok && (probe.reason === "auth" || probe.reason === "permission")) {
-      return yield* new BrowserBridgeError({ message: `${probe.detail} — ${probe.hint}` });
+      return yield* new BrowserBridgeError({ message: `${probe.detail}. ${probe.hint}` });
     }
 
     const name = input.name?.trim() || browserProviderName(config.provider);
     yield* ctx.core.integrations.register({
       slug,
       name,
+      // `resolved`, not `config`: an inferred account ID has to be the one
+      // stored, or every session start would infer it again.
       description: remoteProviderSetup[config.provider].note,
-      config,
+      config: resolved,
       canRemove: true,
       canRefresh: true,
     });
@@ -951,7 +1045,7 @@ function addBrowserProviderEffect(ctx: PluginCtx, input: AddBrowserProviderInput
             ? "header"
             : "none";
     const connectionName = ConnectionName.make(input.connectionName?.trim() || "default");
-    // An integration with no connection is not a browser target — it is a name
+    // An integration with no connection is not a browser target, it is a name
     // that blocks the slug and cannot be called. If the credential fails to
     // persist, take the integration back out rather than leaving the user to
     // discover the orphan when their retry reports "already exists".
@@ -979,9 +1073,91 @@ function addBrowserProviderEffect(ctx: PluginCtx, input: AddBrowserProviderInput
 /**
  * Check one target on demand: the reverse session for local Chrome, the stored
  * credential for a remote provider. Unlike `checkHealth` this always contacts
- * the provider, because the user asked for the check — a live session proves
+ * the provider, because the user asked for the check, a live session proves
  * the target works but not that the credential is still good.
  */
+/** The page a trial run loads. Stable, tiny, and nobody's private property. */
+const TRIAL_URL = "https://example.com/";
+
+/**
+ * Drive the browser once, for real.
+ *
+ * The credential probe cannot answer "will this browse?": for Vercel it stops
+ * at "token accepted, entitlement not confirmed", because entitlement is not
+ * readable from the API. The only way to know is to start one, and the only
+ * honest way to offer that is as a separate, explicit action, since it costs a
+ * session.
+ *
+ * The session is stopped on the way out, including after a failure, so a failed
+ * trial cannot leave a sandbox running until the idle reaper finds it.
+ */
+function trialRunEffect(ctx: PluginCtx, integration: string, connection: string) {
+  return Effect.gen(function* () {
+    const slug = IntegrationSlug.make(integration);
+    const record = yield* ctx.core.integrations.get(slug);
+    const config = record ? parseBrowserIntegrationConfig(record.config) : null;
+    if (!config || !isRemoteBrowserConfig(config)) {
+      return yield* new BrowserBridgeError({
+        message: `"${integration}" is not a remote browser target`,
+      });
+    }
+    const connections = yield* ctx.connections.list({ integration: slug });
+    const row = connections.find((candidate) => String(candidate.name) === connection);
+    if (!row) {
+      return yield* new BrowserBridgeError({
+        message: `"${integration}" has no connection named "${connection}"`,
+      });
+    }
+    const credential = yield* ctx.connections.resolveValue({
+      owner: row.owner,
+      integration: row.integration,
+      name: row.name,
+    });
+
+    const key = remoteSessionKey(ctx.owner, integration, connection);
+    const startedAt = Date.now();
+    const outcome = yield* Effect.promise(async () => {
+      try {
+        const result = (await runRemoteBrowserTool({
+          key,
+          config,
+          credential,
+          tool: "navigate",
+          args: { url: TRIAL_URL },
+        })) as { readonly tab?: { readonly title?: string; readonly url?: string } };
+        return { ok: true as const, tab: result?.tab };
+      } catch (error) {
+        return { ok: false as const, error };
+      } finally {
+        // A failure to stop must not replace the trial's own verdict, which is
+        // the thing the user asked for.
+        try {
+          await stopRemoteBrowserSession(key);
+        } catch {
+          /* left to the idle reaper */
+        }
+      }
+    });
+    const ms = Date.now() - startedAt;
+    const ranAt = Date.now();
+
+    if (outcome.ok) {
+      return {
+        ok: true,
+        detail: `${browserProviderName(config.provider)} started a browser and loaded a page in ${Math.round(ms / 1000)}s`,
+        ...(outcome.tab?.title ? { title: outcome.tab.title } : {}),
+        ...(outcome.tab?.url ? { url: outcome.tab.url } : {}),
+        ms,
+        ranAt,
+      };
+    }
+    // Reuse the start-failure classifier so a trial explains itself the same
+    // way a failed session does, rather than inventing a second vocabulary.
+    const failure = classifyRemoteBrowserFailure(key, config.provider, outcome.error);
+    return { ok: false, detail: failure.detail, hint: failure.hint, ms, ranAt };
+  });
+}
+
 function testBrowserConnectionEffect(ctx: PluginCtx, integration: string, connection: string) {
   return Effect.gen(function* () {
     const slug = IntegrationSlug.make(integration);
@@ -1034,7 +1210,7 @@ function testBrowserConnectionEffect(ctx: PluginCtx, integration: string, connec
  * Take a browser target out of the catalog: session, connection, integration.
  *
  * A target is one integration+connection created by addProvider, so removal
- * walks the same shape backwards — any live session is stopped first (a
+ * walks the same shape backwards, any live session is stopped first (a
  * removed target must not leave a provider VM running on the clock), and the
  * integration goes once its last connection is gone, because an integration
  * with no connection is just a name squatting on the slug.
@@ -1082,6 +1258,8 @@ const makeBrowserBridgeExtension = (ctx: PluginCtx) => ({
   ) => reusableCredentialsEffect(ctx, provider),
   testConnection: (integration: string, connection: string) =>
     testBrowserConnectionEffect(ctx, integration, connection),
+  trialRun: (integration: string, connection: string) =>
+    trialRunEffect(ctx, integration, connection),
   stopSession: (integration: string, connection: string) =>
     Effect.promise(() =>
       stopRemoteBrowserSession(remoteSessionKey(ctx.owner, integration, connection)).then(
@@ -1145,6 +1323,16 @@ const BrowserControlHandlers = HttpApiBuilder.group(
         }).pipe(
           Effect.mapError(
             (error) => browserBridgeError(error, "Could not list existing credentials").message,
+          ),
+        ),
+      )
+      .handle("trialRun", ({ params }) =>
+        Effect.gen(function* () {
+          const extension = yield* BrowserBridgeExtensionService;
+          return yield* extension.trialRun(params.integration, params.connection);
+        }).pipe(
+          Effect.mapError(
+            (error) => browserBridgeError(error, "Could not run the browser").message,
           ),
         ),
       )
@@ -1228,7 +1416,7 @@ function ensureChromeEffect(ctx: PluginCtx) {
       canRefresh: true,
     });
 
-    // Effect v4: catchAll is gone — use catch / orElseSucceed
+    // Effect v4: catchAll is gone, use catch / orElseSucceed
     const created = yield* ctx.connections
       .create({
         owner: "user",
@@ -1404,7 +1592,7 @@ export const browserBridgePlugin = definePlugin((options: BrowserBridgePluginOpt
             checkedAt: Date.now(),
             detail: probe.ok
               ? `${name}: ${probe.detail}${probe.permissionVerified ? "" : " (session starts on demand)"}`
-              : `${name}: ${probe.detail} — ${probe.hint}`,
+              : `${name}: ${probe.detail}. ${probe.hint}`,
           };
         }
         // HealthStatus vocab: healthy | expired | degraded | unknown.
@@ -1431,7 +1619,7 @@ export const browserBridgePlugin = definePlugin((options: BrowserBridgePluginOpt
     handlers: () => BrowserControlHandlers,
     extensionService: BrowserBridgeExtensionService,
 
-    // Only installer under executor — do NOT also declare static id "browser"
+    // Only installer under executor, do NOT also declare static id "browser"
     // (that duplicated the catalog row with no health dot).
     staticIntegrations: (self) => [
       {

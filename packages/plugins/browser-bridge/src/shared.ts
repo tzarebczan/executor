@@ -17,6 +17,12 @@ export const BrowserProviderDefinition = Schema.Struct({
   setup: Schema.String,
   note: Schema.String,
   configured: Schema.Number,
+  /**
+   * Whether this Executor host carries an ambient credential for the provider,
+   * so the UI can stop offering an auth path that cannot work here. Only Vercel
+   * has one (`VERCEL_OIDC_TOKEN`); every other provider is always false.
+   */
+  hostIdentity: Schema.Boolean,
 });
 
 export const BrowserSessionView = Schema.Struct({
@@ -147,6 +153,32 @@ export const BrowserConnectionTest = Schema.Struct({
 export type BrowserConnectionTestView = typeof BrowserConnectionTest.Type;
 
 /**
+ * Result of actually driving the browser once.
+ *
+ * Separate from `BrowserConnectionTest` because it answers a different
+ * question. The credential check proves a token is live; it starts nothing, so
+ * it cannot tell you the provider will hand you a working browser. "Token
+ * accepted; sandbox entitlement not confirmed" is an honest answer to the wrong
+ * question when what you want to know is whether this thing browses.
+ *
+ * This one starts a real session, loads a page, and stops it again, so it costs
+ * whatever one short session costs. Never run automatically.
+ */
+export const BrowserTrialRun = Schema.Struct({
+  ok: Schema.Boolean,
+  detail: Schema.String,
+  hint: Schema.optional(Schema.String),
+  /** Title of the page that was actually loaded. Absent when the run failed. */
+  title: Schema.optional(Schema.String),
+  url: Schema.optional(Schema.String),
+  /** Wall-clock time for start, navigate, and stop together. */
+  ms: Schema.Number,
+  ranAt: Schema.Number,
+});
+
+export type BrowserTrialRunView = typeof BrowserTrialRun.Type;
+
+/**
  * An existing credential that might also work for a browser provider.
  *
  * Carries no secret value: it names a connection the user already owns so they
@@ -166,7 +198,7 @@ export type ReusableCredentialView = typeof ReusableCredential.Type;
  * Every failure on these routes is the caller's to fix.
  *
  * A bare `Schema.String` error carries no status annotation, and HttpApi
- * defaults an unannotated error to 500 — so "paste an account ID" and "that
+ * defaults an unannotated error to 500, so "paste an account ID" and "that
  * token was rejected" both reached the browser as `POST /api/browsers 500
  * (Internal Server Error)`. The message was in the body and did render in the
  * form, but the console said the server had crashed, which is the wrong thing
@@ -214,6 +246,13 @@ export const BrowserControlApi = HttpApiGroup.make("browserControl")
     HttpApiEndpoint.post("testConnection", "/browsers/:integration/:connection/test", {
       params: Schema.Struct({ integration: Schema.String, connection: Schema.String }),
       success: BrowserConnectionTest,
+      error: BrowserControlError,
+    }),
+  )
+  .add(
+    HttpApiEndpoint.post("trialRun", "/browsers/:integration/:connection/trial", {
+      params: Schema.Struct({ integration: Schema.String, connection: Schema.String }),
+      success: BrowserTrialRun,
       error: BrowserControlError,
     }),
   );

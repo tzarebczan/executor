@@ -98,16 +98,22 @@ describe("cloud browser providers", () => {
     );
   });
 
-  it("fails before provisioning when a token target has no Vercel scope", async () => {
-    const tokenBrowser = vi.fn();
+  it("starts a token target that names no team or project", async () => {
+    // Neither is required any more: the token path infers both. Passing them
+    // as `undefined` rather than omitting them would defeat that, since the
+    // adapter decides whether to infer by looking for the keys.
+    const tokenBrowser = vi.fn().mockResolvedValue({ session: "v", exec: vi.fn(), close: vi.fn() });
 
-    await expect(
-      createCloudBrowserSession(
-        { provider: "vercel-sandbox", token: "vercel_abc" },
-        { createTokenVercelBrowser: tokenBrowser },
-      ),
-    ).rejects.toThrow(/Team ID and Project ID are required/);
-    expect(tokenBrowser).not.toHaveBeenCalled();
+    await createCloudBrowserSession(
+      { provider: "vercel-sandbox", token: "vercel_abc" },
+      { createTokenVercelBrowser: tokenBrowser },
+    );
+
+    expect(tokenBrowser).toHaveBeenCalledTimes(1);
+    const passed = tokenBrowser.mock.calls[0]![0] as Record<string, unknown>;
+    expect(passed.token).toBe("vercel_abc");
+    expect("teamId" in passed).toBe(false);
+    expect("projectId" in passed).toBe(false);
   });
 
   it("still uses the ambient identity when no token is configured", async () => {

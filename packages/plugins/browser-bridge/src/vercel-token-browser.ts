@@ -4,7 +4,7 @@
  * Vercel Sandbox browsers authenticated with an API token.
  *
  * `remote-agent-browser` provisions its own sandbox, and the only credential it
- * can use is the ambient one — `VERCEL_OIDC_TOKEN` in the server process, or a
+ * can use is the ambient one, `VERCEL_OIDC_TOKEN` in the server process, or a
  * local `vercel login`. On a self-hosted Executor that is the single hardest
  * prerequisite in the whole browser feature: the token is short-lived, it has
  * to reach the *server's* environment rather than a shell, and when it is
@@ -12,7 +12,7 @@
  *
  * `@vercel/sandbox` itself has always accepted an explicit `token`, so the
  * limitation is only that the library above it does not forward one. It does
- * export `createBrowserClient`, which takes any `CommandRunner` — so provisioning
+ * export `createBrowserClient`, which takes any `CommandRunner`, so provisioning
  * the sandbox here and handing the runner over gets token auth without forking
  * anything. The runner mirrors the library's own sandbox adapter; if that
  * behaviour drifts, this is the file to reconcile.
@@ -22,6 +22,7 @@
  */
 
 import { Sandbox } from "@vercel/sandbox";
+import { inferScope } from "@vercel/sandbox/dist/auth/index.js";
 import { createBrowserClient, type AgentBrowser, type CommandRunner } from "remote-agent-browser";
 
 /** Matches remote-agent-browser's own sandbox defaults. */
@@ -35,12 +36,18 @@ const DEFAULT_IMAGE = "remote-agent-browser:latest";
 const DEFAULT_COMMAND_TIMEOUT_MS = 60_000;
 
 export type TokenVercelBrowserOptions = {
-  /** Vercel API token. Required — this path exists to avoid ambient identity. */
+  /** Vercel API token. Required: this path exists to avoid ambient identity. */
   readonly token: string;
-  /** Team the token is scoped to. Required by the Sandbox API. */
-  readonly teamId: string;
-  /** Project that owns the sandbox. Required by the Sandbox API. */
-  readonly projectId: string;
+  /**
+   * Team and project that own the sandbox.
+   *
+   * Both are optional because `inferScope` derives them from the token, which
+   * is what makes a pasted token sufficient on its own. Supply them only to
+   * override that choice: a token with access to several teams resolves to the
+   * default one, and a specific team has to be named to beat it.
+   */
+  readonly teamId?: string;
+  readonly projectId?: string;
   readonly image?: string;
   readonly timeoutMs?: number;
   readonly vcpus?: number;
@@ -128,20 +135,55 @@ class TokenSandboxRunner implements CommandRunner {
   }
 }
 
+/** Injected in tests. Mirrors `inferScope` from `@vercel/sandbox`. */
+export type VercelScopeResolver = (opts: {
+  token: string;
+  teamId?: string;
+}) => Promise<{ teamId: string; projectId: string }>;
+
+/**
+ * Fill in whichever of team and project the user did not supply.
+ *
+ * `inferScope` picks the token's default team and provisions a default sandbox
+ * project when none exists, so a token alone is enough. Asking for both IDs up
+ * front made three fields mandatory to reach a browser when the SDK could
+ * answer two of them, and a wrong ID fails at start time with a bare 404.
+ *
+ * Skipped entirely when both are already known, so an explicit choice costs no
+ * extra API call and cannot be silently overridden.
+ */
+async function resolveScope(
+  options: TokenVercelBrowserOptions,
+  infer: VercelScopeResolver,
+): Promise<{ teamId: string; projectId: string }> {
+  if (options.teamId && options.projectId) {
+    return { teamId: options.teamId, projectId: options.projectId };
+  }
+  const scope = await infer({
+    token: options.token,
+    ...(options.teamId ? { teamId: options.teamId } : {}),
+  });
+  return {
+    teamId: options.teamId || scope.teamId,
+    projectId: options.projectId || scope.projectId,
+  };
+}
+
 /**
  * Start a browser in a Vercel Sandbox using an explicit API token.
  *
- * @param deps.createSandbox Overridden in tests. Nothing else should pass it —
+ * @param deps.createSandbox Overridden in tests. Nothing else should pass it:
  *   a real call here provisions a billable sandbox.
  */
 export async function createTokenVercelBrowser(
   options: TokenVercelBrowserOptions,
-  deps: { readonly createSandbox?: VercelSandboxFactory } = {},
+  deps: {
+    readonly createSandbox?: VercelSandboxFactory;
+    readonly inferScope?: VercelScopeResolver;
+  } = {},
 ): Promise<AgentBrowser> {
   if (!options.token) throw new Error("A Vercel API token is required for this browser target");
-  if (!options.teamId) throw new Error("A Vercel Team ID is required for this browser target");
-  if (!options.projectId)
-    throw new Error("A Vercel Project ID is required for this browser target");
+  const scope = await resolveScope(options, deps.inferScope || inferScope);
   const env: Record<string, string> = { ...BASE_ENV };
   const create =
     deps.createSandbox ||
@@ -160,8 +202,8 @@ export async function createTokenVercelBrowser(
 
   const sandbox = await create({
     token: options.token,
-    teamId: options.teamId,
-    projectId: options.projectId,
+    teamId: scope.teamId,
+    projectId: scope.projectId,
     image: options.image || process.env.REMOTE_AGENT_BROWSER_IMAGE || DEFAULT_IMAGE,
     timeout: options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
     resources: { vcpus: options.vcpus ?? 2 },

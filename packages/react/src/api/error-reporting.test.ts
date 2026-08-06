@@ -53,6 +53,20 @@ describe("frontend error reporting", () => {
     expect(messageFromExit(Exit.fail({ reason: "unknown" }), "Fallback")).toBe("Fallback");
   });
 
+  it("keeps the message when an endpoint fails with a bare string", () => {
+    // An HttpApi endpoint whose `error` is `Schema.String` fails with the
+    // string itself, not a `{ message }` object. This helper decoded only the
+    // object shape, so every such explanation was replaced by the caller's
+    // generic fallback: the browser plugin's "Cloudflare needs an account ID"
+    // reached the page as "Could not add this browser provider", which tells
+    // the user nothing and sends them to the server logs for their own typo.
+    // `messageFromUnknown` already handled strings; only this path did not.
+    expect(messageFromExit(Exit.fail("Enter the Cloudflare account ID"), "Fallback")).toBe(
+      "Enter the Cloudflare account ID",
+    );
+    expect(messageFromExit(Exit.fail(""), "Fallback")).toBe("Fallback");
+  });
+
   it("reports failed exits with the provided context", () => {
     const exit = Exit.fail({ message: "Could not update integration" });
     const { calls, report } = captureReports();

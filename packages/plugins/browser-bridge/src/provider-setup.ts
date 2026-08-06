@@ -4,8 +4,8 @@
  * The failure this exists to prevent is a form with an empty "API token" box
  * and no indication of which of a provider's dozen token types is the right
  * one. Each entry names the exact permission, links the page that issues it,
- * and — where the prerequisite is on the Executor host rather than in a
- * dashboard — offers a prompt the user can hand to an agent instead.
+ * and, where the prerequisite is on the Executor host rather than in a
+ * dashboard, offers a prompt the user can hand to an agent instead.
  */
 
 import type { CloudBrowserProvider } from "./cloud-providers";
@@ -24,7 +24,7 @@ export type ProviderSetup = {
   readonly steps: readonly SetupStep[];
   /**
    * A prompt the user can paste into a coding agent when the setup is easier to
-   * delegate than to click through — a prerequisite on the Executor host, or a
+   * delegate than to click through, a prerequisite on the Executor host, or a
    * provider console the agent can already reach over MCP.
    *
    * Never rendered: it is written for an agent to read, and showing twenty
@@ -47,7 +47,7 @@ Please:
 2. Pull the development environment so a VERCEL_OIDC_TOKEN is issued
    (\`vercel env pull\`), and confirm the token is present and unexpired.
 3. Work out where the Executor server process reads its environment from in
-   this deployment, and wire VERCEL_OIDC_TOKEN into it there — not just into my
+   this deployment, and wire VERCEL_OIDC_TOKEN into it there, not just into my
    interactive shell, since the server is what needs it.
 4. Tell me how the token is refreshed and what happens when it expires, because
    these tokens are short-lived and a stale one will look like a broken browser
@@ -65,13 +65,13 @@ Please:
 1. Use the Cloudflare MCP server if you have it connected; otherwise use the
    Cloudflare dashboard or API directly, and tell me which you used.
 2. Find my Cloudflare account ID and confirm Browser Rendering is enabled on
-   that account — it is not on by default on every plan, and a token cannot
+   that account, it is not on by default on every plan, and a token cannot
    grant a capability the account lacks.
-3. Create an API token scoped to that account with the "Browser Rendering —
+3. Create an API token scoped to that account with the "Browser Rendering,
    Edit" permission, and nothing broader. If a suitable token already exists,
    tell me rather than minting a duplicate.
 4. Give me the account ID in plain text, and the token by whatever route we
-   normally pass secrets — I will paste it into Executor's browser target form.
+   normally pass secrets, I will paste it into Executor's browser target form.
 5. Warn me if the account has a Browser Rendering usage limit or a per-minute
    concurrency cap that a browsing agent would hit.
 
@@ -82,51 +82,33 @@ export const PROVIDER_SETUP: Record<CloudBrowserProvider, ProviderSetup> = {
     credentialLabel: "API token",
     steps: [
       {
-        text:
-          "Simplest: create a Vercel API token and paste it below. This works wherever Executor runs, " +
-          "and if you already hold a Vercel credential here it will be offered for reuse.",
+        text: "Create a Vercel API token and paste it below. Team and project are read from the token.",
         url: "https://vercel.com/account/settings/tokens",
       },
       {
-        text:
-          "Scope the token to the team whose sandboxes you want to use, then enter that team ID and " +
-          "the project ID that will own the sandbox.",
-      },
-      {
-        text:
-          "Push a browser-ready image to that project's Vercel Container Registry. The default image " +
-          "name is remote-agent-browser:latest; enter another repository:tag below if needed.",
+        text: "Push a browser image to that project's Container Registry, named remote-agent-browser:latest.",
         url: "https://vercel.com/docs/sandbox/concepts/images",
       },
       {
-        text:
-          "Alternative: if Executor itself runs on Vercel, it already has an ambient identity and needs " +
-          "no token — switch this target to ambient below.",
-      },
-      {
-        text: "To use ambient identity off-Vercel, VERCEL_OIDC_TOKEN has to reach the server process. Copy the setup prompt for that.",
+        text: "Running Executor on Vercel? Tick ambient identity instead and skip the token.",
       },
     ],
     agentPrompt: VERCEL_OIDC_PROMPT,
-    agentPromptLabel: "Setup prompt for putting VERCEL_OIDC_TOKEN on the host",
+    agentPromptLabel: "Setup prompt for ambient identity off Vercel",
   },
   "cloudflare-browser-run": {
     credentialLabel: "API token",
-    permission: "Browser Rendering — Edit",
+    permission: "Browser Rendering, Edit",
     steps: [
       {
         text: "Create an API token with the Browser Rendering permission.",
         url: "https://dash.cloudflare.com/profile/api-tokens",
       },
       {
-        text: "Copy your account ID from the dashboard overview — it is not the token.",
-        url: "https://dash.cloudflare.com",
+        text: "Paste it below. The account is read from the token.",
       },
       {
-        text: "Paste both below. Test the target afterwards: a token can be valid and still lack Browser Rendering.",
-      },
-      {
-        text: "Or hand the whole Cloudflare side to an agent with the Cloudflare MCP server — copy the prompt below.",
+        text: "Test afterwards: a valid token can still lack Browser Rendering.",
       },
     ],
     agentPrompt: CLOUDFLARE_MCP_PROMPT,
@@ -146,7 +128,7 @@ export const PROVIDER_SETUP: Record<CloudBrowserProvider, ProviderSetup> = {
     credentialLabel: "Header value",
     steps: [
       {
-        text: "Get the CDP WebSocket URL from your provider — Browserbase, Browserless, Kernel, or your own Chrome.",
+        text: "Get the CDP WebSocket URL from your provider, Browserbase, Browserless, Kernel, or your own Chrome.",
       },
       {
         text: "If the endpoint needs authentication, give the header name and value it expects.",

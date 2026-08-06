@@ -4,7 +4,9 @@ import {
   accessFromCapabilities,
   BROWSER_TOOL_CATALOG,
   connectionTestFromProbe,
+  connectionOffersReusableSecret,
   credentialLooksReusable,
+  integrationIsBrowserTarget,
   localBridgeVerdict,
   remoteAdvancedAllowed,
   remoteCatalogResult,
@@ -210,7 +212,7 @@ describe("credentialLooksReusable", () => {
     // `addProvider` re-checks this before resolving another integration's
     // secret. Without that, a request could name any integration and have its
     // token copied into a generic-cdp target whose auth header and endpoint
-    // URL the same request supplies — sending the secret wherever it liked.
+    // URL the same request supplies, sending the secret wherever it liked.
     expect(credentialLooksReusable("generic-cdp", "cloudflare-dns", "Cloudflare")).toBe(false);
     expect(credentialLooksReusable("cloudflare-browser-run", "stripe", "Stripe")).toBe(false);
   });
@@ -227,6 +229,40 @@ describe("credentialLooksReusable", () => {
     // still only an offer: the user picks it and the copy is probed first.
     expect(credentialLooksReusable("vercel-sandbox", "vercel", "Vercel")).toBe(true);
     expect(credentialLooksReusable("vercel-sandbox", "stripe", "Stripe")).toBe(false);
+  });
+});
+
+describe("integrationIsBrowserTarget", () => {
+  it("does not offer a browser target its own credential back", () => {
+    // The name filter matches "vercel" against the integration's own name, and
+    // a Vercel Sandbox target is itself called "Vercel Sandbox". Adding a
+    // second target therefore listed the first as a reuse candidate beside the
+    // real Vercel integration, with nothing to tell the two apart.
+    expect(integrationIsBrowserTarget({ kind: "browser-bridge" })).toBe(true);
+    expect(integrationIsBrowserTarget({ kind: "openapi" })).toBe(false);
+  });
+});
+
+describe("connectionOffersReusableSecret", () => {
+  it("offers a pasted API token", () => {
+    expect(connectionOffersReusableSecret({ oauthClient: null })).toBe(true);
+    expect(connectionOffersReusableSecret({})).toBe(true);
+  });
+
+  it("does not offer a credential that expires", () => {
+    // An expiring credential is a session. A copy of it stops working later
+    // with nothing having changed on the target that adopted it, which reads
+    // as the browser breaking by itself.
+    expect(connectionOffersReusableSecret({ expiresAt: 1_700_000_000_000 })).toBe(false);
+  });
+
+  it("does not offer an OAuth access token as if it were an API token", () => {
+    // The name filter matches any integration containing "cloudflare", which
+    // includes a Cloudflare MCP connection minted by OAuth. Its access token is
+    // not a Browser Rendering API token and it expires, so adopting one copied
+    // a credential that could never work into a new target and failed the add
+    // with a message about a bad token rather than a bad choice.
+    expect(connectionOffersReusableSecret({ oauthClient: "cloudflare-mcp" })).toBe(false);
   });
 });
 

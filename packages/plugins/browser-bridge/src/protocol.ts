@@ -148,7 +148,7 @@ export interface BrowserSnapshotNode {
  *
  * Prose changes; these do not. An agent deciding whether to retry, ask the user
  * to widen access, or give up needs to tell "the tab is gone" from "you are not
- * allowed to touch it" — and a message string cannot carry that reliably.
+ * allowed to touch it", and a message string cannot carry that reliably.
  */
 export const BROWSER_ERROR_CODES = Object.freeze({
   /** Advanced mode is off in the extension's settings. */
@@ -159,7 +159,7 @@ export const BROWSER_ERROR_CODES = Object.freeze({
   outsideGroup: "TAB_OUTSIDE_EXECUTOR_GROUP",
   /** The tab's host is not in the Limited-mode allowlist. */
   hostNotAllowed: "HOST_NOT_IN_ALLOWLIST",
-  /** No tab matched — genuinely absent, as opposed to refused. */
+  /** No tab matched, genuinely absent, as opposed to refused. */
   noTab: "NO_TARGET_TAB",
   /** This target does not publish the requested tool. */
   unsupported: "TOOL_NOT_SUPPORTED",
@@ -184,7 +184,7 @@ export type BrowserToolError = {
  */
 export interface BrowserConsoleEntry {
   readonly level: string;
-  /** Redacted before capture — see the extension's `redact` module. */
+  /** Redacted before capture, see the extension's `redact` module. */
   readonly text: string;
   readonly timestamp: number;
   readonly tabId: number;
@@ -299,7 +299,7 @@ export interface BrowserCapabilityAdvertisement {
   readonly tools: readonly BrowserToolName[];
   /**
    * What the extension will actually let through, as it sees it. Declared in
-   * full — the console shows this to the user, so a field the extension sends
+   * full, the console shows this to the user, so a field the extension sends
    * and this type omits is a scope the user cannot see.
    */
   readonly access?: {

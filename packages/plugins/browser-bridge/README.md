@@ -12,7 +12,7 @@ Extension ← long-poll jobs ←─────┘
 
 ## HTTP (extension)
 
-Every route requires a **presented** credential — an API key as `Authorization: Bearer`
+Every route requires a **presented** credential, an API key as `Authorization: Bearer`
 or `x-api-key`. A browser session cookie is rejected even when it identifies the same
 user: this is a machine surface, and accepting an ambient cookie would let any page the
 user has open inject tool results or rewrite the advertised access scope.
@@ -64,7 +64,7 @@ it later without starting a session.
 | Generic CDP | optional header | The CDP WebSocket URL, plus an auth header if the endpoint needs one |
 
 Each provider's setup steps link the page that issues the right credential, and
-Vercel and Cloudflare also offer a prompt you can hand to an agent instead — one
+Vercel and Cloudflare also offer a prompt you can hand to an agent instead, one
 for putting `VERCEL_OIDC_TOKEN` on the host, one for driving the Cloudflare
 console over MCP. The prompts are copy-only: they are written for an agent to
 read, not for you.
@@ -72,7 +72,7 @@ read, not for you.
 ### Vercel Sandbox: token or ambient identity
 
 `remote-agent-browser` provisions its sandbox with whatever ambient Vercel
-identity the process has — `VERCEL_OIDC_TOKEN`, or a local `vercel login`. That
+identity the process has, `VERCEL_OIDC_TOKEN`, or a local `vercel login`. That
 is automatic when Executor runs on Vercel and awkward everywhere else, since the
 token is short-lived and has to reach the *server's* environment rather than a
 shell.
@@ -83,8 +83,8 @@ accepts one directly; the sandbox is provisioned here and handed to
 Tick **ambient identity** on the target instead if Executor runs on Vercel, or if
 you would rather keep the credential out of Executor.
 
-A token is checked against `/v2/user` — and against `/v2/teams/:id` when a team
-is given — before the target is created. Sandbox entitlement is not readable
+A token is checked against `/v2/user`, and against `/v2/teams/:id` when a team
+is given, before the target is created. Sandbox entitlement is not readable
 from the API, so a passing check reports the credential as good and the
 entitlement as unconfirmed rather than claiming both.
 
@@ -103,8 +103,8 @@ Two controls apply to every remote target:
 ### Generic CDP reaches the network the Executor host can see
 
 A Generic CDP endpoint is dialled **from the Executor host**, and loopback and private
-addresses are deliberately allowed so that `ws://127.0.0.1:9222` — a Chrome the operator
-started themselves — works. On a single-operator self-hosted instance that is the point
+addresses are deliberately allowed so that `ws://127.0.0.1:9222`, a Chrome the operator
+started themselves, works. On a single-operator self-hosted instance that is the point
 of the provider. On a shared instance it means anyone who can add a browser target can
 make the host connect to an address of their choosing and drive whatever answers, so
 either restrict who may add targets or do not enable this provider there.

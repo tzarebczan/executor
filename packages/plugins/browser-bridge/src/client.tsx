@@ -29,6 +29,7 @@ import {
   Cloud,
   ExternalLink,
   Monitor,
+  PlayCircle,
   Plus,
   PlugZap,
   RefreshCw,
@@ -43,6 +44,7 @@ import {
   type BrowserAccessView,
   type BrowserConnectionTestView,
   type BrowserTargetView,
+  type BrowserTrialRunView,
   type ReusableCredentialView,
 } from "./shared";
 
@@ -55,6 +57,7 @@ const addProviderAtom = BrowserClient.mutation("browserControl", "addProvider");
 const stopSessionAtom = BrowserClient.mutation("browserControl", "stopSession");
 const removeTargetAtom = BrowserClient.mutation("browserControl", "removeTarget");
 const testConnectionAtom = BrowserClient.mutation("browserControl", "testConnection");
+const trialRunAtom = BrowserClient.mutation("browserControl", "trialRun");
 
 /** `Atom.family` because the form re-renders: a fresh atom per render refetches in a loop. */
 const reusableCredentialsAtom = Atom.family((provider: RemoteProvider) =>
@@ -139,7 +142,7 @@ function AccessSummary({ access }: { readonly access: BrowserAccessView }) {
  *
  * That state existed for Vercel without an ambient identity on the host, and it
  * disabled the provider outright. Since a Vercel API token works on any host,
- * every provider here can be set up from this page — so the only question left
+ * every provider here can be set up from this page, so the only question left
  * is whether it already has been.
  */
 function AvailabilityBadge({
@@ -169,7 +172,7 @@ function AvailabilityBadge({
  * with no instructions attached: an agent handed `tools.browser.user.desktop`
  * still does not know it should prefer snapshots, that only certain tabs are
  * reachable, or that it must not invent page state. This is the paste that
- * makes the target usable, and it is never shown — nobody reads a wall of
+ * makes the target usable, and it is never shown, nobody reads a wall of
  * instructions written for a machine.
  */
 function agentPromptFor(target: BrowserTargetView): string {
@@ -198,11 +201,11 @@ function agentPromptFor(target: BrowserTargetView): string {
   if (target.access?.mode === "limited" && target.access.allowedHosts.length > 0) {
     lines.push(`- Only these sites are allowed: ${target.access.allowedHosts.join(", ")}.`);
   }
-  lines.push("- If a tool returns an error, report it — do not guess what the page shows.");
+  lines.push("- If a tool returns an error, report it, do not guess what the page shows.");
   return lines.join("\n");
 }
 
-/** Rough countdown — enough to decide whether to act, not a clock. */
+/** Rough countdown, enough to decide whether to act, not a clock. */
 function untilLabel(at: number, now: number): string {
   const seconds = Math.max(0, Math.round((at - now) / 1000));
   return seconds >= 90 ? `${Math.round(seconds / 60)} min` : `${seconds}s`;
@@ -229,6 +232,37 @@ function ConnectionTestResult({ result }: { readonly result: BrowserConnectionTe
         <Icon className="mt-px size-3.5 shrink-0" />
         <span className="min-w-0 break-words">{result.detail}</span>
       </p>
+      {result.hint && (
+        <p className="mt-1 break-words pl-5 text-xs text-muted-foreground">{result.hint}</p>
+      )}
+    </div>
+  );
+}
+
+/**
+ * What a real session did, as opposed to what a credential claims.
+ *
+ * The page title is shown because it is the part that cannot be faked by a
+ * probe: something rendered HTML at the other end.
+ */
+function TrialRunResult({ result }: { readonly result: BrowserTrialRunView }) {
+  const Icon = result.ok ? CheckCircle2 : AlertTriangle;
+  return (
+    <div className="mt-3 rounded border bg-muted/40 px-2.5 py-2">
+      <p
+        className={`flex items-start gap-1.5 text-xs ${
+          result.ok ? "text-emerald-700 dark:text-emerald-300" : "text-destructive"
+        }`}
+      >
+        <Icon className="mt-px size-3.5 shrink-0" />
+        <span className="min-w-0 break-words">{result.detail}</span>
+      </p>
+      {result.ok && result.title && (
+        <p className="mt-1 break-words pl-5 text-xs text-muted-foreground">
+          Loaded &ldquo;{result.title}&rdquo;
+          {result.url ? ` from ${result.url}` : ""}
+        </p>
+      )}
       {result.hint && (
         <p className="mt-1 break-words pl-5 text-xs text-muted-foreground">{result.hint}</p>
       )}
@@ -285,9 +319,12 @@ function SetupGuide({ provider }: { readonly provider: RemoteProvider }) {
 
 function ProviderForm({
   provider,
+  hostIdentity,
   onDone,
 }: {
   readonly provider: RemoteProvider;
+  /** This host carries an ambient credential for the provider. */
+  readonly hostIdentity: boolean;
   readonly onDone: () => void;
 }) {
   const [busy, setBusy] = useState(false);
@@ -352,11 +389,7 @@ function ProviderForm({
       <SetupGuide provider={provider} />
       {candidates.length > 0 && (
         <div className="grid gap-2 rounded-md border p-3">
-          <p className="text-xs text-muted-foreground">
-            You already have credentials that may work here. Reusing one copies its value now — it
-            will not follow later changes to the original. The copy is checked before this target is
-            created.
-          </p>
+          <p className="text-xs font-medium">Auth from Integration</p>
           {candidates.map((candidate) => {
             const chosen = reuse?.address === candidate.address;
             return (
@@ -367,7 +400,7 @@ function ProviderForm({
                   size="sm"
                   onClick={() => setReuse(chosen ? null : candidate)}
                 >
-                  {chosen ? "Selected" : "Reuse"}
+                  {chosen ? "Using" : "Use"}
                 </Button>
                 <span className="min-w-0 truncate text-xs">
                   {candidate.integrationName} · {candidate.connection}
@@ -376,68 +409,32 @@ function ProviderForm({
               </div>
             );
           })}
+          <p className="text-xs text-muted-foreground">
+            Copies the value now, so later changes to the original will not follow.
+          </p>
         </div>
       )}
       {provider === "vercel-sandbox" && (
         <>
-          {/* Ambient identity is offered second because it is the path that
-              works on exactly one kind of deployment. A token works on all of
-              them, so it is what an empty form asks for. */}
-          <Label htmlFor="browser-vercel-ambient" className="flex items-start gap-2 text-sm">
-            <Checkbox
-              id="browser-vercel-ambient"
-              checked={vercelAmbient}
-              onCheckedChange={(checked) => setVercelAmbient(checked === true)}
-            />
-            <span className="min-w-0">
-              Use this host&apos;s ambient Vercel identity instead of a token
-              <span className="block text-xs text-muted-foreground">
-                Only works when Executor runs on Vercel, or VERCEL_OIDC_TOKEN is in the
-                server&apos;s environment.
-              </span>
-            </span>
-          </Label>
-          {!vercelAmbient && (
-            <>
-              {!reuse && <SecretField name="credential" label={secretLabel!} />}
-              <div className="grid gap-3 sm:grid-cols-2">
-                <Field name="teamId" label="Team ID" placeholder="team_..." required />
-                <Field name="projectId" label="Project ID" placeholder="prj_..." required />
-              </div>
-              <Field
-                name="image"
-                label="VCR browser image"
-                placeholder="remote-agent-browser:latest (default)"
+          {/* Only offered where it can work. The host either has an ambient
+              Vercel identity or it does not, and the server already knows
+              which; asking the user to decide meant explaining OIDC to people
+              on hosts where the option was guaranteed to fail. */}
+          {hostIdentity && (
+            <Label htmlFor="browser-vercel-ambient" className="flex items-center gap-2 text-sm">
+              <Checkbox
+                id="browser-vercel-ambient"
+                checked={vercelAmbient}
+                onCheckedChange={(checked) => setVercelAmbient(checked === true)}
               />
-            </>
+              <span>This host has its own Vercel identity. Use it instead of a token.</span>
+            </Label>
           )}
-          <div className="grid gap-3 sm:grid-cols-2">
-            <Field
-              name="timeoutMs"
-              label="Session timeout (ms)"
-              placeholder="600000"
-              type="number"
-              min={1}
-              step={1000}
-            />
-            <Field name="vcpus" label="vCPUs" placeholder="2" type="number" min={1} step={1} />
-          </div>
+          {!vercelAmbient && !reuse && <SecretField name="credential" label={secretLabel!} />}
         </>
       )}
-      {provider === "cloudflare-browser-run" && (
-        <>
-          <Field name="accountId" label="Cloudflare account ID" required />
-          {!reuse && <SecretField name="credential" label={secretLabel!} />}
-          <Field
-            name="keepAliveMs"
-            label="Keep-alive (ms)"
-            placeholder="600000"
-            type="number"
-            min={10000}
-            max={1200000}
-            step={10000}
-          />
-        </>
+      {provider === "cloudflare-browser-run" && !reuse && (
+        <SecretField name="credential" label={secretLabel!} />
       )}
       {provider === "browser-use" && (
         <>
@@ -485,6 +482,51 @@ function ProviderForm({
           Advanced
         </CollapsibleTrigger>
         <CollapsibleContent className="pt-3">
+          {/* Tuning and overrides live here rather than in the form proper.
+              Every one of these has a working default, and a field with a
+              default still reads as something to fill in when it sits next to
+              the credential that genuinely is required. */}
+          {provider === "vercel-sandbox" && !vercelAmbient && (
+            <div className="mb-3 grid gap-3">
+              <p className="text-xs text-muted-foreground">
+                Team and project are read from the token. Set them only to override that choice.
+              </p>
+              <div className="grid gap-3 sm:grid-cols-2">
+                <Field name="teamId" label="Team ID" placeholder="Inferred from token" />
+                <Field name="projectId" label="Project ID" placeholder="Inferred from token" />
+              </div>
+              <Field
+                name="image"
+                label="Browser image"
+                placeholder="remote-agent-browser:latest (default)"
+              />
+              <div className="grid gap-3 sm:grid-cols-2">
+                <Field
+                  name="timeoutMs"
+                  label="Session timeout (ms)"
+                  placeholder="600000"
+                  type="number"
+                  min={1}
+                  step={1000}
+                />
+                <Field name="vcpus" label="vCPUs" placeholder="2" type="number" min={1} step={1} />
+              </div>
+            </div>
+          )}
+          {provider === "cloudflare-browser-run" && (
+            <div className="mb-3 grid gap-3">
+              <Field name="accountId" label="Account ID" placeholder="Inferred from token" />
+              <Field
+                name="keepAliveMs"
+                label="Keep-alive (ms)"
+                placeholder="600000"
+                type="number"
+                min={10000}
+                max={1200000}
+                step={10000}
+              />
+            </div>
+          )}
           <div className="grid gap-3 sm:grid-cols-2">
             <Field name="name" label="Display name" placeholder={providerLabels[provider]} />
             <Field name="connectionName" label="Connection" placeholder="default" />
@@ -597,12 +639,15 @@ function BrowsersPage() {
   const stopSession = useAtomSet(stopSessionAtom, { mode: "promiseExit" });
   const removeTarget = useAtomSet(removeTargetAtom, { mode: "promiseExit" });
   const testConnection = useAtomSet(testConnectionAtom, { mode: "promiseExit" });
+  const trialRun = useAtomSet(trialRunAtom, { mode: "promiseExit" });
   const [adding, setAdding] = useState<RemoteProvider | null>(null);
   const [stopping, setStopping] = useState<string | null>(null);
   const [removing, setRemoving] = useState<string | null>(null);
   const [removeErrors, setRemoveErrors] = useState<Record<string, string>>({});
   const [testing, setTesting] = useState<string | null>(null);
   const [tests, setTests] = useState<Record<string, BrowserConnectionTestView>>({});
+  const [trialling, setTrialling] = useState<string | null>(null);
+  const [trials, setTrials] = useState<Record<string, BrowserTrialRunView>>({});
   const value = AsyncResult.isSuccess(overview) ? overview.value : null;
   const liveTargets = value?.targets.filter((target) => target.state === "live").length || 0;
 
@@ -727,7 +772,44 @@ function BrowsersPage() {
                             }}
                           >
                             <PlugZap className="size-3.5" />
-                            {testing === key ? "Testing..." : "Test"}
+                            {testing === key ? "Checking..." : "Check credential"}
+                          </Button>
+                        )}
+                        {target.connection && target.provider !== "local-extension" && (
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            disabled={trialling === key}
+                            /* Separate from the credential check because it
+                               starts a real session and is billed like one. It
+                               is also the only thing that answers "does this
+                               actually browse?", which a probe cannot. */
+                            title="Starts a real session, loads one page, then stops it"
+                            onClick={async () => {
+                              setTrialling(key);
+                              const exit = await trialRun({
+                                params: {
+                                  integration: target.integration,
+                                  connection: target.connection!,
+                                },
+                                reactivityKeys: ["browser-control"],
+                              });
+                              setTrials((previous) => ({
+                                ...previous,
+                                [key]: Exit.isSuccess(exit)
+                                  ? exit.value
+                                  : {
+                                      ok: false,
+                                      detail: messageFromExit(exit, "Could not run this browser"),
+                                      ms: 0,
+                                      ranAt: Date.now(),
+                                    },
+                              }));
+                              setTrialling(null);
+                            }}
+                          >
+                            <PlayCircle className="size-3.5" />
+                            {trialling === key ? "Running..." : "Test run"}
                           </Button>
                         )}
                         {target.session?.liveUrl && (
@@ -762,7 +844,7 @@ function BrowsersPage() {
                           )}
                         {/* Local Chrome is not removable here: its lifecycle
                             belongs to the extension, and ensureChrome would
-                            re-register it anyway — a Remove that undoes itself
+                            re-register it anyway, a Remove that undoes itself
                             reads as a bug. */}
                         {target.provider !== "local-extension" && target.connection && (
                           <Button
@@ -808,6 +890,7 @@ function BrowsersPage() {
                         <p className="mt-2 text-xs text-destructive">{removeErrors[key]}</p>
                       )}
                       {tests[key] && <ConnectionTestResult result={tests[key]!} />}
+                      {trials[key] && <TrialRunResult result={trials[key]!} />}
                     </div>
                   </div>
                 </article>
@@ -859,7 +942,13 @@ function BrowsersPage() {
                       {open ? "Close" : provider.configured > 0 ? "Add target" : "Configure"}
                     </Button>
                   </div>
-                  {open && <ProviderForm provider={provider.id} onDone={() => setAdding(null)} />}
+                  {open && (
+                    <ProviderForm
+                      provider={provider.id}
+                      hostIdentity={provider.hostIdentity}
+                      onDone={() => setAdding(null)}
+                    />
+                  )}
                 </div>
               );
             })}

@@ -5,9 +5,9 @@
  *
  * Health for a remote target used to be reported as `healthy` unconditionally,
  * so a revoked token or a missing permission looked identical to a working
- * setup. Every probe here answers three separate questions — can we reach the
+ * setup. Every probe here answers three separate questions, can we reach the
  * provider, is the credential accepted, and does it carry the permission the
- * browser target actually needs — because the remedy differs for each.
+ * browser target actually needs, because the remedy differs for each.
  *
  * Probes are deliberately cheap and non-billing: none of them starts a browser.
  */
@@ -85,6 +85,41 @@ const unreachable = (detail: string, what: string): ProviderProbe => ({
   detail,
   hint: `Could not reach ${what}. Check this Executor host's outbound network access.`,
 });
+
+/**
+ * The account a Cloudflare token belongs to, when there is only one.
+ *
+ * Asking for an account ID made a second field mandatory to reach a browser
+ * when the token already names its own account: `/accounts` is readable by any
+ * token, so the common case (one account) needs no input at all.
+ *
+ * Returns null rather than guessing when the token spans several accounts.
+ * Picking the first would silently point the browser at the wrong one, and a
+ * wrong ID fails later as a 403 that reads like a bad token.
+ */
+export async function inferCloudflareAccountId(
+  token: string,
+  deps: ProbeDeps = {},
+): Promise<{ accountId: string } | { reason: "none" | "ambiguous" | "unreadable" }> {
+  const fetchImpl = deps.fetch || globalThis.fetch;
+  const timeoutMs = deps.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const accounts = await requestJson(
+    fetchImpl,
+    "https://api.cloudflare.com/client/v4/accounts?per_page=50",
+    { method: "GET", headers: { authorization: `Bearer ${token}` } },
+    timeoutMs,
+  );
+  if ("networkError" in accounts || accounts.status >= 400) return { reason: "unreadable" };
+  const result = (accounts.body as { result?: unknown })?.result;
+  const ids = Array.isArray(result)
+    ? result
+        .map((entry) => (entry as { id?: unknown })?.id)
+        .filter((id): id is string => typeof id === "string" && id.length > 0)
+    : [];
+  if (ids.length === 0) return { reason: "none" };
+  if (ids.length > 1) return { reason: "ambiguous" };
+  return { accountId: ids[0]! };
+}
 
 async function probeCloudflare(
   accountId: string,
@@ -289,7 +324,7 @@ async function probeGenericCdp(
   const version = typeof result.body.Browser === "string" ? result.body.Browser : null;
   return {
     ok: true,
-    detail: version ? `Reachable — ${version}` : "Endpoint reachable",
+    detail: version ? `Reachable: ${version}` : "Endpoint reachable",
     permissionVerified: true,
   };
 }
@@ -396,14 +431,8 @@ export async function probeProvider(
       // real credential and gets a real probe; ambient OIDC is not a secret at
       // all, so there the only answerable question is whether the host has one.
       if (target.auth === "token") {
-        if (!target.teamId || !target.projectId) {
-          return {
-            ok: false,
-            reason: "config",
-            detail: "Team ID and Project ID are required for token-backed Vercel Sandbox targets",
-            hint: "Remove and re-add this target with both IDs from the Vercel project settings.",
-          };
-        }
+        // No team/project check: both are inferred from the token when unset,
+        // so their absence is the normal case rather than a misconfiguration.
         return credential
           ? probeVercelToken(credential, target.teamId, fetchImpl, timeoutMs)
           : {

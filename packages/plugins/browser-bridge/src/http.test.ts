@@ -31,7 +31,7 @@ describe("browser bridge HTTP surface", () => {
   it("does not let a meaningless bearer header re-enable the cookie", async () => {
     // The precheck only proves a credential was presented. If the resolver can
     // still fall back to the cookie, `Authorization: Bearer anything` reopens
-    // the door — so the cookie is removed before the resolver ever sees it.
+    // the door, so the cookie is removed before the resolver ever sees it.
     let sawCookie: string | null = "not-called";
     const handler = makeBrowserBridgeHandler({
       getSession: async (request) => {

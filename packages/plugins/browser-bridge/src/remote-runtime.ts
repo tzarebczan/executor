@@ -158,12 +158,22 @@ export function classifyRemoteBrowserFailure(
 ): RemoteBrowserFailure {
   const text = failureText(error);
   const label = providerLabel(provider);
+
+  // Scope: these two remedies name a Vercel project, a team ID, and a Vercel
+  // Container Registry, none of which exist for the other providers. Matched on
+  // message text alone they misfire, a Cloudflare 404 (wrong account ID, or
+  // Browser Rendering not enabled) was being answered with "push the configured
+  // image to that project's Vercel Container Registry", which is not a worse
+  // hint so much as an instruction for a different product.
+  const isVercel = provider === "vercel-sandbox";
+
   if (
-    text.includes("teamid") ||
-    text.includes("projectid") ||
-    text.includes("team id") ||
-    text.includes("project id") ||
-    text.includes("missing credentials parameters")
+    isVercel &&
+    (text.includes("teamid") ||
+      text.includes("projectid") ||
+      text.includes("team id") ||
+      text.includes("project id") ||
+      text.includes("missing credentials parameters"))
   ) {
     return {
       key,
@@ -174,13 +184,26 @@ export function classifyRemoteBrowserFailure(
       failedAt,
     };
   }
-  if (text.includes("status code 404") || text.includes("status 404") || text.includes("(404)")) {
+  if (
+    isVercel &&
+    (text.includes("status code 404") || text.includes("status 404") || text.includes("(404)"))
+  ) {
     return {
       key,
       provider,
       reason: "config",
       detail: `${label} could not find the configured project or browser image`,
       hint: "Verify the Project ID and push the configured image to that project's Vercel Container Registry.",
+      failedAt,
+    };
+  }
+  if (text.includes("status code 404") || text.includes("status 404") || text.includes("(404)")) {
+    return {
+      key,
+      provider,
+      reason: "config",
+      detail: `${label} could not find the configured target`,
+      hint: "Check this target's account and endpoint settings, then try the browser again.",
       failedAt,
     };
   }
@@ -281,7 +304,7 @@ const REAP_INTERVAL_MS = 30_000;
  * A total lifetime the provider grants from creation, where it grants one.
  *
  * Vercel's sandbox timeout and Browser Use's session timeout are measured from
- * when the session started, not from when it was last touched — using them as
+ * when the session started, not from when it was last touched, using them as
  * an idle window would let a session that is used every minute advertise an
  * expiry that keeps sliding past the moment the provider actually kills it.
  * Cloudflare's `keep_alive` is genuinely idle-based, so it is not one of these.
@@ -331,7 +354,7 @@ let reaper: ReturnType<typeof setInterval> | null = null;
  * Close every session whose idle window has elapsed.
  *
  * A session with work in flight is never idle, whatever the clock says: a call
- * that outruns the window — a slow navigation, a large PDF — must not have the
+ * that outruns the window, a slow navigation, a large PDF, must not have the
  * browser closed out from under it.
  */
 export async function reapIdleRemoteBrowserSessions(now = Date.now()): Promise<readonly string[]> {
@@ -537,7 +560,7 @@ async function connectCdp(handle: CloudBrowserHandle): Promise<CdpRuntime> {
  *
  * Creating a session is check-await-set, so two calls arriving together on a
  * cold target would both see an empty map, both pay for a browser, and the
- * second `set` would orphan the first — unreachable by the reaper or by
+ * second `set` would orphan the first, unreachable by the reaper or by
  * `stopAll`, and billing until the provider itself gave up. Callers share one
  * creation instead.
  */

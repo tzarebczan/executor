@@ -51,6 +51,18 @@ export type TokenVercelBrowserOptions = {
   readonly timeoutMs?: number;
   readonly vcpus?: number;
   readonly args?: readonly string[];
+  /**
+   * Stable name for the sandbox backing this target.
+   *
+   * Supplying it turns provisioning into get-or-create: a later session finds
+   * the same machine, already carrying the browser, instead of building a new
+   * one. Without it every session starts from nothing, which is what made a
+   * second run as slow as the first.
+   *
+   * Never derived from anything secret: sandbox names are visible in the Vercel
+   * dashboard and in API responses.
+   */
+  readonly sandboxName?: string;
 };
 
 type SandboxHandle = Awaited<ReturnType<typeof Sandbox.create>>;
@@ -66,6 +78,10 @@ export type VercelSandboxFactory = (options: {
   readonly timeout: number;
   readonly resources: { readonly vcpus: number };
   readonly env: Record<string, string>;
+  /** Set when the sandbox is reusable; absent for a one-shot sandbox. */
+  readonly name?: string;
+  /** Run once, and only when the sandbox was freshly created. */
+  readonly onCreate?: (sandbox: SandboxHandle) => Promise<void>;
 }) => Promise<SandboxHandle>;
 
 /**
@@ -235,8 +251,8 @@ export async function createTokenVercelBrowser(
   const env: Record<string, string> = { ...BASE_ENV };
   const create =
     deps.createSandbox ||
-    ((input) =>
-      Sandbox.create({
+    ((input) => {
+      const shared = {
         token: input.token,
         teamId: input.teamId,
         projectId: input.projectId,
@@ -247,14 +263,45 @@ export async function createTokenVercelBrowser(
         timeout: input.timeout,
         ports: [],
         env: input.env,
-        persistent: false,
-      } as Parameters<typeof Sandbox.create>[0]));
+      };
+      if (!input.name) {
+        return Sandbox.create({
+          ...shared,
+          persistent: false,
+        } as Parameters<typeof Sandbox.create>[0]);
+      }
+      // `getOrCreate` resumes a sandbox of this name when one exists, and
+      // `onCreate` runs only when it did not, so the install happens once per
+      // machine rather than once per session. `persistent` keeps the filesystem
+      // across resumes, which is what the installed browser lives on.
+      // `getOrCreate` returns a plain Sandbox while `create` returns one that
+      // is also AsyncDisposable. This adapter never uses `using`, so the extra
+      // member is irrelevant to every call site here.
+      return Sandbox.getOrCreate({
+        ...shared,
+        name: input.name,
+        resume: true,
+        persistent: true,
+        onCreate: input.onCreate,
+      } as Parameters<typeof Sandbox.getOrCreate>[0]) as Promise<SandboxHandle>;
+    });
 
   // An image is used when one is configured, and only then. The default used to
   // be `remote-agent-browser:latest`, which nobody had pushed, so the first
   // session of every new target failed on a registry lookup for an image the
   // user had never heard of.
   const image = options.image?.trim() || process.env.REMOTE_AGENT_BROWSER_IMAGE?.trim() || "";
+  const name = options.sandboxName?.trim() || "";
+  // Only the unnamed path can bootstrap after the fact. A named sandbox may be
+  // a resume, where the browser is already installed and running the installer
+  // again would add a minute to every call for nothing.
+  const bootstrapOnCreate =
+    !image && name
+      ? async (fresh: SandboxHandle) => {
+          await bootstrapAgentBrowser(new TokenSandboxRunner(fresh, env));
+        }
+      : undefined;
+
   const sandbox = await create({
     token: options.token,
     teamId: scope.teamId,
@@ -263,10 +310,12 @@ export async function createTokenVercelBrowser(
     timeout: options.timeoutMs ?? DEFAULT_TIMEOUT_MS,
     resources: { vcpus: options.vcpus ?? 2 },
     env,
+    ...(name ? { name } : {}),
+    ...(bootstrapOnCreate ? { onCreate: bootstrapOnCreate } : {}),
   });
 
   const runner = new TokenSandboxRunner(sandbox, env);
-  if (!image) {
+  if (!image && !name) {
     try {
       await bootstrapAgentBrowser(runner);
     } catch (error) {

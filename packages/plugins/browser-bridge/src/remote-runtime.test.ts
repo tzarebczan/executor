@@ -29,8 +29,32 @@ import {
   idleTimeoutMsFor,
   reapIdleRemoteBrowserSessions,
   runRemoteBrowserTool,
+  sandboxNameFor,
   stopAllRemoteBrowserSessions,
 } from "./remote-runtime";
+
+describe("sandboxNameFor", () => {
+  it("is stable for a target, so the next session finds the same machine", () => {
+    // Without a stable name every session provisioned a new sandbox and
+    // reinstalled the browser, so a second run cost as much as the first.
+    expect(sandboxNameFor("user/browser-vercel/default")).toBe(
+      sandboxNameFor("user/browser-vercel/default"),
+    );
+    expect(sandboxNameFor("user/browser-vercel/default")).not.toBe(
+      sandboxNameFor("user/browser-vercel/other"),
+    );
+  });
+
+  it("does not put the owner or the integration slug in a name Vercel displays", () => {
+    // Sandbox names appear in the dashboard and in API responses, so the key is
+    // hashed rather than passed through.
+    const name = sandboxNameFor("tenant-acme/browser-vercel/default");
+
+    expect(name).not.toContain("acme");
+    expect(name).not.toContain("browser-vercel");
+    expect(name).toMatch(/^executor-browser-[0-9a-f]{24}$/);
+  });
+});
 
 describe("remote browser runtime", () => {
   afterEach(async () => {

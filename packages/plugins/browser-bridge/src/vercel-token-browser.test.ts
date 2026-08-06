@@ -175,6 +175,59 @@ describe("provisioning without a browser image", () => {
     expect(runOf(sandbox)).toEqual(expect.arrayContaining(["npm", "agent-browser"]));
   });
 
+  it("names the sandbox so a later session resumes it instead of rebuilding", async () => {
+    // Without a name every session provisioned a fresh machine and reinstalled
+    // the browser, so running the same target twice in a row was slow twice.
+    const sandbox = fakeSandbox();
+    const createSandbox = vi.fn().mockResolvedValue(sandbox);
+
+    await createTokenVercelBrowser(
+      { token: "t", teamId: "team_1", projectId: "prj_1", sandboxName: "executor-browser-abc" },
+      { createSandbox },
+    );
+
+    const created = createSandbox.mock.calls[0]![0] as Record<string, unknown>;
+    expect(created.name).toBe("executor-browser-abc");
+    // The install moves into onCreate, which the SDK runs only for a sandbox it
+    // actually created. Running it inline as well would reinstall on resume and
+    // put the cost back on every call.
+    expect(typeof created.onCreate).toBe("function");
+    expect(runOf(sandbox)).not.toContain("npm");
+  });
+
+  it("still installs when the named sandbox is the one being created", async () => {
+    const sandbox = fakeSandbox();
+    const createSandbox = vi.fn().mockImplementation(async (input) => {
+      await (input as { onCreate?: (s: unknown) => Promise<void> }).onCreate?.(sandbox);
+      return sandbox;
+    });
+
+    await createTokenVercelBrowser(
+      { token: "t", teamId: "team_1", projectId: "prj_1", sandboxName: "executor-browser-abc" },
+      { createSandbox },
+    );
+
+    expect(runOf(sandbox)).toEqual(expect.arrayContaining(["npm", "agent-browser"]));
+  });
+
+  it("does not install on a named sandbox that boots from an image", async () => {
+    const sandbox = fakeSandbox();
+    const createSandbox = vi.fn().mockResolvedValue(sandbox);
+
+    await createTokenVercelBrowser(
+      {
+        token: "t",
+        teamId: "team_1",
+        projectId: "prj_1",
+        image: "my-browser:v2",
+        sandboxName: "executor-browser-abc",
+      },
+      { createSandbox },
+    );
+
+    expect((createSandbox.mock.calls[0]![0] as Record<string, unknown>).onCreate).toBeUndefined();
+  });
+
   it("uses a configured image and skips the install entirely", async () => {
     const sandbox = fakeSandbox();
     const createSandbox = vi.fn().mockResolvedValue(sandbox);

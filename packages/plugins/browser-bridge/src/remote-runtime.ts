@@ -9,6 +9,7 @@ import puppeteer, {
   type Page,
 } from "puppeteer-core";
 import type { BrowserCommandResult } from "remote-agent-browser";
+import { createHash } from "node:crypto";
 import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
@@ -411,15 +412,31 @@ function trimBuffer<T>(items: T[], max = 500): void {
   if (items.length > max) items.splice(0, items.length - max);
 }
 
+/**
+ * A stable, non-identifying sandbox name for one browser target.
+ *
+ * Stable so `getOrCreate` finds the same machine on the next session, which is
+ * what turns a second run from a full rebuild into a resume. Hashed so the
+ * name leaks neither the owner nor the integration slug into a dashboard.
+ */
+export function sandboxNameFor(key: string): string {
+  return `executor-browser-${createHash("sha256").update(key).digest("hex").slice(0, 24)}`;
+}
+
 function cloudConfig(
   config: Exclude<BrowserIntegrationConfig, { provider: "local-extension" }>,
   credential: string | null,
+  key: string,
 ) {
   switch (config.provider) {
     case "vercel-sandbox":
       if (config.auth === "token") {
         if (!credential) throw new Error("Vercel API token is required");
-        return { ...config, token: credential };
+        // The sandbox is named after the target so the next session resumes it
+        // instead of building another. Hashed because the key contains the
+        // owner and integration slug, and a sandbox name is visible in Vercel's
+        // dashboard and API responses.
+        return { ...config, token: credential, sandboxName: sandboxNameFor(key) };
       }
       return config;
     case "cloudflare-browser-run":
@@ -602,7 +619,7 @@ async function createRemoteBrowserSession(
   config: Exclude<BrowserIntegrationConfig, { provider: "local-extension" }>,
   credential: string | null,
 ): Promise<RemoteBrowserSessionSummary> {
-  const handle = await createCloudBrowserSession(cloudConfig(config, credential));
+  const handle = await createCloudBrowserSession(cloudConfig(config, credential, key));
   try {
     const session: RuntimeSession = {
       key,

@@ -35,6 +35,8 @@ export type CloudBrowserProviderConfig =
       readonly token?: string;
       readonly teamId?: string;
       readonly projectId?: string;
+      /** Stable name so a later session resumes this target's sandbox. */
+      readonly sandboxName?: string;
     }
   | {
       readonly provider: "cloudflare-browser-run";
@@ -122,6 +124,7 @@ export async function createCloudBrowserSession(
           token: config.token,
           ...(config.teamId ? { teamId: config.teamId } : {}),
           ...(config.projectId ? { projectId: config.projectId } : {}),
+          ...(config.sandboxName ? { sandboxName: config.sandboxName } : {}),
           timeoutMs: config.timeoutMs,
           vcpus: config.vcpus,
           image: config.image,

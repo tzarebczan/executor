@@ -172,6 +172,9 @@ export function readMintScriptResult(raw: unknown): MintOutcome {
     return {
       ok: true,
       token: found.token,
+      ...(typeof found.accountId === "string" && found.accountId
+        ? { accountId: found.accountId }
+        : {}),
       detail: `Created a Cloudflare token scoped to ${String(found.permission || "Browser Rendering")} on this account`,
     };
   }
@@ -229,6 +232,7 @@ export function readMintScriptResult(raw: unknown): MintOutcome {
 type MintPayload = {
   minted?: unknown;
   token?: unknown;
+  accountId?: unknown;
   reason?: unknown;
   permission?: unknown;
   errors?: unknown;
@@ -339,7 +343,19 @@ export type MintDeps = {
 };
 
 export type MintOutcome =
-  | { readonly ok: true; readonly token: string; readonly detail: string }
+  | {
+      readonly ok: true;
+      readonly token: string;
+      readonly detail: string;
+      /**
+       * The account the token is scoped to.
+       *
+       * Reported back because a token holding Browser Rendering alone cannot
+       * list accounts, so working the account out afterwards from the token
+       * just created fails. The mint already knows it.
+       */
+      readonly accountId?: string;
+    }
   | { readonly ok: false; readonly reason: MintFailureReason; readonly detail: string };
 
 export type MintFailureReason = "permission" | "unsupported" | "network" | "provider" | "not-found";
@@ -497,6 +513,7 @@ export async function mintCloudflareBrowserToken(
   return {
     ok: true,
     token: value,
+    accountId: options.accountId,
     detail: `Created a Cloudflare token scoped to ${group.name} on this account`,
   };
 }

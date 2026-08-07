@@ -177,6 +177,20 @@ describe("readMintScriptResult", () => {
     expect(outcome).toMatchObject({ ok: true, token: "cf_minted" });
   });
 
+  it("carries back the account the token was scoped to", () => {
+    // The minted token holds Browser Rendering and nothing else, so asking
+    // Cloudflare afterwards which accounts it can see returns none. The mint
+    // is the only place that knows, and dropping it here meant a token that
+    // worked could not be stored against an account.
+    const outcome = readMintScriptResult({
+      minted: true,
+      token: "cf_minted",
+      accountId: "acct_9",
+    });
+
+    expect(outcome).toMatchObject({ ok: true, accountId: "acct_9" });
+  });
+
   it("reads a structured result just as well", () => {
     const outcome = readMintScriptResult({
       structuredContent: { minted: true, token: "cf_minted", permission: "Browser Rendering Edit" },

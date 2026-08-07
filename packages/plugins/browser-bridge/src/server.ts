@@ -1005,7 +1005,7 @@ function mintCredentialForNewTarget(
         );
       const outcome = readMintScriptResult(raw);
       if (!outcome.ok) return yield* new BrowserBridgeError({ message: outcome.detail });
-      return outcome.token;
+      return { token: outcome.token, accountId: outcome.accountId || accountId || "" };
     }
 
     const existing = yield* ctx.connections.resolveValue({
@@ -1035,7 +1035,7 @@ function mintCredentialForNewTarget(
       mintCloudflareBrowserToken({ token: existing, accountId, label }),
     );
     if (!minted.ok) return yield* new BrowserBridgeError({ message: minted.detail });
-    return minted.token;
+    return { token: minted.token, accountId: minted.accountId || accountId };
   });
 }
 
@@ -1046,11 +1046,17 @@ function credentialForNewTarget(
 ) {
   return Effect.gen(function* () {
     const pasted = input.credential?.trim();
-    if (pasted) return pasted;
+    if (pasted) return { credential: pasted, accountId: "" };
+    // A minted token reports the account it was scoped to. That is the only
+    // way to learn it: the token carries Browser Rendering and nothing else,
+    // so asking Cloudflare which accounts it can see comes back empty.
     if (input.mintIntegration && input.mintConnection) {
-      return yield* mintCredentialForNewTarget(ctx, input, provider);
+      const minted = yield* mintCredentialForNewTarget(ctx, input, provider);
+      return { credential: minted.token, accountId: minted.accountId };
     }
-    if (!input.reuseIntegration || !input.reuseConnection) return "";
+    if (!input.reuseIntegration || !input.reuseConnection) {
+      return { credential: "", accountId: "" };
+    }
     const slug = IntegrationSlug.make(input.reuseIntegration);
     const source = yield* ctx.core.integrations.get(slug);
     if (!source || !credentialLooksReusable(provider, String(slug), source.name)) {
@@ -1075,7 +1081,7 @@ function credentialForNewTarget(
         message: `"${input.reuseConnection}" holds no value this plugin can read; paste a credential instead`,
       });
     }
-    return value;
+    return { credential: value, accountId: "" };
   });
 }
 
@@ -1140,7 +1146,11 @@ function addBrowserProviderEffect(ctx: PluginCtx, input: AddBrowserProviderInput
       config.provider === "browser-use" ||
       (config.provider === "vercel-sandbox" && config.auth === "token") ||
       (config.provider === "generic-cdp" && config.auth?.kind === "header");
-    const credential = yield* credentialForNewTarget(ctx, input, config.provider);
+    const { credential, accountId: mintedAccount } = yield* credentialForNewTarget(
+      ctx,
+      input,
+      config.provider,
+    );
     if (secretRequired && !credential) {
       return yield* new BrowserBridgeError({ message: "Provider credential is required" });
     }
@@ -1148,8 +1158,14 @@ function addBrowserProviderEffect(ctx: PluginCtx, input: AddBrowserProviderInput
     // Fill in the Cloudflare account from the token when the user left it
     // blank, so a pasted token is enough. Deliberately after the credential is
     // resolved and before the probe, since the probe reads the account too and
-    // would otherwise fail on the empty ID we are about to supply.
-    const resolved = yield* resolveCloudflareAccount(config, credential);
+    // would otherwise fail on the empty ID we are about to supply. A minted
+    // token brings its own account, which is taken directly: inferring it
+    // would mean asking a Browser-Rendering-only token to list accounts.
+    const named =
+      mintedAccount && config.provider === "cloudflare-browser-run" && !config.accountId
+        ? { ...config, accountId: mintedAccount }
+        : config;
+    const resolved = yield* resolveCloudflareAccount(named, credential);
 
     // Check the credential before writing anything. A target created around a
     // rejected token looks configured and fails only at the first browser call,

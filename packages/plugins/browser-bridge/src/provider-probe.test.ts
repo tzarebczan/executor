@@ -29,11 +29,34 @@ const rejecting = (message: string) =>
   vi.fn<typeof globalThis.fetch>().mockRejectedValue(new Error(message));
 
 describe("probeProvider", () => {
+  it("accepts an account-scoped token, which cannot answer the user-scoped routes", async () => {
+    // Cloudflare issues tokens at user scope and at account scope, and the ones
+    // this plugin mints are account-scoped. Validating them against
+    // /user/tokens/verify drew a 401 that reads exactly like a revoked
+    // credential, so every freshly minted token was rejected as invalid.
+    // Reading /accounts/{id} instead fails from the other side: a token holding
+    // Browser Rendering alone has no Account Settings Read.
+    const probe = await probeProvider(
+      { provider: "cloudflare-browser-run", accountId: "acct" },
+      "account-scoped",
+      {
+        fetch: respond({
+          "/user/tokens/verify": { status: 401 },
+          "/accounts/acct": { status: 403 },
+          "/accounts/acct/browser-rendering/limits": { status: 200, body: { success: true } },
+        }),
+      },
+    );
+    expect(probe.ok).toBe(true);
+    if (!probe.ok) return;
+    expect(probe.permissionVerified).toBe(true);
+  });
+
   it("reports a revoked Cloudflare token as an auth failure, not a healthy target", async () => {
     const probe = await probeProvider(
       { provider: "cloudflare-browser-run", accountId: "acct" },
       "bad-token",
-      { fetch: respond({ "/user/tokens/verify": { status: 401 } }) },
+      { fetch: respond({ "/accounts/acct/browser-rendering/limits": { status: 401 } }) },
     );
     expect(probe.ok).toBe(false);
     if (probe.ok) return;
@@ -48,7 +71,6 @@ describe("probeProvider", () => {
       "scoped-token",
       {
         fetch: respond({
-          "/user/tokens/verify": { status: 200, body: { success: true } },
           "/accounts/acct/browser-rendering/limits": { status: 403 },
           "/accounts/acct": { status: 200, body: { success: true } },
         }),
@@ -57,6 +79,7 @@ describe("probeProvider", () => {
     expect(probe.ok).toBe(false);
     if (probe.ok) return;
     expect(probe.reason).toBe("permission");
+    expect(probe.detail).toContain("acct");
     expect(probeToHealthStatus(probe)).toBe("degraded");
   });
 
@@ -66,7 +89,6 @@ describe("probeProvider", () => {
       "token",
       {
         fetch: respond({
-          "/user/tokens/verify": { status: 200 },
           "/accounts/acct/browser-rendering/limits": { status: 404 },
           "/accounts/acct": { status: 200 },
         }),
@@ -78,21 +100,24 @@ describe("probeProvider", () => {
     expect(probe.detail).toContain("not confirmed");
   });
 
-  it("separates an account-scope denial from a token rejection", async () => {
+  it("names a wrong account ID rather than reporting the token unconfirmed", async () => {
+    // An account that does not exist and an endpoint that has moved both come
+    // back as a non-403 error from the browser route. The account read runs
+    // only to tell those apart.
     const probe = await probeProvider(
-      { provider: "cloudflare-browser-run", accountId: "other" },
+      { provider: "cloudflare-browser-run", accountId: "typo" },
       "token",
       {
         fetch: respond({
-          "/user/tokens/verify": { status: 200 },
-          "/accounts/other": { status: 403 },
+          "/accounts/typo/browser-rendering/limits": { status: 404 },
+          "/accounts/typo": { status: 404 },
         }),
       },
     );
     expect(probe.ok).toBe(false);
     if (probe.ok) return;
-    expect(probe.reason).toBe("permission");
-    expect(probe.detail).toContain("other");
+    expect(probe.reason).toBe("config");
+    expect(probe.detail).toContain("typo");
   });
 
   it("treats an unreachable provider as unknown rather than failed credentials", async () => {

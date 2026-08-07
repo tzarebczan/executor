@@ -137,14 +137,30 @@ async function probeCloudflare(
   }
   const headers = { authorization: `Bearer ${token}` };
 
-  const verify = await requestJson(
+  // The browser endpoint is the check, rather than a generic token-validity
+  // call, because it is the only one every token that should pass here can
+  // answer. Cloudflare issues API tokens at user scope and at account scope,
+  // and /user/tokens/verify rejects an account-scoped token with a 401 that is
+  // indistinguishable from a revoked credential. A token minted for this
+  // plugin is account-scoped, so validating it that way called every good
+  // token invalid. Reading /accounts/{id} to prove scope has the same flaw
+  // from the other side: a token holding Browser Rendering alone has no
+  // Account Settings Read and answers 403.
+  const limits = await requestJson(
     fetchImpl,
-    "https://api.cloudflare.com/client/v4/user/tokens/verify",
+    `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}/browser-rendering/limits`,
     { method: "GET", headers },
     timeoutMs,
   );
-  if ("networkError" in verify) return unreachable(verify.networkError, "the Cloudflare API");
-  if (verify.status === 401) {
+  if ("networkError" in limits) return unreachable(limits.networkError, "the Cloudflare API");
+  if (limits.status < 400) {
+    return {
+      ok: true,
+      detail: "Token valid; Browser Rendering permission confirmed",
+      permissionVerified: true,
+    };
+  }
+  if (limits.status === 401) {
     return {
       ok: false,
       reason: "auth",
@@ -152,9 +168,19 @@ async function probeCloudflare(
       hint: "The token is invalid, expired, or revoked. " + CLOUDFLARE_TOKEN_HINT,
     };
   }
+  if (limits.status === 403) {
+    return {
+      ok: false,
+      reason: "permission",
+      detail: `Token lacks the Browser Rendering permission on account ${accountId}`,
+      hint: CLOUDFLARE_TOKEN_HINT,
+    };
+  }
 
-  // Reading the account proves the token is scoped to it. A 403 here is a
-  // different remedy from a bad token, so it is reported separately.
+  // Anything else is inconclusive rather than a failure: the endpoint may be
+  // absent or renamed, and a wrong account ID looks the same from here. The
+  // account read only runs now, to tell those apart, and its own 403 is not
+  // held against a token that was never expected to have that permission.
   const account = await requestJson(
     fetchImpl,
     `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}`,
@@ -162,14 +188,12 @@ async function probeCloudflare(
     timeoutMs,
   );
   if ("networkError" in account) return unreachable(account.networkError, "the Cloudflare API");
-  if (account.status === 401 || account.status === 403) {
+  if (account.status === 401) {
     return {
       ok: false,
-      reason: "permission",
-      detail: `Cloudflare denied access to account ${accountId} (${account.status})`,
-      hint:
-        "This token cannot read that account. Check the account ID, or issue the " +
-        "token under the correct account with the Browser Rendering permission.",
+      reason: "auth",
+      detail: "Cloudflare rejected the API token (401)",
+      hint: "The token is invalid, expired, or revoked. " + CLOUDFLARE_TOKEN_HINT,
     };
   }
   if (account.status === 404) {
@@ -180,44 +204,9 @@ async function probeCloudflare(
       hint: "Check the account ID on your Cloudflare dashboard overview page.",
     };
   }
-  if (account.status >= 400) {
-    return {
-      ok: false,
-      reason: "network",
-      detail: `Cloudflare returned ${account.status}`,
-      hint: "Cloudflare reported an unexpected error. Retry, then check status.cloudflare.com.",
-    };
-  }
-
-  // Best-effort permission check. This endpoint is not load-bearing: if it is
-  // absent or changes shape we report the credential as good but the
-  // permission unconfirmed, rather than inventing a failure.
-  const limits = await requestJson(
-    fetchImpl,
-    `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}/browser-rendering/limits`,
-    { method: "GET", headers },
-    timeoutMs,
-  );
-  if (!("networkError" in limits)) {
-    if (limits.status === 403) {
-      return {
-        ok: false,
-        reason: "permission",
-        detail: "Token lacks the Browser Rendering permission",
-        hint: CLOUDFLARE_TOKEN_HINT,
-      };
-    }
-    if (limits.status < 400) {
-      return {
-        ok: true,
-        detail: "Token valid; Browser Rendering permission confirmed",
-        permissionVerified: true,
-      };
-    }
-  }
   return {
     ok: true,
-    detail: "Token valid for this account; Browser Rendering permission not confirmed",
+    detail: `Token accepted; Browser Rendering permission not confirmed (Cloudflare returned ${limits.status})`,
     permissionVerified: false,
   };
 }

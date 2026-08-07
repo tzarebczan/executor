@@ -32,6 +32,17 @@ describe("cloudflareMintScript", () => {
     expect(code).toContain("attempts");
   });
 
+  it("pages through the permission list instead of reading only the first page", () => {
+    // Cloudflare publishes hundreds of permission groups and caps per_page
+    // below that. One page can omit Browser Rendering entirely, which reads
+    // exactly like an account that does not have the product.
+    const code = cloudflareMintScript({ accountId: "acct_9", label: "Lab" });
+
+    expect(code).toContain("per_page: 100");
+    expect(code).toContain("page");
+    expect(code).toContain("total_pages");
+  });
+
   it("defers to the account the MCP grant already covers when none is named", () => {
     // Cloudflare's `execute` tool pre-binds `accountId`. Interpolating an empty
     // string instead would build the resource "com.cloudflare.api.account."

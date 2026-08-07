@@ -82,8 +82,25 @@ export function cloudflareMintScript(options: {
   let readAny = false;
   let total = 0;
   for (const path of groupRoutes) {
-    const response = await tryRequest({ method: "GET", path, query: { per_page: 200 } });
-    const all = response && Array.isArray(response.result) ? response.result : [];
+    // Paginated rather than asking for one large page. Cloudflare publishes
+    // hundreds of permission groups and caps per_page below that, so a single
+    // page can omit Browser Rendering entirely and read as an account without
+    // the product.
+    const all = [];
+    for (let page = 1; page <= 10; page += 1) {
+      const response = await tryRequest({
+        method: "GET",
+        path,
+        query: { per_page: 100, page },
+      });
+      const batch = response && Array.isArray(response.result) ? response.result : [];
+      all.push(...batch);
+      const info = response && response.result_info;
+      const pages = info && Number(info.total_pages);
+      if (batch.length === 0) break;
+      if (Number.isFinite(pages) && page >= pages) break;
+      if (!info && batch.length < 100) break;
+    }
     if (all.length) { readAny = true; total += all.length; }
     // Widened from "browser rendering": Cloudflare names these groups itself
     // and a near miss ("Workers Browser Rendering") would otherwise read as an

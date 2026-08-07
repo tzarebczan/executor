@@ -79,7 +79,9 @@ import {
   type BrowserAccessView,
   type BrowserConnectionTestView,
   type BrowserStartFailureView,
+  type BrowserTargetSettings,
   type ReusableCredentialView,
+  type UpdateBrowserTargetPayload,
 } from "./shared";
 
 export interface BrowserBridgePluginOptions {
@@ -587,6 +589,7 @@ type BrowserTargetView = {
   readonly session?: Omit<ReturnType<typeof listRemoteBrowserSessions>[number], "key">;
   readonly access?: BrowserAccessView;
   readonly failure?: BrowserStartFailureView;
+  readonly settings?: BrowserTargetSettings;
 };
 
 /**
@@ -709,6 +712,168 @@ function withoutFailureKey(
   return view;
 }
 
+/**
+ * A stored config projected onto the settings a person may edit.
+ *
+ * Only what is actually set is included. Filling in defaults here would make an
+ * edit form unable to distinguish a value someone chose from one nobody has
+ * touched, and saving that form would turn every default into a decision.
+ */
+export function settingsFor(
+  config: Exclude<BrowserIntegrationConfig, { provider: "local-extension" }>,
+): BrowserTargetSettings {
+  const shared = {
+    ...(config.idleTimeoutMs === undefined
+      ? {}
+      : { idleTimeoutMinutes: Math.round(config.idleTimeoutMs / 60_000) }),
+    ...(config.allowAdvanced === undefined ? {} : { allowAdvanced: config.allowAdvanced }),
+    // Always sent, unlike the rest: absent and empty mean the same thing here
+    // ("any public host"), and a form that cannot see the current list would
+    // have to guess whether leaving it alone means keep or clear.
+    allowedHosts: config.allowedHosts || [],
+    ...(config.allowPrivateNetwork ? { allowPrivateNetwork: true } : {}),
+    ...(config.fullAccess ? { fullAccess: true } : {}),
+  };
+  switch (config.provider) {
+    case "cloudflare-browser-run":
+      return {
+        ...shared,
+        accountId: config.accountId,
+        ...(config.keepAliveMs === undefined ? {} : { keepAliveMs: config.keepAliveMs }),
+      };
+    case "vercel-sandbox":
+      return {
+        ...shared,
+        ...(config.teamId ? { teamId: config.teamId } : {}),
+        ...(config.projectId ? { projectId: config.projectId } : {}),
+        ...(config.image ? { image: config.image } : {}),
+        ...(config.timeoutMs === undefined ? {} : { timeoutMs: config.timeoutMs }),
+        ...(config.vcpus === undefined ? {} : { vcpus: config.vcpus }),
+      };
+    case "browser-use":
+      return {
+        ...shared,
+        ...(config.timeoutMinutes === undefined ? {} : { timeoutMinutes: config.timeoutMinutes }),
+        ...(config.profileId ? { profileId: config.profileId } : {}),
+        ...(config.proxyCountryCode === undefined
+          ? {}
+          : { proxyCountryCode: config.proxyCountryCode }),
+        ...(config.enableRecording === undefined
+          ? {}
+          : { enableRecording: config.enableRecording }),
+      };
+    default:
+      return shared;
+  }
+}
+
+/**
+ * Apply a settings edit to a stored target.
+ *
+ * Absent means unchanged, so a client sends only what it touched and a field
+ * this version of the UI does not know about survives being edited by it.
+ * `allowedHosts` is deliberately different: an empty array clears the list,
+ * because there has to be a way back to unrestricted browsing.
+ */
+function updateTargetEffect(
+  ctx: PluginCtx,
+  params: { readonly integration: string; readonly connection: string },
+  input: UpdateBrowserTargetPayload,
+) {
+  return Effect.gen(function* () {
+    const slug = IntegrationSlug.make(params.integration);
+    const record = yield* ctx.core.integrations.get(slug);
+    const current = record ? parseBrowserIntegrationConfig(record.config) : null;
+    if (!record || !current) {
+      return yield* new BrowserBridgeError({
+        message: `No browser target "${params.integration}"`,
+      });
+    }
+    if (!isRemoteBrowserConfig(current)) {
+      return yield* new BrowserBridgeError({
+        message:
+          "The local browser is configured in the Executor Browser extension, not here. Open its options to change access scope.",
+      });
+    }
+
+    const hosts =
+      input.allowedHosts === undefined
+        ? current.allowedHosts
+        : [...new Set(input.allowedHosts.map(normalizeHost).filter(Boolean))];
+    const allowPrivate =
+      input.allowPrivateNetwork === undefined
+        ? current.allowPrivateNetwork
+        : input.allowPrivateNetwork;
+    // The same rule the add form applies, checked here too: a client is not
+    // where a safety rule is allowed to live.
+    if (allowPrivate && !hosts?.length) {
+      return yield* new BrowserBridgeError({
+        message:
+          "List the hosts this target may reach before allowing private addresses. A target that can reach a private network and every public one is not bounded by anything.",
+      });
+    }
+    const idleMinutes = optionalNumber(input.idleTimeoutMinutes, "Idle timeout", {
+      min: 1,
+      max: 240,
+      integer: true,
+    });
+
+    const next = {
+      ...current,
+      ...pickDefined({
+        allowAdvanced: input.allowAdvanced,
+        fullAccess: input.fullAccess,
+        accountId: input.accountId?.trim(),
+        keepAliveMs: input.keepAliveMs,
+        teamId: input.teamId?.trim(),
+        projectId: input.projectId?.trim(),
+        image: input.image?.trim(),
+        timeoutMs: input.timeoutMs,
+        vcpus: input.vcpus,
+        timeoutMinutes: input.timeoutMinutes,
+        profileId: input.profileId?.trim(),
+        proxyCountryCode: input.proxyCountryCode,
+        enableRecording: input.enableRecording,
+      }),
+      ...(idleMinutes === undefined ? {} : { idleTimeoutMs: idleMinutes * 60_000 }),
+      ...(hosts?.length ? { allowedHosts: hosts } : { allowedHosts: undefined }),
+      ...(allowPrivate ? { allowPrivateNetwork: true } : { allowPrivateNetwork: undefined }),
+    } as BrowserIntegrationConfig;
+
+    yield* ctx.core.integrations.update(slug, {
+      config: next as never,
+      ...(input.name?.trim() ? { name: input.name.trim() } : {}),
+    });
+
+    // A running session was built around the settings that just changed: its
+    // page-level policy was installed at connect time and its idle window was
+    // computed from the old timeout. Closing it means the next call rebuilds
+    // both, rather than leaving a browser enforcing a policy nobody can see.
+    yield* Effect.promise(() =>
+      stopRemoteBrowserSession(remoteSessionKey(ctx.owner, params.integration, params.connection)),
+    );
+
+    const overview = yield* browserOverviewEffect(ctx);
+    const updated = overview.targets.find(
+      (target) =>
+        target.integration === params.integration && target.connection === params.connection,
+    );
+    if (!updated) {
+      return yield* new BrowserBridgeError({
+        message: `Saved, but "${params.integration}" has no connection "${params.connection}"`,
+      });
+    }
+    return updated;
+  });
+}
+
+/** Fields the caller actually sent. Absent stays absent rather than becoming undefined. */
+function pickDefined<T extends Record<string, unknown>>(values: T): Partial<T> {
+  return Object.fromEntries(
+    Object.entries(values).filter(([, value]) => value !== undefined),
+  ) as Partial<T>;
+}
+
 function browserOverviewEffect(ctx: PluginCtx) {
   return Effect.gen(function* () {
     const integrations = yield* ctx.core.integrations.list();
@@ -787,6 +952,7 @@ function browserOverviewEffect(ctx: PluginCtx) {
                 : "Host authentication is missing; this target cannot start",
           ...(session ? { session: withoutSessionKey(session) } : {}),
           ...(failure ? { failure: withoutFailureKey(failure) } : {}),
+          settings: settingsFor(record.config),
         });
       }
     }
@@ -1461,6 +1627,10 @@ const makeBrowserBridgeExtension = (ctx: PluginCtx) => ({
   addProvider: (input: AddBrowserProviderInput) => addBrowserProviderEffect(ctx, input),
   removeTarget: (integration: string, connection: string) =>
     removeBrowserTargetEffect(ctx, integration, connection),
+  updateTarget: (
+    params: { readonly integration: string; readonly connection: string },
+    input: UpdateBrowserTargetPayload,
+  ) => updateTargetEffect(ctx, params, input),
   reusableCredentials: (
     provider: Exclude<BrowserIntegrationConfig["provider"], "local-extension">,
   ) => reusableCredentialsEffect(ctx, provider),
@@ -1504,6 +1674,16 @@ const BrowserControlHandlers = HttpApiBuilder.group(
           return yield* extension.addProvider(payload);
         }).pipe(
           Effect.mapError((error) => browserBridgeError(error, "Could not add browser").message),
+        ),
+      )
+      .handle("updateTarget", ({ params, payload }) =>
+        Effect.gen(function* () {
+          const extension = yield* BrowserBridgeExtensionService;
+          return yield* extension.updateTarget(params, payload);
+        }).pipe(
+          Effect.mapError(
+            (error) => browserBridgeError(error, "Could not save these settings").message,
+          ),
         ),
       )
       .handle("stopSession", ({ params }) =>

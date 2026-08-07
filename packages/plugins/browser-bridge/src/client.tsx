@@ -34,6 +34,7 @@ import {
   PlugZap,
   RefreshCw,
   Server,
+  SlidersHorizontal,
   X,
 } from "lucide-react";
 
@@ -56,6 +57,7 @@ const overviewAtom = BrowserClient.query("browserControl", "overview", {
 const addProviderAtom = BrowserClient.mutation("browserControl", "addProvider");
 const stopSessionAtom = BrowserClient.mutation("browserControl", "stopSession");
 const removeTargetAtom = BrowserClient.mutation("browserControl", "removeTarget");
+const updateTargetAtom = BrowserClient.mutation("browserControl", "updateTarget");
 const testConnectionAtom = BrowserClient.mutation("browserControl", "testConnection");
 const trialRunAtom = BrowserClient.mutation("browserControl", "trialRun");
 
@@ -715,6 +717,150 @@ function SecretField(props: {
   );
 }
 
+/**
+ * Change a target's settings after it exists.
+ *
+ * Seeded from what is stored, not from placeholders. A form that shows
+ * defaults where nothing is set cannot tell "unset" from "set to the default",
+ * and saving it would turn every untouched field into a decision.
+ *
+ * Credentials are absent on purpose. Replacing one is a different operation
+ * with different consequences, and it stays with remove-and-re-add rather than
+ * being smuggled into a settings dialog.
+ */
+function EditTargetForm({
+  target,
+  onDone,
+}: {
+  readonly target: BrowserTargetView;
+  readonly onDone: () => void;
+}) {
+  const settings = target.settings || {};
+  const updateTarget = useAtomSet(updateTargetAtom, { mode: "promiseExit" });
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [hosts, setHosts] = useState((settings.allowedHosts || []).join(", "));
+  const [allowPrivateNetwork, setAllowPrivateNetwork] = useState(
+    settings.allowPrivateNetwork === true,
+  );
+  const [fullAccess, setFullAccess] = useState(settings.fullAccess === true);
+  const [allowAdvanced, setAllowAdvanced] = useState(settings.allowAdvanced !== false);
+  const [idleMinutes, setIdleMinutes] = useState(
+    settings.idleTimeoutMinutes === undefined ? "" : String(settings.idleTimeoutMinutes),
+  );
+
+  const parsedHosts = hosts
+    .split(/[\s,]+/)
+    .map((host) => host.trim())
+    .filter(Boolean);
+
+  return (
+    <form
+      className="mt-3 grid gap-3 rounded-md border border-border/60 bg-muted/30 p-3"
+      onSubmit={async (event) => {
+        event.preventDefault();
+        setBusy(true);
+        setError(null);
+        const exit = await updateTarget({
+          params: { integration: target.integration, connection: target.connection! },
+          payload: {
+            allowedHosts: parsedHosts,
+            allowPrivateNetwork,
+            fullAccess,
+            allowAdvanced,
+            ...(idleMinutes.trim() ? { idleTimeoutMinutes: Number(idleMinutes) } : {}),
+          },
+          reactivityKeys: ["browser-control"],
+        });
+        setBusy(false);
+        if (Exit.isSuccess(exit)) {
+          onDone();
+          return;
+        }
+        setError(messageFromExit(exit, "Could not save these settings"));
+      }}
+    >
+      <div className="grid gap-1.5">
+        <Label htmlFor={`hosts-${target.integration}`} className="text-xs">
+          Allowed hosts
+        </Label>
+        <Input
+          id={`hosts-${target.integration}`}
+          value={hosts}
+          onChange={(event) => setHosts(event.target.value)}
+          placeholder="example.com, docs.example.com — blank for any public site"
+        />
+        <p className="text-xs text-muted-foreground">
+          Covers subdomains. Private and link-local addresses are always refused unless allowed
+          below.
+        </p>
+      </div>
+      <Label className="flex items-start gap-2 text-sm">
+        <Checkbox
+          checked={fullAccess}
+          onCheckedChange={(checked) => setFullAccess(checked === true)}
+        />
+        <span>
+          Approve once per session
+          <span className="block text-xs font-normal text-muted-foreground">
+            Stops the prompt on every click. Naming hosts above does this on its own.
+          </span>
+        </span>
+      </Label>
+      <Label className="flex items-start gap-2 text-sm">
+        <Checkbox
+          checked={allowPrivateNetwork}
+          onCheckedChange={(checked) => setAllowPrivateNetwork(checked === true)}
+        />
+        <span>
+          Reach private addresses
+          <span className="block text-xs font-normal text-muted-foreground">
+            Requires an allowed-hosts list.
+          </span>
+        </span>
+      </Label>
+      <Label className="flex items-start gap-2 text-sm">
+        <Checkbox
+          checked={allowAdvanced}
+          onCheckedChange={(checked) => setAllowAdvanced(checked !== false)}
+        />
+        <span>
+          Advanced tools
+          <span className="block text-xs font-normal text-muted-foreground">
+            evaluate, PDF, console, network, dialogs, viewport.
+          </span>
+        </span>
+      </Label>
+      <div className="grid gap-1.5">
+        <Label htmlFor={`idle-${target.integration}`} className="text-xs">
+          Idle timeout (minutes)
+        </Label>
+        <Input
+          id={`idle-${target.integration}`}
+          type="number"
+          min={1}
+          max={240}
+          value={idleMinutes}
+          onChange={(event) => setIdleMinutes(event.target.value)}
+          placeholder="10"
+        />
+      </div>
+      {error && <p className="text-sm text-destructive">{error}</p>}
+      <p className="text-xs text-muted-foreground">
+        Saving closes any running session, so the next call picks these up.
+      </p>
+      <div className="flex justify-end gap-2">
+        <Button type="button" variant="ghost" size="sm" onClick={onDone} disabled={busy}>
+          Cancel
+        </Button>
+        <Button type="submit" size="sm" disabled={busy}>
+          {busy ? "Saving..." : "Save settings"}
+        </Button>
+      </div>
+    </form>
+  );
+}
+
 function BrowsersPage() {
   const overview = useAtomValue(overviewAtom);
   const refresh = useAtomRefresh(overviewAtom);
@@ -725,6 +871,7 @@ function BrowsersPage() {
   const [adding, setAdding] = useState<RemoteProvider | null>(null);
   const [stopping, setStopping] = useState<string | null>(null);
   const [removing, setRemoving] = useState<string | null>(null);
+  const [editing, setEditing] = useState<string | null>(null);
   const [removeErrors, setRemoveErrors] = useState<Record<string, string>>({});
   const [testing, setTesting] = useState<string | null>(null);
   const [tests, setTests] = useState<Record<string, BrowserConnectionTestView>>({});
@@ -894,6 +1041,16 @@ function BrowsersPage() {
                             {trialling === key ? "Running..." : "Test run"}
                           </Button>
                         )}
+                        {target.connection && target.provider !== "local-extension" && (
+                          <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() => setEditing(editing === key ? null : key)}
+                          >
+                            <SlidersHorizontal className="size-3.5" />
+                            {editing === key ? "Close" : "Settings"}
+                          </Button>
+                        )}
                         {target.session?.liveUrl && (
                           <Button variant="outline" size="sm" asChild>
                             <a href={target.session.liveUrl} target="_blank" rel="noreferrer">
@@ -973,6 +1130,9 @@ function BrowsersPage() {
                       )}
                       {tests[key] && <ConnectionTestResult result={tests[key]!} />}
                       {trials[key] && <TrialRunResult result={trials[key]!} />}
+                      {editing === key && (
+                        <EditTargetForm target={target} onDone={() => setEditing(null)} />
+                      )}
                     </div>
                   </div>
                 </article>

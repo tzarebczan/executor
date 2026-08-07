@@ -64,6 +64,53 @@ export const BrowserStartFailure = Schema.Struct({
 
 export type BrowserStartFailureView = typeof BrowserStartFailure.Type;
 
+/**
+ * A target's editable settings, as stored.
+ *
+ * Sent with the target so an edit form opens on what is actually configured
+ * rather than on blanks. A form seeded with placeholders cannot tell "unset,
+ * using the default" apart from "set to the default", and saving it would
+ * silently rewrite whichever one it guessed wrong.
+ *
+ * Credentials are never included. Changing one is a different operation with
+ * different consequences, and a settings form is not the place to reveal a
+ * token that only has to be replaced, never read.
+ */
+export const BrowserTargetSettings = Schema.Struct({
+  idleTimeoutMinutes: Schema.optional(Schema.Number),
+  allowAdvanced: Schema.optional(Schema.Boolean),
+  allowedHosts: Schema.optional(Schema.Array(Schema.String)),
+  allowPrivateNetwork: Schema.optional(Schema.Boolean),
+  fullAccess: Schema.optional(Schema.Boolean),
+  accountId: Schema.optional(Schema.String),
+  keepAliveMs: Schema.optional(Schema.Number),
+  teamId: Schema.optional(Schema.String),
+  projectId: Schema.optional(Schema.String),
+  image: Schema.optional(Schema.String),
+  timeoutMs: Schema.optional(Schema.Number),
+  vcpus: Schema.optional(Schema.Number),
+  timeoutMinutes: Schema.optional(Schema.Number),
+  profileId: Schema.optional(Schema.String),
+  proxyCountryCode: Schema.optional(Schema.NullOr(Schema.String)),
+  enableRecording: Schema.optional(Schema.Boolean),
+});
+
+export type BrowserTargetSettings = typeof BrowserTargetSettings.Type;
+
+/**
+ * A settings edit.
+ *
+ * Every field optional and absent means unchanged, so a client may send only
+ * what it touched. `allowedHosts` is the exception worth stating: an empty
+ * array is a real value meaning "any public host", not an omission.
+ */
+export const UpdateBrowserTargetPayload = Schema.Struct({
+  name: Schema.optional(Schema.String),
+  ...BrowserTargetSettings.fields,
+});
+
+export type UpdateBrowserTargetPayload = typeof UpdateBrowserTargetPayload.Type;
+
 export const BrowserTargetView = Schema.Struct({
   integration: Schema.String,
   name: Schema.String,
@@ -83,6 +130,8 @@ export const BrowserTargetView = Schema.Struct({
   session: Schema.optional(BrowserSessionView),
   access: Schema.optional(BrowserAccessView),
   failure: Schema.optional(BrowserStartFailure),
+  /** Present for remote targets, which are the ones with settings to edit. */
+  settings: Schema.optional(BrowserTargetSettings),
 });
 
 export type BrowserTargetView = typeof BrowserTargetView.Type;
@@ -245,6 +294,14 @@ export const BrowserControlApi = HttpApiGroup.make("browserControl")
   .add(
     HttpApiEndpoint.post("addProvider", "/browsers", {
       payload: AddBrowserProviderPayload,
+      success: BrowserTargetView,
+      error: BrowserControlError,
+    }),
+  )
+  .add(
+    HttpApiEndpoint.post("updateTarget", "/browsers/:integration/:connection/settings", {
+      params: Schema.Struct({ integration: Schema.String, connection: Schema.String }),
+      payload: UpdateBrowserTargetPayload,
       success: BrowserTargetView,
       error: BrowserControlError,
     }),

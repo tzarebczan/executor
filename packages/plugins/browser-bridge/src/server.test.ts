@@ -11,6 +11,7 @@ import {
   localBridgeVerdict,
   remoteAdvancedAllowed,
   remoteCatalogResult,
+  settingsFor,
   SESSION_STALE_MS,
   validateInnerCall,
 } from "./server";
@@ -256,6 +257,46 @@ describe("approval scope follows what bounds the target", () => {
 
   it("does not treat reading as something to approve either way", () => {
     expect(asks(target, browserToolCatalogName("snapshot"))).toBe(false);
+  });
+});
+
+describe("settingsFor", () => {
+  it("reports only what is set, so an edit form can tell unset from default", () => {
+    // Filling in defaults here would make every untouched field look like a
+    // decision someone made, and saving the form would make it one.
+    const settings = settingsFor({ provider: "cloudflare-browser-run", accountId: "acct" });
+
+    expect(settings.accountId).toBe("acct");
+    expect(settings.idleTimeoutMinutes).toBeUndefined();
+    expect(settings.allowAdvanced).toBeUndefined();
+    // The exception: absent and empty mean the same thing for hosts, so the
+    // form is always told which it is rather than having to guess.
+    expect(settings.allowedHosts).toEqual([]);
+  });
+
+  it("round-trips the access controls it is meant to make editable", () => {
+    const settings = settingsFor({
+      provider: "cloudflare-browser-run",
+      accountId: "acct",
+      allowedHosts: ["example.com"],
+      allowPrivateNetwork: true,
+      fullAccess: true,
+      idleTimeoutMs: 15 * 60_000,
+    });
+
+    expect(settings).toMatchObject({
+      allowedHosts: ["example.com"],
+      allowPrivateNetwork: true,
+      fullAccess: true,
+      idleTimeoutMinutes: 15,
+    });
+  });
+
+  it("does not leak a credential into a settings payload", () => {
+    // A settings form is not a place to reveal a token that only ever has to
+    // be replaced, never read.
+    const settings = settingsFor({ provider: "cloudflare-browser-run", accountId: "acct" });
+    expect(JSON.stringify(settings)).not.toMatch(/token|secret|credential/i);
   });
 });
 

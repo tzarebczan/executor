@@ -240,12 +240,34 @@ export interface BrowserToolSuccessMap {
     readonly matches: readonly BrowserSnapshotNode[];
   };
   readonly wait: { readonly ok: true; readonly matched: true; readonly elapsedMs: number };
-  readonly click: { readonly ok: true; readonly tabId: number };
-  readonly dblclick: { readonly ok: true; readonly tabId: number };
+  /**
+   * `url` is where the tab ended up, and `navigated` says the action moved it
+   * there. Both are optional so an implementation that cannot tell may omit
+   * them, but reporting them is what lets a caller verify a click without a
+   * second call — and that second call is the one that used to race the
+   * navigation the click had just started.
+   */
+  readonly click: {
+    readonly ok: true;
+    readonly tabId: number;
+    readonly url?: string;
+    readonly navigated?: boolean;
+  };
+  readonly dblclick: {
+    readonly ok: true;
+    readonly tabId: number;
+    readonly url?: string;
+    readonly navigated?: boolean;
+  };
   readonly hover: { readonly ok: true; readonly tabId: number };
   readonly focus: { readonly ok: true; readonly tabId: number };
   readonly type: { readonly ok: true; readonly tabId: number };
-  readonly press: { readonly ok: true; readonly tabId: number };
+  readonly press: {
+    readonly ok: true;
+    readonly tabId: number;
+    readonly url?: string;
+    readonly navigated?: boolean;
+  };
   readonly select: {
     readonly ok: true;
     readonly tabId: number;

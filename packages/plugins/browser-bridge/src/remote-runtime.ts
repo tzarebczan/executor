@@ -5,6 +5,7 @@ import puppeteer, {
   type BrowserContext,
   type Dialog,
   type ElementHandle,
+  type Frame,
   type KeyInput,
   type Page,
 } from "puppeteer-core";
@@ -688,6 +689,67 @@ export function getRemoteBrowserSession(key: string): RemoteBrowserSessionSummar
   return session ? summarize(session) : null;
 }
 
+/**
+ * How long a navigation has to commit before an action is treated as one that
+ * did not navigate, and how long to then wait for the new document.
+ *
+ * Split deliberately. A click that navigates commits almost at once, so a short
+ * window answers "did this navigate?" without making every ordinary click pay
+ * for the answer. Only once it has committed is the longer budget spent, and
+ * only then is anyone waiting on a document that is actually coming.
+ */
+const NAVIGATION_COMMIT_MS = 400;
+const NAVIGATION_SETTLE_MS = 15_000;
+
+/**
+ * Watch for a navigation that an action is about to start.
+ *
+ * Armed before the action rather than after, because a click that follows a
+ * link can commit before `click()` itself resolves. A waiter attached
+ * afterwards misses that navigation entirely and then waits out its whole
+ * timeout, which is the worst of both.
+ *
+ * Without this, a click returned while the old document was being torn down.
+ * The next call then read whichever document it happened to catch: the
+ * original URL on a browser that had not started yet, or a destroyed execution
+ * context on one already mid-navigation.
+ */
+export function watchNavigation(page: Page): () => Promise<boolean> {
+  let committed = false;
+  const onNavigated = (frame: Frame) => {
+    if (frame === page.mainFrame()) committed = true;
+  };
+  page.on("framenavigated", onNavigated);
+  // Attached now so the load is already being awaited by the time the action
+  // returns. The rejection is the timeout, which is an answer, not a failure.
+  const settled = page
+    .waitForNavigation({ waitUntil: "domcontentloaded", timeout: NAVIGATION_SETTLE_MS })
+    .then(() => true)
+    .catch(() => false);
+  return async () => {
+    try {
+      const deadline = Date.now() + NAVIGATION_COMMIT_MS;
+      while (!committed && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+      }
+      return committed ? await settled : false;
+    } finally {
+      page.off("framenavigated", onNavigated);
+    }
+  };
+}
+
+/**
+ * The URL an action left the tab on, reported with the action itself.
+ *
+ * Verifying a click used to mean a second call, which is exactly the call that
+ * raced the navigation. Answering here removes the race rather than asking the
+ * caller to time it.
+ */
+function navigationResult(page: Page, tabId: number, navigated: boolean) {
+  return { ok: true as const, tabId, url: page.url(), ...(navigated ? { navigated } : {}) };
+}
+
 async function cdpPage(
   runtime: CdpRuntime,
   tabId?: number,
@@ -945,6 +1007,8 @@ async function runCdpTool<Name extends BrowserToolName>(
     case "hover": {
       const value = args as BrowserToolInputMap["click"];
       const selector = targetSelector(runtime, tabId, value);
+      // Hovering cannot navigate, so it is not made to wait to find that out.
+      const navigation = name === "hover" ? null : watchNavigation(page);
       if (selector) {
         const element = await requiredElement(page, selector);
         await withModifiers(page, value.modifiers, () =>
@@ -966,7 +1030,12 @@ async function runCdpTool<Name extends BrowserToolName>(
       } else {
         throw new Error(`${name} requires selector, nodeIndex, or x and y`);
       }
-      return { ok: true, tabId } as BrowserToolResult<Name>;
+      const navigated = navigation ? await navigation() : false;
+      // The snapshot of the old page is meaningless once a new one has loaded,
+      // and keeping it would let a later nodeIndex resolve against a document
+      // that is no longer on screen.
+      if (navigated) runtime.snapshotNodes.delete(tabId);
+      return navigationResult(page, tabId, navigated) as BrowserToolResult<Name>;
     }
     case "focus": {
       const value = args as BrowserToolInputMap["focus"];
@@ -998,8 +1067,12 @@ async function runCdpTool<Name extends BrowserToolName>(
         if (selector) await (await requiredElement(page, selector)).press(value.key as KeyInput);
         else await page.keyboard.press(value.key as KeyInput);
       };
+      // Enter on a form submits, so a key press navigates as readily as a click.
+      const navigation = watchNavigation(page);
       await withModifiers(page, value.modifiers, press);
-      return { ok: true, tabId } as BrowserToolResult<Name>;
+      const navigated = await navigation();
+      if (navigated) runtime.snapshotNodes.delete(tabId);
+      return navigationResult(page, tabId, navigated) as BrowserToolResult<Name>;
     }
     case "select": {
       const value = args as BrowserToolInputMap["select"];

@@ -1668,7 +1668,19 @@ export const browserBridgePlugin = definePlugin((options: BrowserBridgePluginOpt
           );
           const name = String(toolRow.name);
           if (name === "session_status") {
-            return getRemoteBrowserSession(key);
+            // Reported as a shape rather than as `null`. A bare null cannot say
+            // whether nothing is running or whether this looked somewhere the
+            // session is not, and the caller has no way to tell those apart or
+            // to report which it saw.
+            const session = getRemoteBrowserSession(key);
+            return session
+              ? { active: true as const, ...session }
+              : {
+                  active: false as const,
+                  key,
+                  detail:
+                    "No remote browser session is open for this connection. Any browser tool starts one, or use session_start.",
+                };
           }
           if (name === "session_start") {
             return yield* Effect.tryPromise({

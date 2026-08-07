@@ -31,7 +31,73 @@ import {
   runRemoteBrowserTool,
   sandboxNameFor,
   stopAllRemoteBrowserSessions,
+  watchNavigation,
 } from "./remote-runtime";
+
+describe("watchNavigation", () => {
+  const fakePage = () => {
+    const listeners = new Set<(frame: unknown) => void>();
+    const main = { name: "main" };
+    let settle: (() => void) | null = null;
+    return {
+      main,
+      listeners,
+      finishLoad: () => settle?.(),
+      page: {
+        mainFrame: () => main,
+        url: () => "https://example.com/after",
+        on: (_event: string, fn: (frame: unknown) => void) => listeners.add(fn),
+        off: (_event: string, fn: (frame: unknown) => void) => listeners.delete(fn),
+        waitForNavigation: () =>
+          new Promise<void>((resolve) => {
+            settle = resolve;
+          }),
+      },
+    };
+  };
+
+  it("waits for the new document once a navigation commits", async () => {
+    // The waiter is armed before the click precisely so a navigation that
+    // commits during the click is not missed.
+    const fake = fakePage();
+    const done = watchNavigation(fake.page as never);
+    fake.listeners.forEach((fn) => fn(fake.main));
+
+    let resolved = false;
+    const pending = done().then((value) => {
+      resolved = true;
+      return value;
+    });
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(resolved).toBe(false);
+
+    fake.finishLoad();
+    expect(await pending).toBe(true);
+    expect(fake.listeners.size).toBe(0);
+  });
+
+  it("does not make an action that never navigates wait out the load budget", async () => {
+    // A click that opens a menu must not pay for the answer to a question it
+    // was never going to raise.
+    const fake = fakePage();
+    const done = watchNavigation(fake.page as never);
+
+    const started = Date.now();
+    expect(await done()).toBe(false);
+    expect(Date.now() - started).toBeLessThan(2_000);
+    expect(fake.listeners.size).toBe(0);
+  });
+
+  it("ignores a navigation in a subframe", async () => {
+    // An ad or an embed loading in an iframe is not the page moving, and
+    // treating it as one would block on a load nobody asked about.
+    const fake = fakePage();
+    const done = watchNavigation(fake.page as never);
+    fake.listeners.forEach((fn) => fn({ name: "iframe" }));
+
+    expect(await done()).toBe(false);
+  });
+});
 
 describe("sandboxNameFor", () => {
   it("is stable for a target, so the next session finds the same machine", () => {

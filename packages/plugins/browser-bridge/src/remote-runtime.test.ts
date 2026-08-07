@@ -32,7 +32,34 @@ import {
   sandboxNameFor,
   stopAllRemoteBrowserSessions,
   watchNavigation,
+  withoutLiveLinks,
 } from "./remote-runtime";
+
+describe("withoutLiveLinks", () => {
+  it("strips the links that drive the session, and keeps the status", () => {
+    // A live-view URL opens an interactive devtools front end onto the running
+    // browser and needs nothing else presented with it. Handing one to a model
+    // puts a working handle on the session into a transcript that outlives the
+    // approval that created it.
+    const stripped = withoutLiveLinks({
+      key: "user:cf:default",
+      provider: "cloudflare-browser-run",
+      sessionId: "s1",
+      transport: "cdp",
+      createdAt: 1,
+      lastUsedAt: 2,
+      idleExpiresAt: 3,
+      liveUrl: "https://devtools.example/?wss=signed-token",
+      recordingUrl: "https://recordings.example/signed",
+    });
+
+    expect(stripped).not.toHaveProperty("liveUrl");
+    expect(stripped).not.toHaveProperty("recordingUrl");
+    expect(JSON.stringify(stripped)).not.toContain("signed");
+    // Everything a caller legitimately needs to reason about the session stays.
+    expect(stripped).toMatchObject({ sessionId: "s1", transport: "cdp", idleExpiresAt: 3 });
+  });
+});
 
 describe("watchNavigation", () => {
   const fakePage = () => {
@@ -126,6 +153,44 @@ describe("remote browser runtime", () => {
   afterEach(async () => {
     await stopAllRemoteBrowserSessions();
     vi.clearAllMocks();
+  });
+
+  it("reports where a Vercel click left the page, as the other transports do", async () => {
+    // The transports disagreed: CDP and the extension reported the destination
+    // while Vercel returned only a tab id, so the same click looked like it had
+    // done nothing on one provider and worked on another.
+    let url = "https://example.com/";
+    mocks.exec.mockImplementation(
+      async (command: string, options?: { args?: readonly string[] }) => {
+        if (command === "tab" && !options?.args?.length) {
+          return {
+            ok: true,
+            data: { tabs: [{ tabId: "t1", title: "Example", url, active: true }] },
+          };
+        }
+        if (command === "click") {
+          url = "https://www.iana.org/domains/example";
+          return { ok: true, data: {} };
+        }
+        return { ok: true, data: {} };
+      },
+    );
+
+    const config = { provider: "vercel-sandbox" as const };
+    const shared = { key: "vercel:nav", config, credential: "token" };
+    // Listing first is what teaches the session the tab's starting URL.
+    await runRemoteBrowserTool({ ...shared, tool: "tabs.list", args: {} });
+    const clicked = await runRemoteBrowserTool({
+      ...shared,
+      tool: "click",
+      args: { selector: "a" },
+    });
+
+    expect(clicked).toMatchObject({
+      ok: true,
+      url: "https://www.iana.org/domains/example",
+      navigated: true,
+    });
   });
 
   it("refuses a host outside the allowlist without starting a browser", async () => {
@@ -226,7 +291,9 @@ describe("remote browser runtime", () => {
       tool: "click",
       args: { nodeIndex: 0 },
     });
-    expect(mocks.exec).toHaveBeenLastCalledWith("click", { args: ["@e4"] });
+    // Not "last called": a click now re-reads the tab afterwards to report
+    // where it left the page. What matters here is the ref it clicked.
+    expect(mocks.exec).toHaveBeenCalledWith("click", { args: ["@e4"] });
 
     await runRemoteBrowserTool({
       key: "vercel:test",

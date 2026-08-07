@@ -736,9 +736,13 @@ function EditTargetForm({
   readonly onDone: () => void;
 }) {
   const settings = target.settings || {};
+  const local = target.provider === "local-extension";
   const updateTarget = useAtomSet(updateTargetAtom, { mode: "promiseExit" });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [sessionScopedApproval, setSessionScopedApproval] = useState(
+    settings.sessionScopedApproval === true,
+  );
   const [hosts, setHosts] = useState((settings.allowedHosts || []).join(", "));
   const [allowPrivateNetwork, setAllowPrivateNetwork] = useState(
     settings.allowPrivateNetwork === true,
@@ -763,13 +767,15 @@ function EditTargetForm({
         setError(null);
         const exit = await updateTarget({
           params: { integration: target.integration, connection: target.connection! },
-          payload: {
-            allowedHosts: parsedHosts,
-            allowPrivateNetwork,
-            fullAccess,
-            allowAdvanced,
-            ...(idleMinutes.trim() ? { idleTimeoutMinutes: Number(idleMinutes) } : {}),
-          },
+          payload: local
+            ? { sessionScopedApproval }
+            : {
+                allowedHosts: parsedHosts,
+                allowPrivateNetwork,
+                fullAccess,
+                allowAdvanced,
+                ...(idleMinutes.trim() ? { idleTimeoutMinutes: Number(idleMinutes) } : {}),
+              },
           reactivityKeys: ["browser-control"],
         });
         setBusy(false);
@@ -780,75 +786,106 @@ function EditTargetForm({
         setError(messageFromExit(exit, "Could not save these settings"));
       }}
     >
-      <div className="grid gap-1.5">
-        <Label htmlFor={`hosts-${target.integration}`} className="text-xs">
-          Allowed hosts
-        </Label>
-        <Input
-          id={`hosts-${target.integration}`}
-          value={hosts}
-          onChange={(event) => setHosts(event.target.value)}
-          placeholder="example.com, docs.example.com — blank for any public site"
-        />
-        <p className="text-xs text-muted-foreground">
-          Covers subdomains. Private and link-local addresses are always refused unless allowed
-          below.
-        </p>
-      </div>
-      <Label className="flex items-start gap-2 text-sm">
-        <Checkbox
-          checked={fullAccess}
-          onCheckedChange={(checked) => setFullAccess(checked === true)}
-        />
-        <span>
-          Approve once per session
-          <span className="block text-xs font-normal text-muted-foreground">
-            Stops the prompt on every click. Naming hosts above does this on its own.
-          </span>
-        </span>
-      </Label>
-      <Label className="flex items-start gap-2 text-sm">
-        <Checkbox
-          checked={allowPrivateNetwork}
-          onCheckedChange={(checked) => setAllowPrivateNetwork(checked === true)}
-        />
-        <span>
-          Reach private addresses
-          <span className="block text-xs font-normal text-muted-foreground">
-            Requires an allowed-hosts list.
-          </span>
-        </span>
-      </Label>
-      <Label className="flex items-start gap-2 text-sm">
-        <Checkbox
-          checked={allowAdvanced}
-          onCheckedChange={(checked) => setAllowAdvanced(checked !== false)}
-        />
-        <span>
-          Advanced tools
-          <span className="block text-xs font-normal text-muted-foreground">
-            evaluate, PDF, console, network, dialogs, viewport.
-          </span>
-        </span>
-      </Label>
-      <div className="grid gap-1.5">
-        <Label htmlFor={`idle-${target.integration}`} className="text-xs">
-          Idle timeout (minutes)
-        </Label>
-        <Input
-          id={`idle-${target.integration}`}
-          type="number"
-          min={1}
-          max={240}
-          value={idleMinutes}
-          onChange={(event) => setIdleMinutes(event.target.value)}
-          placeholder="10"
-        />
-      </div>
+      {/* The local browser's access scope lives in the extension and is not
+          duplicated here. What Executor owns for it is how often it asks. */}
+      {local && (
+        <>
+          <Label className="flex items-start gap-2 text-sm">
+            <Checkbox
+              checked={sessionScopedApproval}
+              onCheckedChange={(checked) => setSessionScopedApproval(checked === true)}
+            />
+            <span>
+              Approve once per session
+              <span className="block text-xs font-normal text-muted-foreground">
+                Off by default, and deliberately: this is your own signed-in Chrome, so one approval
+                would cover every account you are logged into. It applies only while the extension
+                is in Limited access mode with an allowed-hosts list — in Full access mode actions
+                are refused rather than waved through.
+              </span>
+            </span>
+          </Label>
+          <p className="text-xs text-muted-foreground">
+            Access scope, allowed hosts, and Advanced mode are set in the Executor Browser extension
+            itself.
+          </p>
+        </>
+      )}
+      {!local && (
+        <>
+          <div className="grid gap-1.5">
+            <Label htmlFor={`hosts-${target.integration}`} className="text-xs">
+              Allowed hosts
+            </Label>
+            <Input
+              id={`hosts-${target.integration}`}
+              value={hosts}
+              onChange={(event) => setHosts(event.target.value)}
+              placeholder="example.com, docs.example.com — blank for any public site"
+            />
+            <p className="text-xs text-muted-foreground">
+              Covers subdomains. Private and link-local addresses are always refused unless allowed
+              below.
+            </p>
+          </div>
+          <Label className="flex items-start gap-2 text-sm">
+            <Checkbox
+              checked={fullAccess}
+              onCheckedChange={(checked) => setFullAccess(checked === true)}
+            />
+            <span>
+              Approve once per session
+              <span className="block text-xs font-normal text-muted-foreground">
+                Stops the prompt on every click. Naming hosts above does this on its own.
+              </span>
+            </span>
+          </Label>
+          <Label className="flex items-start gap-2 text-sm">
+            <Checkbox
+              checked={allowPrivateNetwork}
+              onCheckedChange={(checked) => setAllowPrivateNetwork(checked === true)}
+            />
+            <span>
+              Reach private addresses
+              <span className="block text-xs font-normal text-muted-foreground">
+                Requires an allowed-hosts list.
+              </span>
+            </span>
+          </Label>
+          <Label className="flex items-start gap-2 text-sm">
+            <Checkbox
+              checked={allowAdvanced}
+              onCheckedChange={(checked) => setAllowAdvanced(checked !== false)}
+            />
+            <span>
+              Advanced tools
+              <span className="block text-xs font-normal text-muted-foreground">
+                evaluate, PDF, console, network, dialogs, viewport.
+              </span>
+            </span>
+          </Label>
+          <div className="grid gap-1.5">
+            <Label htmlFor={`idle-${target.integration}`} className="text-xs">
+              Idle timeout (minutes)
+            </Label>
+            <Input
+              id={`idle-${target.integration}`}
+              type="number"
+              min={1}
+              max={240}
+              value={idleMinutes}
+              onChange={(event) => setIdleMinutes(event.target.value)}
+              placeholder="10"
+            />
+          </div>
+        </>
+      )}
       {error && <p className="text-sm text-destructive">{error}</p>}
-      <p className="text-xs text-muted-foreground">
-        Saving closes any running session, so the next call picks these up.
-      </p>
+      {!local && (
+        <p className="text-xs text-muted-foreground">
+          Saving closes any running session, so the next call picks these up.
+        </p>
+      )}
       <div className="flex justify-end gap-2">
         <Button type="button" variant="ghost" size="sm" onClick={onDone} disabled={busy}>
           Cancel
@@ -1041,7 +1078,7 @@ function BrowsersPage() {
                             {trialling === key ? "Running..." : "Test run"}
                           </Button>
                         )}
-                        {target.connection && target.provider !== "local-extension" && (
+                        {target.connection && (
                           <Button
                             variant="outline"
                             size="sm"

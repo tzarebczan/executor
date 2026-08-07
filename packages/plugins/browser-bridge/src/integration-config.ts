@@ -69,6 +69,21 @@ export type BrowserIntegrationConfig =
       readonly provider: "local-extension";
       readonly transport: "reverse";
       readonly kind: "extension";
+      /**
+       * Approve the extension's session rather than each action.
+       *
+       * Stored here rather than read from whatever the extension is currently
+       * advertising, because the tool catalog carrying these approvals is
+       * cached and only rebuilt when config changes. An approval rule derived
+       * from the extension's live mode would keep applying after that mode
+       * changed, which is the one way this could quietly grant more than was
+       * agreed.
+       *
+       * Honoured only while the extension is in Limited mode, checked at call
+       * time where the answer is live. Full access plus no per-action prompt is
+       * the user's whole signed-in Chrome behind a single click.
+       */
+      readonly sessionScopedApproval?: boolean;
     }
   | (RemoteTargetControls & {
       readonly provider: "vercel-sandbox";
@@ -181,9 +196,18 @@ export function sessionApprovalScope(config: BrowserIntegrationConfig): string {
 export function parseBrowserIntegrationConfig(value: unknown): BrowserIntegrationConfig | null {
   if (!value || typeof value !== "object" || Array.isArray(value)) return null;
   const config = value as Record<string, unknown>;
-  if (config.provider === "local-extension") return LOCAL_BROWSER_CONFIG;
-  // Backward compatibility for the original extension integration.
-  if (config.transport === "reverse" && config.kind === "extension") return LOCAL_BROWSER_CONFIG;
+  if (
+    config.provider === "local-extension" ||
+    // Backward compatibility for the original extension integration.
+    (config.transport === "reverse" && config.kind === "extension")
+  ) {
+    return {
+      provider: "local-extension",
+      transport: "reverse",
+      kind: "extension",
+      ...(config.sessionScopedApproval === true ? { sessionScopedApproval: true } : {}),
+    };
+  }
 
   if (config.provider === "vercel-sandbox") {
     return {

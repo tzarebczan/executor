@@ -113,6 +113,8 @@ type RuntimeSession = {
   inFlight: number;
   readonly cdp?: CdpRuntime;
   readonly vercelTabRefs: Map<number, string>;
+  /** Last URL seen per tab, so a click can say whether it moved the page. */
+  readonly vercelTabUrls: Map<number, string>;
   readonly vercelSnapshotRefs: Map<number, string>;
   nextVercelTabId: number;
   activeVercelTabId: number | null;
@@ -716,6 +718,7 @@ async function createRemoteBrowserSession(
       lastUsedAt: Date.now(),
       inFlight: 0,
       vercelTabRefs: new Map(),
+      vercelTabUrls: new Map(),
       vercelSnapshotRefs: new Map(),
       nextVercelTabId: 1,
       activeVercelTabId: null,
@@ -775,6 +778,24 @@ export function listRemoteBrowserSessions(prefix?: string): readonly RemoteBrows
 export function getRemoteBrowserSession(key: string): RemoteBrowserSessionSummary | null {
   const session = sessions.get(key);
   return session ? summarize(session) : null;
+}
+
+/**
+ * A session summary with the live-view links taken out.
+ *
+ * `liveUrl` opens an interactive devtools front end onto the running browser,
+ * and whoever holds it can drive that browser without presenting anything else.
+ * It is a capability, not a status field. The person who approved a session is
+ * meant to be the one who can watch it, so the link belongs in their UI and not
+ * in a tool result, a transcript, or a log line that outlives the session.
+ *
+ * `recordingUrl` is the same shape of thing for a session that has ended.
+ */
+export function withoutLiveLinks(
+  summary: RemoteBrowserSessionSummary,
+): Omit<RemoteBrowserSessionSummary, "liveUrl" | "recordingUrl"> {
+  const { liveUrl: _liveUrl, recordingUrl: _recordingUrl, ...rest } = summary;
+  return rest;
 }
 
 /**
@@ -1356,6 +1377,7 @@ function vercelTab(session: RuntimeSession, tab: AgentBrowserTab): BrowserTab {
   const ref = tab.tabId || `t${session.nextVercelTabId}`;
   const id = vercelNumericTab(session, ref);
   if (tab.active) session.activeVercelTabId = id;
+  if (tab.url) session.vercelTabUrls.set(id, tab.url);
   return {
     id,
     title: tab.title || "",
@@ -1519,8 +1541,28 @@ async function runVercelTool<Name extends BrowserToolName>(
     case "focus": {
       const target = vercelTarget(session, value);
       if (!target) throw new Error(`${name} requires selector or nodeIndex on Vercel Sandbox`);
+      const tabId = Number(value.tabId || session.activeVercelTabId || 1);
+      const before = session.vercelTabUrls.get(tabId);
       await browser.exec(name, { args: [target] });
-      return { ok: true, tabId: Number(value.tabId || session.activeVercelTabId || 1) };
+      // Hover and focus cannot navigate, so they are not charged a tab read to
+      // establish that they did not.
+      if (name === "hover" || name === "focus") return { ok: true, tabId };
+      // Re-read where the page ended up, so this transport answers the same
+      // question as the others rather than leaving the caller to ask in a
+      // separate call — which is the call that used to race the navigation.
+      //
+      // Unlike the CDP path this cannot watch the navigation happen; it reports
+      // what the CLI had settled on by the time it returned. A navigation still
+      // in flight reads as no navigation here.
+      await listTabs();
+      const after = session.vercelTabUrls.get(tabId);
+      if (after && after !== before) session.vercelSnapshotRefs.clear();
+      return {
+        ok: true,
+        tabId,
+        ...(after ? { url: after } : {}),
+        ...(after && before && after !== before ? { navigated: true } : {}),
+      };
     }
     case "type": {
       const target = vercelTarget(session, value);

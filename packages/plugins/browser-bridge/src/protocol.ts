@@ -418,7 +418,8 @@ export const BROWSER_TOOL_DEFINITIONS = {
     inputSchema: objectSchema({ ...tabProperties, bypassCache: { type: "boolean" } }),
   },
   snapshot: {
-    description: "Structured accessibility-oriented page snapshot across accessible frames.",
+    description:
+      "Read the page: a structured snapshot of visible elements and text across frames, with a node index for each element that click, type, and the other actions accept.",
     risk: "read",
     inputSchema: objectSchema({
       ...tabProperties,
@@ -438,7 +439,8 @@ export const BROWSER_TOOL_DEFINITIONS = {
     }),
   },
   wait: {
-    description: "Wait for an element, text, URL, or visibility state.",
+    description:
+      "Wait for a condition instead of sleeping: an element to appear or disappear, text to show up, the URL to match, or the page to finish loading. Always prefer this over a delay.",
     risk: "read",
     inputSchema: objectSchema({
       ...tabProperties,
@@ -488,7 +490,11 @@ export const BROWSER_TOOL_DEFINITIONS = {
     ),
   },
   press: {
-    description: "Press a keyboard key, optionally on a target element.",
+    // Named for the words someone searches with. A review of this surface
+    // reported keyboard input as missing while `press` was published the whole
+    // time, because nothing in its description said "Enter" or "shortcut".
+    description:
+      "Press a keyboard key or keyboard shortcut: Enter, Escape, Tab, Backspace, Delete, arrow keys, F-keys, or a letter with Control, Alt, Shift, or Meta held. Optionally targets an element first.",
     risk: "write",
     inputSchema: objectSchema(
       { ...elementProperties, key: { type: "string", minLength: 1 }, modifiers },
@@ -496,7 +502,8 @@ export const BROWSER_TOOL_DEFINITIONS = {
     ),
   },
   select: {
-    description: "Select one or more values in a select element.",
+    description:
+      "Choose an option in a native select dropdown or combo box, including multi-select lists.",
     risk: "write",
     inputSchema: objectSchema(
       {
@@ -533,7 +540,8 @@ export const BROWSER_TOOL_DEFINITIONS = {
     }),
   },
   upload: {
-    description: "Attach in-memory files to a page file input.",
+    description:
+      "Upload a file: attach in-memory file contents to a file input or attachment control on the page.",
     risk: "sensitive",
     inputSchema: objectSchema(
       {
@@ -556,7 +564,10 @@ export const BROWSER_TOOL_DEFINITIONS = {
     ),
   },
   "downloads.list": {
-    description: "List recent browser downloads without reading local file contents.",
+    // Kept alongside the others so a search for "download" lands somewhere,
+    // even though this lists rather than fetches.
+    description:
+      "List downloaded files and their progress. Names and states only; file contents are not read.",
     risk: "read",
     inputSchema: objectSchema({
       limit: { type: "integer", minimum: 1, maximum: 100 },
@@ -564,7 +575,8 @@ export const BROWSER_TOOL_DEFINITIONS = {
     }),
   },
   "dialog.handle": {
-    description: "Accept or dismiss the current JavaScript dialog.",
+    description:
+      "Accept or dismiss a JavaScript dialog: alert, confirm, prompt, or an onbeforeunload leave-site popup.",
     risk: "sensitive",
     advanced: true,
     inputSchema: objectSchema({ accept: { type: "boolean" }, promptText: { type: "string" } }, [
@@ -572,7 +584,8 @@ export const BROWSER_TOOL_DEFINITIONS = {
     ]),
   },
   "console.list": {
-    description: "Read redacted console messages captured in Advanced mode.",
+    description:
+      "Read console output and page errors captured for this tab: console.log, warnings, uncaught exceptions, and stack traces. Values are redacted. Advanced mode.",
     risk: "read",
     advanced: true,
     inputSchema: objectSchema({
@@ -582,7 +595,8 @@ export const BROWSER_TOOL_DEFINITIONS = {
     }),
   },
   "network.list": {
-    description: "Read redacted network request metadata captured in Advanced mode.",
+    description:
+      "Inspect network activity for this tab: requests, response status codes, and failed or blocked requests. Metadata only, redacted, no bodies. Advanced mode.",
     risk: "sensitive",
     advanced: true,
     inputSchema: objectSchema({
@@ -616,7 +630,8 @@ export const BROWSER_TOOL_DEFINITIONS = {
     }),
   },
   "viewport.set": {
-    description: "Override viewport metrics for a controlled tab in Advanced mode.",
+    description:
+      "Set the viewport: window width, height, and device pixel ratio, for responsive or mobile-sized rendering. Advanced mode.",
     risk: "write",
     advanced: true,
     inputSchema: objectSchema(

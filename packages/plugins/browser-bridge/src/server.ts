@@ -66,6 +66,7 @@ import {
   classifyRemoteBrowserFailure,
   DEFAULT_IDLE_TIMEOUT_MS,
   getRemoteBrowserSession,
+  withoutLiveLinks,
   getRemoteBrowserFailure,
   listRemoteBrowserSessions,
   runRemoteBrowserTool,
@@ -295,26 +296,138 @@ export const BROWSER_TOOL_CATALOG: readonly ToolDef[] = [
   ...BROWSER_TOOL_NAMES.map((name) => browserCatalogEntry(name)),
 ];
 
-function catalogResult(): ResolveToolsResult {
-  return { tools: [...BROWSER_TOOL_CATALOG] };
+/**
+ * The local extension's session tools.
+ *
+ * `session_start` is deliberately absent. The extension's control session is
+ * what grants an agent reach over a browser that is signed into the user's own
+ * accounts, and it is granted in the extension, by the person. A tool that
+ * started one would let an agent hand itself the access the step exists to
+ * withhold. Reading the session and ending it are both safe: one observes, and
+ * the other only ever takes access away.
+ */
+const LOCAL_SESSION_TOOLS: readonly ToolDef[] = [
+  {
+    name: ToolName.make("session_status"),
+    description:
+      "Browser session status for the local Chrome extension: whether a control session is running, its access mode, which hosts are in scope, and when it expires. Does not start one.",
+    inputSchema: noArgsSchema,
+  },
+  {
+    name: ToolName.make("session_stop"),
+    description:
+      "End the local browser control session, returning the extension to its resting access. Safe to call when none is running.",
+    inputSchema: noArgsSchema,
+  },
+];
+
+function catalogResult(config?: BrowserIntegrationConfig | null): ResolveToolsResult {
+  const sessionScoped =
+    config?.provider === "local-extension" && config.sessionScopedApproval === true;
+  return {
+    tools: [
+      ...LOCAL_SESSION_TOOLS,
+      BROWSER_TOOL_CATALOG_V1[0]!,
+      BROWSER_TOOL_CATALOG_V1[1]!,
+      ...BROWSER_TOOL_NAMES.map((name) => browserCatalogEntry(name, { sessionScoped })),
+    ],
+  };
+}
+
+/**
+ * What the extension is currently advertising about its own access.
+ *
+ * Read live rather than from stored config, because it is the extension's
+ * setting and not Executor's: the answer has to be whatever is true right now,
+ * not what was true when this catalog was built.
+ */
+/**
+ * Why a session-scoped local call must not proceed, if it must not.
+ *
+ * Dropping the per-action prompt on the local browser is only defensible while
+ * the extension is bounding it to named hosts. In Full access mode the same
+ * setting would mean one click covering the user's whole signed-in Chrome, so
+ * the setting stops applying rather than silently meaning something larger than
+ * it did when it was ticked.
+ *
+ * Reads are unaffected: they were never prompted.
+ */
+export function localScopeProblem(
+  config: BrowserIntegrationConfig,
+  ctx: PluginCtx,
+  toolName: string,
+): string | null {
+  return localScopeVerdict(
+    config,
+    accessFromCapabilities(listSessionsForUser(userIdFromOwner(ctx.owner))[0]?.capabilities),
+    toolName,
+  );
+}
+
+/** The decision itself, separated from looking up what the extension advertised. */
+export function localScopeVerdict(
+  config: BrowserIntegrationConfig,
+  access: BrowserAccessView | null,
+  toolName: string,
+): string | null {
+  if (config.provider !== "local-extension" || !config.sessionScopedApproval) return null;
+  const inner = browserToolNameFromCatalog(toolName) || toolName;
+  const definition = (BROWSER_TOOL_DEFINITIONS as Record<string, { risk?: string } | undefined>)[
+    inner
+  ];
+  if (!definition || definition.risk === "read") return null;
+  if (access && access.mode === "limited") return null;
+  return (
+    "This browser is set to ask once per session, which only applies while the extension is in " +
+    "Limited access mode. It is not, so actions are not covered by that approval. Switch the " +
+    "extension to Limited access with an allowed-hosts list, or turn off ask-once for this browser."
+  );
+}
+
+export function localSessionStatus(ctx: PluginCtx) {
+  const sessions = listSessionsForUser(userIdFromOwner(ctx.owner));
+  const session = sessions[0];
+  if (!session) {
+    return {
+      active: false as const,
+      detail:
+        "The Executor Browser extension is not connected. Open Chrome and check the extension is running.",
+    };
+  }
+  const access = accessFromCapabilities(session.capabilities);
+  return {
+    active: true as const,
+    connectedFor: Date.now() - session.createdAt,
+    ...(access
+      ? {
+          mode: access.mode,
+          controlSessionActive: access.sessionActive,
+          advanced: access.advanced,
+          allowedHosts: access.allowedHosts,
+          ...(access.expiresAt ? { expiresAt: access.expiresAt } : {}),
+        }
+      : { detail: "The extension did not advertise its access scope" }),
+  };
 }
 
 const REMOTE_SESSION_TOOLS: readonly ToolDef[] = [
   {
     name: ToolName.make("session_status"),
     description:
-      "Show the current remote browser session without starting one. `idleExpiresAt` is when the session closes if nothing uses it before then; the replacement session does not keep open tabs or sign-ins.",
+      "Browser session status: whether a remote browser is currently running, how long it has left, and its transport. Does not start one. `idleExpiresAt` is when the session closes if nothing uses it before then; the replacement session does not keep open tabs or sign-ins.",
     inputSchema: noArgsSchema,
   },
   {
     name: ToolName.make("session_start"),
-    description: "Start or reuse this connection's remote browser session.",
+    description:
+      "Start a browser session, or reuse the one already running for this connection. Browser tools start a session on their own, so this is only needed to warm one up or to approve the session ahead of time.",
     inputSchema: noArgsSchema,
     annotations: approval("Start a remote browser session that may incur provider usage"),
   },
   {
     name: ToolName.make("session_stop"),
-    description: "Stop this connection's remote browser session.",
+    description:
+      "Stop the browser session and release the remote browser, ending what it is billed for. Safe to call when nothing is running.",
     inputSchema: noArgsSchema,
   },
 ];
@@ -789,11 +902,28 @@ function updateTargetEffect(
         message: `No browser target "${params.integration}"`,
       });
     }
+    // The local browser has exactly one setting here. Its access scope belongs
+    // to the extension and is not duplicated; what Executor owns is whether the
+    // prompts it raises are per action or per session.
     if (!isRemoteBrowserConfig(current)) {
-      return yield* new BrowserBridgeError({
-        message:
-          "The local browser is configured in the Executor Browser extension, not here. Open its options to change access scope.",
+      if (input.sessionScopedApproval === undefined) {
+        return yield* new BrowserBridgeError({
+          message:
+            "The local browser's access scope is set in the Executor Browser extension. Only its approval frequency is configured here.",
+        });
+      }
+      yield* ctx.core.integrations.update(slug, {
+        config: {
+          ...LOCAL_BROWSER_CONFIG,
+          ...(input.sessionScopedApproval ? { sessionScopedApproval: true } : {}),
+        } as never,
       });
+      const refreshed = yield* browserOverviewEffect(ctx);
+      const local = refreshed.targets.find((target) => target.integration === params.integration);
+      if (!local) {
+        return yield* new BrowserBridgeError({ message: "Saved, but the local browser vanished" });
+      }
+      return local;
     }
 
     const hosts =
@@ -907,6 +1037,17 @@ function browserOverviewEffect(ctx: PluginCtx) {
       provider: "local-extension",
       connection: localConnection ? String(localConnection.name) : BROWSER_CONNECTION_NAME,
       address: localConnection?.address || "tools.browser.user.desktop",
+      settings: {
+        sessionScopedApproval:
+          localRecord?.config &&
+          parseBrowserIntegrationConfig(localRecord.config)?.provider === "local-extension"
+            ? (
+                parseBrowserIntegrationConfig(localRecord.config) as {
+                  sessionScopedApproval?: boolean;
+                }
+              ).sessionScopedApproval === true
+            : false,
+      },
       state: !localSession ? "offline" : localVerdict.status === "healthy" ? "live" : "stale",
       detail: localSession
         ? `Extension ${String((localSession.client as { version?: string } | undefined)?.version || "connected")} connected · ${localSession.pending.length === 0 ? "no requests waiting" : `${localSession.pending.length} request${localSession.pending.length === 1 ? "" : "s"} waiting`}`
@@ -1873,7 +2014,7 @@ export const browserBridgePlugin = definePlugin((options: BrowserBridgePluginOpt
     resolveTools: ({ config }) => {
       const parsed = parseBrowserIntegrationConfig(config);
       return Effect.succeed(
-        isRemoteBrowserConfig(parsed) ? remoteCatalogResult(parsed) : catalogResult(),
+        isRemoteBrowserConfig(parsed) ? remoteCatalogResult(parsed) : catalogResult(parsed),
       );
     },
     validateToolArgs: ({ toolRow, args }) =>
@@ -1908,7 +2049,11 @@ export const browserBridgePlugin = definePlugin((options: BrowserBridgePluginOpt
             // to report which it saw.
             const session = getRemoteBrowserSession(key);
             return session
-              ? { active: true as const, ...session }
+              ? // The live-view link is withheld here and shown in the UI
+                // instead. It drives the running browser on its own, so handing
+                // it to a model puts a working handle on the session into a
+                // transcript that outlives the approval that created it.
+                { active: true as const, ...withoutLiveLinks(session) }
               : {
                   active: false as const,
                   key,
@@ -1918,13 +2063,17 @@ export const browserBridgePlugin = definePlugin((options: BrowserBridgePluginOpt
           }
           if (name === "session_start") {
             return yield* Effect.tryPromise({
-              try: () => startRemoteBrowserSession(key, config, credential.value),
+              try: () =>
+                startRemoteBrowserSession(key, config, credential.value).then(withoutLiveLinks),
               catch: (error) => browserBridgeError(error, "Could not start remote browser"),
             });
           }
           if (name === "session_stop") {
             return yield* Effect.tryPromise({
-              try: () => stopRemoteBrowserSession(key),
+              // Reported as stopped either way. Nothing running is the state the
+              // caller asked for, and a crash-recovery path that has to guess
+              // whether "false" meant failure will guess wrong.
+              try: () => stopRemoteBrowserSession(key).then((stopped) => ({ ok: true, stopped })),
               catch: (error) => browserBridgeError(error, "Could not stop remote browser"),
             });
           }
@@ -1951,11 +2100,33 @@ export const browserBridgePlugin = definePlugin((options: BrowserBridgePluginOpt
             catch: (error) => browserBridgeError(error, "Remote browser tool failed"),
           });
         }
+        const localName = String(toolRow.name);
+        if (localName === "session_status") {
+          return localSessionStatus(ctx);
+        }
+        // The catalog dropped the per-action prompts on the understanding that
+        // the extension is holding this to a set of hosts. That understanding
+        // is checked here, where the extension's mode is live, rather than
+        // trusted from a catalog built at some earlier point.
+        const scopeProblem = localScopeProblem(config, ctx, localName);
+        if (scopeProblem) return yield* new BrowserBridgeError({ message: scopeProblem });
+        if (localName === "session_stop") {
+          // Ending a control session only ever reduces what this can reach, so
+          // an agent may do it. Starting one is the opposite and is not offered:
+          // the human granting access is the point of that step.
+          return yield* Effect.tryPromise({
+            try: () =>
+              runTool(userIdFromOwner(ctx.owner), "session.stop", {}, defaultTimeout, caller).then(
+                () => ({ ok: true, stopped: true }),
+              ),
+            catch: (error) => browserBridgeError(error, "Could not end the control session"),
+          });
+        }
         return yield* Effect.tryPromise({
           try: () =>
             runTool(
               userIdFromOwner(ctx.owner),
-              String(toolRow.name),
+              localName,
               (args || {}) as Record<string, unknown>,
               defaultTimeout,
               caller,

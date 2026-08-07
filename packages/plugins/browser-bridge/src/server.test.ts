@@ -9,6 +9,7 @@ import {
   integrationIsBrowserTarget,
   providerCanMint,
   localBridgeVerdict,
+  localScopeVerdict,
   remoteAdvancedAllowed,
   remoteCatalogResult,
   settingsFor,
@@ -257,6 +258,45 @@ describe("approval scope follows what bounds the target", () => {
 
   it("does not treat reading as something to approve either way", () => {
     expect(asks(target, browserToolCatalogName("snapshot"))).toBe(false);
+  });
+});
+
+describe("local approval scope", () => {
+  const local = {
+    provider: "local-extension" as const,
+    transport: "reverse" as const,
+    kind: "extension" as const,
+  };
+  const scoped = { ...local, sessionScopedApproval: true };
+  const limited = {
+    mode: "limited" as const,
+    sessionActive: true,
+    advanced: false,
+    allowedHosts: ["example.com"],
+  };
+  const full = { mode: "full" as const, sessionActive: true, advanced: false, allowedHosts: [] };
+
+  it("does not scope approval unless the target asked for it", () => {
+    expect(localScopeVerdict(local, full, "click")).toBeNull();
+  });
+
+  it("never holds reads back, since they were never prompted", () => {
+    expect(localScopeVerdict(scoped, full, "snapshot")).toBeNull();
+  });
+
+  it("allows writes while the extension is bounding the browser", () => {
+    expect(localScopeVerdict(scoped, limited, "click")).toBeNull();
+  });
+
+  it("refuses a write when the extension is no longer bounding the browser", () => {
+    // The catalog dropped the per-action prompts on the understanding that the
+    // extension was holding this to named hosts. In Full access mode that
+    // understanding is gone, and one approval would otherwise stand in for the
+    // user's whole signed-in Chrome. Checked at call time because the catalog
+    // is cached and the extension's mode is not.
+    expect(localScopeVerdict(scoped, full, "click")).toContain("Limited access");
+    // And when the extension has not said anything at all.
+    expect(localScopeVerdict(scoped, null, "click")).toContain("Limited access");
   });
 });
 

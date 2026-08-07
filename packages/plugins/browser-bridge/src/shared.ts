@@ -93,6 +93,11 @@ export const BrowserTargetSettings = Schema.Struct({
   profileId: Schema.optional(Schema.String),
   proxyCountryCode: Schema.optional(Schema.NullOr(Schema.String)),
   enableRecording: Schema.optional(Schema.Boolean),
+  /**
+   * Local extension only: approve its session rather than each action. Applies
+   * only while the extension is in Limited access mode.
+   */
+  sessionScopedApproval: Schema.optional(Schema.Boolean),
 });
 
 export type BrowserTargetSettings = typeof BrowserTargetSettings.Type;

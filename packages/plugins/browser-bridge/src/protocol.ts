@@ -44,7 +44,7 @@ export interface BrowserToolInputMap {
     readonly selector?: string;
     readonly text?: string;
     readonly url?: string;
-    readonly state?: "attached" | "visible" | "hidden" | "gone";
+    readonly state?: "attached" | "visible" | "hidden" | "gone" | "load" | "idle";
     readonly timeoutMs?: number;
   };
   readonly click: BrowserPointTarget & {
@@ -111,6 +111,17 @@ export interface BrowserToolInputMap {
     readonly height: number;
     readonly deviceScaleFactor?: number;
   };
+  readonly drag: BrowserTabTarget & {
+    readonly from: BrowserPointTarget;
+    readonly to: BrowserPointTarget;
+  };
+  readonly "cookies.list": BrowserTabTarget & { readonly domain?: string };
+  readonly "cookies.clear": BrowserTabTarget & { readonly domain?: string };
+  readonly "storage.clear": BrowserTabTarget & {
+    readonly local?: boolean;
+    readonly session?: boolean;
+  };
+  readonly "tabs.waitForNew": { readonly timeoutMs?: number };
 }
 
 export type BrowserToolName = keyof BrowserToolInputMap;
@@ -309,6 +320,29 @@ export interface BrowserToolSuccessMap {
     readonly height: number;
     readonly deviceScaleFactor: number;
   };
+  readonly drag: { readonly ok: true; readonly tabId: number };
+  /**
+   * Cookie metadata without values.
+   *
+   * A session cookie is the sign-in it belongs to. Reading one out of a browser
+   * and into a transcript hands over the account, so the shape of the jar is
+   * reported and its contents are not. Clearing needs no value at all.
+   */
+  readonly "cookies.list": {
+    readonly ok: true;
+    readonly cookies: readonly {
+      readonly name: string;
+      readonly domain: string;
+      readonly path: string;
+      readonly expires?: number;
+      readonly httpOnly: boolean;
+      readonly secure: boolean;
+      readonly sameSite?: string;
+    }[];
+  };
+  readonly "cookies.clear": { readonly ok: true; readonly cleared: number };
+  readonly "storage.clear": { readonly ok: true; readonly tabId: number };
+  readonly "tabs.waitForNew": { readonly ok: true; readonly tab: BrowserTab };
 }
 
 export type BrowserToolResult<Name extends BrowserToolName> =
@@ -447,7 +481,13 @@ export const BROWSER_TOOL_DEFINITIONS = {
       selector,
       text: { type: "string", minLength: 1 },
       url: { type: "string", minLength: 1 },
-      state: { type: "string", enum: ["attached", "visible", "hidden", "gone"] },
+      // "load" and "idle" describe the page rather than an element, which is
+      // what someone reaches for after a click when they do not know which
+      // element proves the new page arrived.
+      state: {
+        type: "string",
+        enum: ["attached", "visible", "hidden", "gone", "load", "idle"],
+      },
       timeoutMs: { type: "integer", minimum: 100, maximum: 120000 },
     }),
   },
@@ -644,6 +684,50 @@ export const BROWSER_TOOL_DEFINITIONS = {
       ["width", "height"],
     ),
   },
+  drag: {
+    description:
+      "Drag and drop: press the mouse on one element or point, move to another, and release. For sliders, reorderable lists, and drag-to-upload targets.",
+    risk: "write",
+    inputSchema: objectSchema(
+      {
+        ...tabProperties,
+        from: { type: "object" },
+        to: { type: "object" },
+      },
+      ["from", "to"],
+    ),
+  },
+  "cookies.list": {
+    // Values are never returned. A session cookie is the sign-in it belongs to,
+    // so reading one into a transcript hands over the account.
+    description:
+      "List cookies for the current page: names, domains, paths, expiry, and flags. Values are never returned.",
+    risk: "sensitive",
+    advanced: true,
+    inputSchema: objectSchema({ ...tabProperties, domain: { type: "string", minLength: 1 } }),
+  },
+  "cookies.clear": {
+    description:
+      "Clear cookies for the current page or a domain, to sign out or start a clean session.",
+    risk: "write",
+    inputSchema: objectSchema({ ...tabProperties, domain: { type: "string", minLength: 1 } }),
+  },
+  "storage.clear": {
+    description:
+      "Clear localStorage and sessionStorage for the current page, to reset stored app state.",
+    risk: "write",
+    inputSchema: objectSchema({
+      ...tabProperties,
+      local: { type: "boolean" },
+      session: { type: "boolean" },
+    }),
+  },
+  "tabs.waitForNew": {
+    description:
+      "Wait for a popup or new tab to open, such as an OAuth or payment window, and return it once it has.",
+    risk: "read",
+    inputSchema: objectSchema({ timeoutMs: { type: "integer", minimum: 100, maximum: 120000 } }),
+  },
 } as const satisfies Record<BrowserToolName, BrowserToolDefinition>;
 
 export const BROWSER_TOOL_NAMES = Object.freeze(
@@ -800,8 +884,11 @@ export function validateBrowserToolCall(toolRaw: unknown, argsRaw: unknown): Bro
   if (tool === "find" && !record.text && !record.role && !record.selector) {
     throw new Error("find requires text, role, or selector");
   }
-  if (tool === "wait" && !record.text && !record.url && !record.selector) {
-    throw new Error("wait requires text, url, or selector");
+  // A load state waits on the page rather than on anything named, so it is a
+  // complete instruction by itself.
+  const loadState = record.state === "load" || record.state === "idle";
+  if (tool === "wait" && !record.text && !record.url && !record.selector && !loadState) {
+    throw new Error("wait requires text, url, selector, or state: load or idle");
   }
   if (tool === "upload") {
     const files = record.files as readonly { readonly dataBase64: string }[];

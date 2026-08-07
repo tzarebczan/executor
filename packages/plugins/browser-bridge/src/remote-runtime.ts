@@ -19,6 +19,7 @@ import { createCloudBrowserSession, type CloudBrowserHandle } from "./cloud-prov
 import {
   BROWSER_PROTOCOL_VERSION,
   type BrowserElementTarget,
+  type BrowserPointTarget,
   type BrowserSnapshotNode,
   type BrowserTab,
   type BrowserToolInputMap,
@@ -870,6 +871,28 @@ async function ensureGuarded(runtime: CdpRuntime, page: Page): Promise<void> {
   if (guard) await guard;
 }
 
+/**
+ * Viewport coordinates for a drag endpoint.
+ *
+ * An endpoint may be given as a selector, a snapshot node, or a raw point, and
+ * a drag needs two of them in the same units. Elements are resolved to the
+ * centre of their box, which is where a person would grab them.
+ */
+async function pointFor(
+  runtime: CdpRuntime,
+  page: Page,
+  tabId: number,
+  target: BrowserPointTarget,
+): Promise<{ x: number; y: number }> {
+  if (target.x != null && target.y != null) return { x: target.x, y: target.y };
+  const selector = targetSelector(runtime, tabId, target);
+  if (!selector) throw new Error("drag endpoints need a selector, nodeIndex, or x and y");
+  const element = await requiredElement(page, selector);
+  const box = await element.boundingBox();
+  if (!box) throw new Error(`"${selector}" is not visible, so it cannot be dragged`);
+  return { x: box.x + box.width / 2, y: box.y + box.height / 2 };
+}
+
 async function cdpPage(
   runtime: CdpRuntime,
   tabId?: number,
@@ -1116,8 +1139,16 @@ async function runCdpTool<Name extends BrowserToolName>(
         );
       } else if (value.url) {
         await page.waitForFunction(`location.href === ${JSON.stringify(value.url)}`, { timeout });
+      } else if (value.state === "load" || value.state === "idle") {
+        // The answer to "the click worked, now what do I wait for?" when the
+        // caller does not know which element proves the new page arrived.
+        // Without this the only options were a guessed selector or a sleep.
+        await page.waitForNetworkIdle({
+          idleTime: value.state === "idle" ? 500 : 0,
+          timeout,
+        });
       } else {
-        throw new Error("wait requires selector, text, or url");
+        throw new Error("wait requires selector, text, url, or a load state");
       }
       return {
         ok: true,
@@ -1281,6 +1312,82 @@ async function runCdpTool<Name extends BrowserToolName>(
         .filter((download) => !value.state || download.state === value.state)
         .slice(-(value.limit || 20));
       return toolResult<Name>({ ok: true, downloads });
+    }
+    case "drag": {
+      const value = args as BrowserToolInputMap["drag"];
+      const from = await pointFor(runtime, page, tabId, value.from);
+      const to = await pointFor(runtime, page, tabId, value.to);
+      // Stepped rather than a single jump: sliders and sortable lists track
+      // pointermove, and a drag that teleports fires none of them.
+      await page.mouse.move(from.x, from.y);
+      await page.mouse.down();
+      for (let step = 1; step <= 10; step += 1) {
+        await page.mouse.move(
+          from.x + ((to.x - from.x) * step) / 10,
+          from.y + ((to.y - from.y) * step) / 10,
+        );
+      }
+      await page.mouse.up();
+      return { ok: true, tabId } as BrowserToolResult<Name>;
+    }
+    case "cookies.list": {
+      const value = args as BrowserToolInputMap["cookies.list"];
+      const jar = await page.cookies();
+      const cookies = jar
+        .filter((cookie) => !value.domain || cookie.domain.endsWith(value.domain))
+        // Values are dropped here rather than at the edge. A session cookie is
+        // the sign-in it belongs to, so it never enters a result that a model
+        // reads or a transcript keeps.
+        .map((cookie) => ({
+          name: cookie.name,
+          domain: cookie.domain,
+          path: cookie.path,
+          ...(cookie.expires && cookie.expires > 0 ? { expires: cookie.expires } : {}),
+          httpOnly: Boolean(cookie.httpOnly),
+          secure: Boolean(cookie.secure),
+          ...(cookie.sameSite ? { sameSite: String(cookie.sameSite) } : {}),
+        }));
+      return toolResult<Name>({ ok: true, cookies });
+    }
+    case "cookies.clear": {
+      const value = args as BrowserToolInputMap["cookies.clear"];
+      const jar = await page.cookies();
+      const doomed = jar.filter((cookie) => !value.domain || cookie.domain.endsWith(value.domain));
+      for (const cookie of doomed) await page.deleteCookie(cookie);
+      return { ok: true, cleared: doomed.length } as BrowserToolResult<Name>;
+    }
+    case "storage.clear": {
+      const value = args as BrowserToolInputMap["storage.clear"];
+      const local = value.local !== false;
+      const session = value.session !== false;
+      await page.evaluate(
+        (clearLocal: boolean, clearSession: boolean) => {
+          if (clearLocal) localStorage.clear();
+          if (clearSession) sessionStorage.clear();
+        },
+        local,
+        session,
+      );
+      return { ok: true, tabId } as BrowserToolResult<Name>;
+    }
+    case "tabs.waitForNew": {
+      const value = args as BrowserToolInputMap["tabs.waitForNew"];
+      // An OAuth or payment popup opens on its own timing. Polling the page set
+      // is what turns "click, then guess how long" into an answer.
+      const known = new Set(runtime.pagesById.values());
+      const deadline = Date.now() + (value.timeoutMs || 15_000);
+      while (Date.now() < deadline) {
+        const pages = await runtime.context.pages();
+        const fresh = pages.find((candidate) => !known.has(candidate));
+        if (fresh) {
+          const newId = registerPage(runtime, fresh);
+          runtime.activePageId = newId;
+          await ensureGuarded(runtime, fresh);
+          return toolResult<Name>({ ok: true, tab: await hydratedPageTab(runtime, fresh) });
+        }
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      throw new Error("No new tab or popup opened before the timeout");
     }
     case "dialog.handle": {
       const value = args as BrowserToolInputMap["dialog.handle"];
@@ -1690,6 +1797,13 @@ async function runVercelTool<Name extends BrowserToolName>(
         height: Number(value.height),
         deviceScaleFactor: Number(value.deviceScaleFactor || 1),
       };
+    default:
+      // Named rather than left to fall out of the switch as undefined. A tool
+      // this provider cannot run is a fact worth stating once, so a caller
+      // switches provider or approach instead of retrying the same call.
+      throw new Error(
+        `"${name}" is not available on Vercel Sandbox, which drives the browser through a CLI rather than a debugging protocol. Use a Cloudflare or CDP target for it.`,
+      );
   }
 }
 

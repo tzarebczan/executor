@@ -261,6 +261,51 @@ describe("approval scope follows what bounds the target", () => {
   });
 });
 
+describe("the interaction surface a review could not find", () => {
+  it("names the tools in the words someone would search for", () => {
+    // A reviewer reported keyboard input, dropdowns, upload, dialogs, and
+    // network inspection as missing while all five were published. Nothing in
+    // their descriptions said Enter, shortcut, dropdown, upload, or alert.
+    const described = (name: string) =>
+      String(catalogByName.get(name)?.description || "").toLowerCase();
+
+    expect(described("press")).toContain("enter");
+    expect(described("press")).toContain("shortcut");
+    expect(described("select")).toContain("dropdown");
+    expect(described("upload")).toContain("upload");
+    expect(described("dialog_handle")).toContain("alert");
+    expect(described("network_list")).toContain("failed");
+    expect(described("console_list")).toContain("error");
+    expect(described("wait")).toContain("instead of sleeping");
+  });
+
+  it("covers what was genuinely absent", () => {
+    for (const name of [
+      "drag",
+      "cookies_list",
+      "cookies_clear",
+      "storage_clear",
+      "tabs_waitForNew",
+    ]) {
+      expect(catalogByName.has(name), name).toBe(true);
+    }
+  });
+
+  it("waits on a load state, so a click needs no guessed selector after it", () => {
+    expect(validateInnerCall("wait", { state: "idle" }).tool).toBe("wait");
+    expect(validateInnerCall("wait", { state: "load" }).args.state).toBe("load");
+  });
+
+  it("treats cookie reading as sensitive and never publishes values", () => {
+    // A session cookie is the sign-in it belongs to. Reading one into a
+    // transcript hands over the account, so the jar's shape is reportable and
+    // its contents are not.
+    const schema = JSON.stringify(catalogByName.get("cookies_list")?.inputSchema);
+    expect(schema).not.toContain("value");
+    expect(catalogByName.get("cookies_list")?.annotations?.requiresApproval).toBe(true);
+  });
+});
+
 describe("local approval scope", () => {
   const local = {
     provider: "local-extension" as const,

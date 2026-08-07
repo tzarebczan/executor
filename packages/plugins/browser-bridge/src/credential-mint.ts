@@ -87,6 +87,7 @@ export function cloudflareMintScript(options: {
     // page can omit Browser Rendering entirely and read as an account without
     // the product.
     const all = [];
+    const ids = new Set();
     for (let page = 1; page <= 10; page += 1) {
       const response = await tryRequest({
         method: "GET",
@@ -94,22 +95,30 @@ export function cloudflareMintScript(options: {
         query: { per_page: 100, page },
       });
       const batch = response && Array.isArray(response.result) ? response.result : [];
-      all.push(...batch);
+      // Deduplicated, and the page loop stops when a page adds nothing new.
+      // Cloudflare ignores per_page/page on this route and returns the whole
+      // list every time, so paging blindly asked for the same rows ten times
+      // and reported twenty groups where there were two.
+      const fresh = batch.filter((g) => g && !ids.has(g.id));
+      for (const g of fresh) ids.add(g.id);
+      all.push(...fresh);
+      if (fresh.length === 0) break;
       const info = response && response.result_info;
       const pages = info && Number(info.total_pages);
-      if (batch.length === 0) break;
       if (Number.isFinite(pages) && page >= pages) break;
-      if (!info && batch.length < 100) break;
+      if (!info) break;
     }
     if (all.length) { readAny = true; total += all.length; }
-    // Widened from "browser rendering": Cloudflare names these groups itself
-    // and a near miss ("Workers Browser Rendering") would otherwise read as an
-    // account without the capability.
+    // Cloudflare calls this product "Browser Run", not "Browser Rendering", so
+    // the match is on the broader word. Both spellings are accepted because the
+    // docs and the dashboard disagree with the API.
     const browser = all.filter((g) => /browser|render/i.test(String(g && g.name)));
     if (browser.length) seen = browser.map((g) => g.name);
-    const writable = browser.find(
-      (g) => /render/i.test(String(g.name)) && /edit|write/i.test(String(g.name)),
-    );
+    // Read-only cannot start a browser, so the writable one is required. The
+    // "browser" spelling is preferred over "render" only to break ties; either
+    // alone is enough, since requiring both discarded "Browser Run Write".
+    const writes = browser.filter((g) => /edit|write/i.test(String(g.name)));
+    const writable = writes.find((g) => /browser/i.test(String(g.name))) || writes[0];
     if (writable) { group = writable; break; }
   }
   if (!group) {
@@ -185,17 +194,21 @@ export function readMintScriptResult(raw: unknown): MintOutcome {
     };
   }
   if (found.reason === "unavailable" || found.reason === "read-only") {
-    const seen = Array.isArray(found.seen)
-      ? found.seen.filter((entry): entry is string => typeof entry === "string")
-      : [];
+    const seen = [
+      ...new Set(
+        Array.isArray(found.seen)
+          ? found.seen.filter((entry): entry is string => typeof entry === "string")
+          : [],
+      ),
+    ];
     const total = typeof found.total === "number" ? found.total : 0;
     return {
       ok: false,
       reason: "not-found",
       detail: withAttempts(
         found.reason === "read-only"
-          ? `Cloudflare offers no writable Browser Rendering permission here. Found: ${seen.join(", ")}.`
-          : `No Browser Rendering permission exists on this Cloudflare account. Read ${total} permission groups, none matching.`,
+          ? `Cloudflare offers no writable browser permission here. Found: ${seen.join(", ")}.`
+          : `No browser permission exists on this Cloudflare account. Read ${total} permission groups, none matching.`,
       ),
     };
   }
@@ -391,17 +404,21 @@ export async function cloudflareBrowserPermissionGroup(
       (entry): entry is { id: string; name: string } =>
         typeof entry.id === "string" && typeof entry.name === "string",
     )
-    .filter((entry) => /browser rendering/i.test(entry.name));
+    // Cloudflare names the groups "Browser Run Read" and "Browser Run Write".
+    // Matching "browser rendering", the product's name in the docs, found
+    // nothing and reported the account as lacking a capability it has.
+    .filter((entry) => /browser|render/i.test(entry.name));
   // "Edit" and "Write" are the same idea under two names across Cloudflare's
   // own surfaces, and a read-only group cannot start a browser, so the writable
   // one is required rather than merely preferred.
-  const writable = named.find((entry) => /edit|write/i.test(entry.name));
+  const writes = named.filter((entry) => /edit|write/i.test(entry.name));
+  const writable = writes.find((entry) => /browser/i.test(entry.name)) || writes[0];
   if (!writable) {
     return {
       reason: "not-found",
       detail: named.length
-        ? "Cloudflare offers no writable Browser Rendering permission for this account"
-        : "Browser Rendering is not available on this Cloudflare account",
+        ? `Cloudflare offers no writable browser permission for this account. Found: ${named.map((entry) => entry.name).join(", ")}`
+        : "No browser permission is available on this Cloudflare account",
     };
   }
   return writable;

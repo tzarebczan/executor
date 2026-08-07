@@ -137,78 +137,113 @@ async function probeCloudflare(
   }
   const headers = { authorization: `Bearer ${token}` };
 
-  // The browser endpoint is the check, rather than a generic token-validity
-  // call, because it is the only one every token that should pass here can
-  // answer. Cloudflare issues API tokens at user scope and at account scope,
-  // and /user/tokens/verify rejects an account-scoped token with a 401 that is
-  // indistinguishable from a revoked credential. A token minted for this
-  // plugin is account-scoped, so validating it that way called every good
-  // token invalid. Reading /accounts/{id} to prove scope has the same flaw
-  // from the other side: a token holding Browser Rendering alone has no
-  // Account Settings Read and answers 403.
+  // Two checks with deliberately different authority.
+  //
+  // Validity may reject a credential, because Cloudflare documents an endpoint
+  // whose whole job is answering it, at both scopes a token can be issued at.
+  // Capability may only confirm one. Every rejection this probe has produced
+  // wrongly came from reading one endpoint's refusal as a verdict on the
+  // token: /user/tokens/verify 401s on an account-scoped token, /accounts/{id}
+  // 403s on a token holding Browser Rendering alone, and the browser route
+  // used here is not in Cloudflare's published API at all. An endpoint this
+  // code is unsure about must not be able to fail a working setup.
+  const validity = await verifyCloudflareToken(fetchImpl, accountId, headers, timeoutMs);
+  if ("networkError" in validity) return unreachable(validity.networkError, "the Cloudflare API");
+  if (validity.valid === false) {
+    return {
+      ok: false,
+      reason: "auth",
+      detail: `Cloudflare rejected the API token (401)${validity.detail}`,
+      hint:
+        `The token is invalid, expired, revoked, or was issued for an account other than ${accountId}. ` +
+        CLOUDFLARE_TOKEN_HINT,
+    };
+  }
+
   const limits = await requestJson(
     fetchImpl,
     `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}/browser-rendering/limits`,
     { method: "GET", headers },
     timeoutMs,
   );
-  if ("networkError" in limits) return unreachable(limits.networkError, "the Cloudflare API");
-  if (limits.status < 400) {
-    return {
-      ok: true,
-      detail: "Token valid; Browser Rendering permission confirmed",
-      permissionVerified: true,
-    };
-  }
-  if (limits.status === 401) {
-    return {
-      ok: false,
-      reason: "auth",
-      detail: "Cloudflare rejected the API token (401)",
-      hint: "The token is invalid, expired, or revoked. " + CLOUDFLARE_TOKEN_HINT,
-    };
-  }
-  if (limits.status === 403) {
-    return {
-      ok: false,
-      reason: "permission",
-      detail: `Token lacks the Browser Rendering permission on account ${accountId}`,
-      hint: CLOUDFLARE_TOKEN_HINT,
-    };
-  }
-
-  // Anything else is inconclusive rather than a failure: the endpoint may be
-  // absent or renamed, and a wrong account ID looks the same from here. The
-  // account read only runs now, to tell those apart, and its own 403 is not
-  // held against a token that was never expected to have that permission.
-  const account = await requestJson(
-    fetchImpl,
-    `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}`,
-    { method: "GET", headers },
-    timeoutMs,
-  );
-  if ("networkError" in account) return unreachable(account.networkError, "the Cloudflare API");
-  if (account.status === 401) {
-    return {
-      ok: false,
-      reason: "auth",
-      detail: "Cloudflare rejected the API token (401)",
-      hint: "The token is invalid, expired, or revoked. " + CLOUDFLARE_TOKEN_HINT,
-    };
-  }
-  if (account.status === 404) {
-    return {
-      ok: false,
-      reason: "config",
-      detail: `Cloudflare account ${accountId} was not found`,
-      hint: "Check the account ID on your Cloudflare dashboard overview page.",
-    };
+  if (!("networkError" in limits)) {
+    if (limits.status < 400) {
+      return {
+        ok: true,
+        detail: "Token valid; Browser Rendering permission confirmed",
+        permissionVerified: true,
+      };
+    }
+    // A 403 on a token Cloudflare has just confirmed is valid is a permission
+    // answer whatever this path is: a route that does not exist answers 404.
+    if (limits.status === 403 && validity.valid) {
+      return {
+        ok: false,
+        reason: "permission",
+        detail: `Token is valid but lacks the Browser Rendering permission on account ${accountId}${cloudflareErrors(limits.body)}`,
+        hint: CLOUDFLARE_TOKEN_HINT,
+      };
+    }
   }
   return {
     ok: true,
-    detail: `Token accepted; Browser Rendering permission not confirmed (Cloudflare returned ${limits.status})`,
+    detail: validity.valid
+      ? "Token valid for this account; Browser Rendering permission not confirmed until first use"
+      : "Token accepted; Browser Rendering permission not confirmed until first use",
     permissionVerified: false,
   };
+}
+
+/**
+ * Whether Cloudflare accepts this token at all.
+ *
+ * Asked at both scopes because Cloudflare issues API tokens as user-owned and
+ * as account-owned, and each verify route rejects the other kind with the same
+ * 401 a revoked token gets. Only a refusal from both is evidence about the
+ * credential; one refusal is evidence about the route.
+ *
+ * `valid: null` means neither route gave a usable answer, which is not held
+ * against the token.
+ */
+async function verifyCloudflareToken(
+  fetchImpl: typeof globalThis.fetch,
+  accountId: string,
+  headers: Record<string, string>,
+  timeoutMs: number,
+): Promise<{ valid: boolean | null; detail: string } | { networkError: string }> {
+  const routes = [
+    `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(accountId)}/tokens/verify`,
+    "https://api.cloudflare.com/client/v4/user/tokens/verify",
+  ];
+  const seen: string[] = [];
+  let rejected = 0;
+  for (const url of routes) {
+    const result = await requestJson(fetchImpl, url, { method: "GET", headers }, timeoutMs);
+    if ("networkError" in result) return result;
+    seen.push(`${url.includes("/user/") ? "user" : "account"} -> ${result.status}`);
+    if (result.status < 400) return { valid: true, detail: "" };
+    if (result.status === 401) {
+      rejected += 1;
+      seen[seen.length - 1] += cloudflareErrors(result.body);
+    }
+  }
+  return {
+    valid: rejected === routes.length ? false : null,
+    detail: ` (${seen.join(", ")})`,
+  };
+}
+
+/** Cloudflare's own error codes and messages, which say more than the status. */
+function cloudflareErrors(body: Record<string, unknown>): string {
+  const errors = Array.isArray(body.errors) ? body.errors : [];
+  const text = errors
+    .map((entry) => entry as { code?: unknown; message?: unknown })
+    .map((entry) =>
+      [entry.code, entry.message].filter((part) => part !== undefined && part !== null).join(": "),
+    )
+    .filter((entry) => entry.length > 0)
+    .join("; ");
+  return text ? `: ${text}` : "";
 }
 
 async function probeBrowserUse(

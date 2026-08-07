@@ -44,7 +44,8 @@ import {
   browserProviderName,
   LOCAL_BROWSER_CONFIG,
   parseBrowserIntegrationConfig,
-  targetIsBounded,
+  approvalIsSessionScoped,
+  sessionApprovalScope,
   type BrowserIntegrationConfig,
 } from "./integration-config";
 import { CLOUD_BROWSER_PROVIDERS } from "./cloud-providers";
@@ -63,6 +64,7 @@ import {
 } from "./provider-probe";
 import {
   classifyRemoteBrowserFailure,
+  DEFAULT_IDLE_TIMEOUT_MS,
   getRemoteBrowserSession,
   getRemoteBrowserFailure,
   listRemoteBrowserSessions,
@@ -340,7 +342,7 @@ export function remoteCatalogResult(
   const names = remoteAdvancedAllowed(config)
     ? BROWSER_TOOL_NAMES
     : BROWSER_TOOL_NAMES.filter((name) => !isAdvancedBrowserTool(name));
-  const sessionScoped = targetIsBounded(config);
+  const sessionScoped = approvalIsSessionScoped(config);
   return {
     tools: [
       ...remoteSessionTools(config),
@@ -352,23 +354,21 @@ export function remoteCatalogResult(
 /**
  * The session tools, with the start prompt saying what it actually covers.
  *
- * On a bounded target one approval now stands in for every action in the
- * session, so the prompt has to name the hosts it is approving. Asking once for
- * something broader than the person understood is worse than asking often.
+ * Where one approval stands in for every action in the session, the prompt has
+ * to state its own scope. Asking once for something broader than the person
+ * understood is worse than asking often.
  */
 function remoteSessionTools(
   config: Exclude<BrowserIntegrationConfig, { provider: "local-extension" }>,
 ): readonly ToolDef[] {
-  const hosts = config.allowedHosts || [];
-  if (!hosts.length) return REMOTE_SESSION_TOOLS;
+  if (!approvalIsSessionScoped(config)) return REMOTE_SESSION_TOOLS;
+  const minutes = Math.round((config.idleTimeoutMs || DEFAULT_IDLE_TIMEOUT_MS) / 60_000);
   return REMOTE_SESSION_TOOLS.map((tool) =>
     String(tool.name) === "session_start"
       ? {
           ...tool,
           annotations: approval(
-            `Start a remote browser session limited to ${hosts.join(", ")}. Browsing inside those hosts will not ask again${
-              config.allowPrivateNetwork ? ", and this target may reach private addresses" : ""
-            }.`,
+            `Start a remote browser session ${sessionApprovalScope(config)}. Browsing will not ask again until the session closes, which happens after ${minutes} minute${minutes === 1 ? "" : "s"} idle.`,
           ),
         }
       : tool,
@@ -866,6 +866,7 @@ function browserConfigFromInput(
     ...(input.allowAdvanced === undefined ? {} : { allowAdvanced: input.allowAdvanced }),
     ...(hosts.length ? { allowedHosts: hosts } : {}),
     ...(input.allowPrivateNetwork ? { allowPrivateNetwork: true } : {}),
+    ...(input.fullAccess ? { fullAccess: true } : {}),
   };
   switch (input.provider) {
     case "vercel-sandbox": {

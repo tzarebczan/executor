@@ -15,6 +15,8 @@ import {
   validateInnerCall,
 } from "./server";
 import { browserToolCatalogName } from "./protocol";
+import { checkRemoteUrl } from "./host-policy";
+import { hostPolicyFor } from "./integration-config";
 import type { BridgeSession } from "./store";
 
 const catalogByName = new Map(BROWSER_TOOL_CATALOG.map((entry) => [String(entry.name), entry]));
@@ -216,6 +218,33 @@ describe("approval scope follows what bounds the target", () => {
     // The session approval is still required, and still says what it covers.
     expect(asks(bounded, "session_start")).toBe(true);
     expect(JSON.stringify(entry(bounded, "session_start")?.annotations)).toContain("example.com");
+  });
+
+  it("lets an unbounded target trade per-action prompts for one, when asked to", () => {
+    // The same idea as the extension's full-access mode. What makes per-action
+    // approval necessary is not knowing where the browser will be sent, and
+    // someone who has decided they do not need to know each time should be able
+    // to say so once rather than clicking through prompts they no longer read.
+    const trusted = { ...target, fullAccess: true };
+    expect(asks(trusted, browserToolCatalogName("click"))).toBe(false);
+    expect(asks(trusted, "session_start")).toBe(true);
+  });
+
+  it("says plainly that an unbounded session covers anywhere", () => {
+    // The prompt has to state its own scope. Asking once for something broader
+    // than the person understood is worse than asking often.
+    const prompt = JSON.stringify(entry({ ...target, fullAccess: true }, "session_start"));
+    expect(prompt).toContain("any public site");
+    // And that it is not permanent.
+    expect(prompt).toContain("idle");
+  });
+
+  it("keeps refusing private addresses on a target trusted for public browsing", () => {
+    // Trust here is about not being asked each time, not about where it may go.
+    expect(
+      checkRemoteUrl("http://169.254.169.254/", hostPolicyFor({ ...target, fullAccess: true }))
+        .allowed,
+    ).toBe(false);
   });
 
   it("keeps asking for sensitive tools even on a bounded target", () => {

@@ -47,6 +47,21 @@ type RemoteTargetControls = {
    * and pair it with an allowlist.
    */
   readonly allowPrivateNetwork?: boolean;
+  /**
+   * Approve the session instead of every action, on a target with no allowlist.
+   *
+   * The local extension has the same idea as its "full access" mode, and the
+   * same reason to allow it: what makes per-action approval necessary is not
+   * knowing where the browser will be sent, and someone who has decided they do
+   * not need to know each time should be able to say so once rather than
+   * clicking through prompts they have stopped reading.
+   *
+   * It is not a permanent grant. Approval is asked at session start, and a
+   * session is closed once it has been idle for `idleTimeoutMs`, so the next
+   * one asks again. Private addresses are still refused, and sensitive tools
+   * still ask.
+   */
+  readonly fullAccess?: boolean;
 };
 
 export type BrowserIntegrationConfig =
@@ -114,6 +129,7 @@ function remoteControls(config: Record<string, unknown>): RemoteTargetControls {
     ...(typeof config.allowAdvanced === "boolean" ? { allowAdvanced: config.allowAdvanced } : {}),
     ...(hosts.length ? { allowedHosts: hosts } : {}),
     ...(config.allowPrivateNetwork === true ? { allowPrivateNetwork: true } : {}),
+    ...(config.fullAccess === true ? { fullAccess: true } : {}),
   };
 }
 
@@ -135,6 +151,31 @@ export function hostPolicyFor(config: BrowserIntegrationConfig): RemoteHostPolic
 /** Whether a target is held to a named set of hosts. */
 export function targetIsBounded(config: BrowserIntegrationConfig): boolean {
   return config.provider !== "local-extension" && (config.allowedHosts?.length || 0) > 0;
+}
+
+/**
+ * Whether approving the session stands in for approving each action.
+ *
+ * True by two different routes, which are worth keeping distinct. A bounded
+ * target earns it: the destinations are known in advance, so there is nothing
+ * left for a per-action prompt to decide. An unbounded one is granted it: the
+ * destinations are not known, and someone has said they do not need to see each
+ * one. Both are session-scoped and both name their scope at the prompt.
+ */
+export function approvalIsSessionScoped(config: BrowserIntegrationConfig): boolean {
+  if (config.provider === "local-extension") return false;
+  return targetIsBounded(config) || config.fullAccess === true;
+}
+
+/** What a session approval is actually agreeing to, in one phrase. */
+export function sessionApprovalScope(config: BrowserIntegrationConfig): string {
+  if (config.provider === "local-extension") return "";
+  const hosts = config.allowedHosts || [];
+  const where = hosts.length ? `limited to ${hosts.join(", ")}` : "able to visit any public site";
+  const privately = config.allowPrivateNetwork
+    ? ", including private addresses on your network"
+    : "";
+  return `${where}${privately}`;
 }
 
 export function parseBrowserIntegrationConfig(value: unknown): BrowserIntegrationConfig | null {

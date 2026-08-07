@@ -332,6 +332,7 @@ function ProviderForm({
   const [recording, setRecording] = useState(false);
   const [allowAdvanced, setAllowAdvanced] = useState(true);
   const [allowPrivateNetwork, setAllowPrivateNetwork] = useState(false);
+  const [fullAccess, setFullAccess] = useState(false);
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [reuse, setReuse] = useState<ReusableCredentialView | null>(null);
   const [mint, setMint] = useState<ReusableCredentialView | null>(null);
@@ -381,6 +382,7 @@ function ProviderForm({
         .map((host) => host.trim())
         .filter(Boolean),
       allowPrivateNetwork,
+      fullAccess,
       ...(reuse ? { reuseIntegration: reuse.integration, reuseConnection: reuse.connection } : {}),
       ...(mint ? { mintIntegration: mint.integration, mintConnection: mint.connection } : {}),
     };
@@ -596,6 +598,22 @@ function ProviderForm({
               instead of once per click.
             </p>
           </div>
+          <Label htmlFor="browser-full-access" className="mt-3 flex items-start gap-2 text-sm">
+            <Checkbox
+              id="browser-full-access"
+              checked={fullAccess}
+              onCheckedChange={(checked) => setFullAccess(checked === true)}
+            />
+            <span>
+              Approve once per session
+              <span className="block text-xs font-normal text-muted-foreground">
+                Stops the prompt on every click. With no allowed-hosts list this browser may visit
+                any public site, so approving the session approves wherever it goes. Private
+                addresses are still refused, Advanced tools still ask, and you are asked again once
+                the session closes. Naming hosts above does this on its own.
+              </span>
+            </span>
+          </Label>
           <Label htmlFor="browser-allow-private" className="mt-3 flex items-start gap-2 text-sm">
             <Checkbox
               id="browser-allow-private"

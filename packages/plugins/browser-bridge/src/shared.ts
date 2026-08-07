@@ -131,6 +131,11 @@ export const AddBrowserProviderPayload = Schema.Struct({
   allowedHosts: Schema.optional(Schema.Array(Schema.String)),
   /** Let this target reach private and link-local addresses. Off by default. */
   allowPrivateNetwork: Schema.optional(Schema.Boolean),
+  /**
+   * Approve the session rather than every action, on a target with no
+   * allowlist. Re-asked when the session closes.
+   */
+  fullAccess: Schema.optional(Schema.Boolean),
   vcpus: Schema.optional(Schema.Number),
   keepAliveMs: Schema.optional(Schema.Number),
   timeoutMinutes: Schema.optional(Schema.Number),

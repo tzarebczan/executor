@@ -54,36 +54,60 @@ export function cloudflareMintScript(options: {
   const account = options.accountId ? JSON.stringify(options.accountId) : "accountId";
   const label = JSON.stringify(options.label);
   return `async () => {
-  const groups = await cloudflare.request({
-    method: "GET",
-    path: "/user/tokens/permission_groups",
-    query: { per_page: 200 },
-  });
-  const all = Array.isArray(groups.result) ? groups.result : [];
-  const browser = all.filter((g) => /browser rendering/i.test(String(g && g.name)));
-  const group = browser.find((g) => /edit|write/i.test(String(g.name)));
+  const account = ${account};
+  const attempts = [];
+  const tryRequest = async (options) => {
+    try {
+      const response = await cloudflare.request(options);
+      attempts.push(options.method + " " + options.path + " -> " + response.status);
+      return response;
+    } catch (error) {
+      attempts.push(options.method + " " + options.path + " threw " + String(error && error.message || error));
+      return null;
+    }
+  };
+
+  // Cloudflare owns API tokens at two scopes. An account-scoped MCP grant can
+  // usually reach the account route and not the user route, so both are tried
+  // rather than assuming which one this grant covers.
+  const groupRoutes = [
+    "/accounts/" + account + "/tokens/permission_groups",
+    "/user/tokens/permission_groups",
+  ];
+  let group = null;
+  let seen = [];
+  for (const path of groupRoutes) {
+    const response = await tryRequest({ method: "GET", path, query: { per_page: 200 } });
+    const all = response && Array.isArray(response.result) ? response.result : [];
+    const browser = all.filter((g) => /browser rendering/i.test(String(g && g.name)));
+    if (browser.length) seen = browser.map((g) => g.name);
+    const writable = browser.find((g) => /edit|write/i.test(String(g.name)));
+    if (writable) { group = writable; break; }
+  }
   if (!group) {
-    return { minted: false, reason: browser.length ? "read-only" : "unavailable",
-             seen: browser.map((g) => g.name) };
+    return { minted: false, reason: seen.length ? "read-only" : "unavailable",
+             seen, attempts };
   }
-  const created = await cloudflare.request({
-    method: "POST",
-    path: "/user/tokens",
-    body: {
-      name: ${label},
-      policies: [{
-        effect: "allow",
-        resources: { ["com.cloudflare.api.account." + ${account}]: "*" },
-        permission_groups: [{ id: group.id }],
-      }],
-    },
-  });
-  if (!created.success || !created.result || !created.result.value) {
-    return { minted: false, reason: "rejected", status: created.status,
-             errors: created.errors, permission: group.name };
+
+  const body = {
+    name: ${label},
+    policies: [{
+      effect: "allow",
+      resources: { ["com.cloudflare.api.account." + account]: "*" },
+      permission_groups: [{ id: group.id }],
+    }],
+  };
+  for (const path of ["/accounts/" + account + "/tokens", "/user/tokens"]) {
+    const created = await tryRequest({ method: "POST", path, body });
+    if (created && created.success && created.result && created.result.value) {
+      return { minted: true, token: created.result.value, permission: group.name,
+               accountId: account, attempts };
+    }
+    if (created && created.errors && created.errors.length) {
+      seen = created.errors;
+    }
   }
-  return { minted: true, token: created.result.value, permission: group.name,
-           accountId: ${account} };
+  return { minted: false, reason: "rejected", errors: seen, permission: group.name, attempts };
 }`;
 }
 
@@ -127,12 +151,19 @@ export function readMintScriptResult(raw: unknown): MintOutcome {
         .filter((message): message is string => typeof message === "string")
         .join("; ")
     : "";
+  // The routes it tried, with their statuses. Cloudflare owns API tokens at two
+  // scopes and a grant may reach one and not the other, so "it was refused" is
+  // only actionable alongside which endpoint refused it.
+  const attempts = Array.isArray(found.attempts)
+    ? found.attempts.filter((entry): entry is string => typeof entry === "string").join(", ")
+    : "";
+  const base =
+    errors ||
+    "Cloudflare refused to create the token. The MCP connection may not carry the API Tokens Write permission.";
   return {
     ok: false,
     reason: "permission",
-    detail:
-      errors ||
-      "Cloudflare refused to create the token. The MCP connection may not carry the API Tokens Write permission.",
+    detail: attempts ? `${base} (tried ${attempts})` : base,
   };
 }
 
@@ -142,6 +173,7 @@ type MintPayload = {
   reason?: unknown;
   permission?: unknown;
   errors?: unknown;
+  attempts?: unknown;
 };
 
 /**

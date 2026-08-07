@@ -13,8 +13,23 @@ describe("cloudflareMintScript", () => {
   it("scopes the policy to a named account", () => {
     const code = cloudflareMintScript({ accountId: "acct_9", label: "Lab" });
 
-    expect(code).toContain('"com.cloudflare.api.account." + "acct_9"');
+    expect(code).toContain('const account = "acct_9"');
+    expect(code).toContain('"com.cloudflare.api.account." + account');
     expect(code).toContain('name: "Lab"');
+  });
+
+  it("tries both token scopes, since a grant may reach one and not the other", () => {
+    // Cloudflare owns API tokens at user scope and at account scope. An
+    // account-scoped MCP grant typically cannot touch /user/tokens, and
+    // assuming either one made the mint fail on a route it never had.
+    const code = cloudflareMintScript({ accountId: "acct_9", label: "Lab" });
+
+    expect(code).toContain('"/accounts/" + account + "/tokens/permission_groups"');
+    expect(code).toContain('"/user/tokens/permission_groups"');
+    expect(code).toContain('"/accounts/" + account + "/tokens"');
+    // The routes it tried come back with the result, so a refusal names the
+    // endpoint that refused rather than only that something did.
+    expect(code).toContain("attempts");
   });
 
   it("defers to the account the MCP grant already covers when none is named", () => {
@@ -23,8 +38,11 @@ describe("cloudflareMintScript", () => {
     // and mint a token scoped to nothing, which fails much later as a 403.
     const code = cloudflareMintScript({ accountId: "", label: "Lab" });
 
-    expect(code).toContain('"com.cloudflare.api.account." + accountId');
-    expect(code).not.toContain('+ ""');
+    // `accountId` unquoted is the tool's own binding; quoting it would name a
+    // variable that does not exist, and an empty string would scope the policy
+    // resource to nothing.
+    expect(code).toContain("const account = accountId;");
+    expect(code).not.toContain('const account = "";');
   });
 });
 

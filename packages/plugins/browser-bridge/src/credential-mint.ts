@@ -76,17 +76,31 @@ export function cloudflareMintScript(options: {
   ];
   let group = null;
   let seen = [];
+  // Tracked separately from the group search: an empty list because the route
+  // was refused is not evidence the account lacks Browser Rendering, and
+  // reporting it as such sends someone to check a plan that is fine.
+  let readAny = false;
+  let total = 0;
   for (const path of groupRoutes) {
     const response = await tryRequest({ method: "GET", path, query: { per_page: 200 } });
     const all = response && Array.isArray(response.result) ? response.result : [];
-    const browser = all.filter((g) => /browser rendering/i.test(String(g && g.name)));
+    if (all.length) { readAny = true; total += all.length; }
+    // Widened from "browser rendering": Cloudflare names these groups itself
+    // and a near miss ("Workers Browser Rendering") would otherwise read as an
+    // account without the capability.
+    const browser = all.filter((g) => /browser|render/i.test(String(g && g.name)));
     if (browser.length) seen = browser.map((g) => g.name);
-    const writable = browser.find((g) => /edit|write/i.test(String(g.name)));
+    const writable = browser.find(
+      (g) => /render/i.test(String(g.name)) && /edit|write/i.test(String(g.name)),
+    );
     if (writable) { group = writable; break; }
   }
   if (!group) {
-    return { minted: false, reason: seen.length ? "read-only" : "unavailable",
-             seen, attempts };
+    return {
+      minted: false,
+      reason: !readAny ? "unreadable" : seen.length ? "read-only" : "unavailable",
+      seen, total, attempts,
+    };
   }
 
   const body = {
@@ -135,36 +149,51 @@ export function readMintScriptResult(raw: unknown): MintOutcome {
       detail: `Created a Cloudflare token scoped to ${String(found.permission || "Browser Rendering")} on this account`,
     };
   }
+  // The routes it tried, with their statuses. Cloudflare owns API tokens at two
+  // scopes and a grant may reach one and not the other, so any failure here is
+  // only actionable alongside which endpoint answered what. Appended to every
+  // branch, not just the last: the earlier ones are the likelier to be wrong.
+  const attempts = Array.isArray(found.attempts)
+    ? found.attempts.filter((entry): entry is string => typeof entry === "string").join(", ")
+    : "";
+  const withAttempts = (text: string) => (attempts ? `${text} (tried ${attempts})` : text);
+
+  if (found.reason === "unreadable") {
+    return {
+      ok: false,
+      reason: "permission",
+      detail: withAttempts(
+        "Could not read Cloudflare's permission list through this MCP connection, so no token was created.",
+      ),
+    };
+  }
   if (found.reason === "unavailable" || found.reason === "read-only") {
+    const seen = Array.isArray(found.seen)
+      ? found.seen.filter((entry): entry is string => typeof entry === "string")
+      : [];
+    const total = typeof found.total === "number" ? found.total : 0;
     return {
       ok: false,
       reason: "not-found",
-      detail:
+      detail: withAttempts(
         found.reason === "read-only"
-          ? "Cloudflare offers no writable Browser Rendering permission for this account"
-          : "Browser Rendering is not available on this Cloudflare account",
+          ? `Cloudflare offers no writable Browser Rendering permission here. Found: ${seen.join(", ")}.`
+          : `No Browser Rendering permission exists on this Cloudflare account. Read ${total} permission groups, none matching.`,
+      ),
     };
   }
   const errors = Array.isArray(found.errors)
     ? found.errors
-        .map((entry) => (entry as { message?: unknown })?.message)
+        .map((entry) =>
+          typeof entry === "string" ? entry : (entry as { message?: unknown })?.message,
+        )
         .filter((message): message is string => typeof message === "string")
         .join("; ")
-    : "";
-  // The routes it tried, with their statuses. Cloudflare owns API tokens at two
-  // scopes and a grant may reach one and not the other, so "it was refused" is
-  // only actionable alongside which endpoint refused it.
-  const attempts = Array.isArray(found.attempts)
-    ? found.attempts.filter((entry): entry is string => typeof entry === "string").join(", ")
     : "";
   const base =
     errors ||
     "Cloudflare refused to create the token. The MCP connection may not carry the API Tokens Write permission.";
-  return {
-    ok: false,
-    reason: "permission",
-    detail: attempts ? `${base} (tried ${attempts})` : base,
-  };
+  return { ok: false, reason: "permission", detail: withAttempts(base) };
 }
 
 type MintPayload = {
@@ -174,6 +203,8 @@ type MintPayload = {
   permission?: unknown;
   errors?: unknown;
   attempts?: unknown;
+  seen?: unknown;
+  total?: unknown;
 };
 
 /**

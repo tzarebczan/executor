@@ -88,14 +88,53 @@ describe("readMintScriptResult", () => {
   });
 
   it("distinguishes a read-only permission from an absent one", () => {
-    expect(readMintScriptResult({ minted: false, reason: "read-only" })).toMatchObject({
-      ok: false,
-      reason: "not-found",
+    expect(
+      readMintScriptResult({
+        minted: false,
+        reason: "read-only",
+        seen: ["Browser Rendering Read"],
+      }),
+    ).toMatchObject({ ok: false, reason: "not-found" });
+    expect(
+      readMintScriptResult({ minted: false, reason: "unavailable", total: 180 }),
+    ).toMatchObject({ ok: false, reason: "not-found" });
+  });
+
+  it("does not blame the account when the permission list could not be read", () => {
+    // An empty list because both routes were refused is not evidence that
+    // Browser Rendering is unavailable. Reporting it that way sent someone to
+    // check a Cloudflare plan that was never the problem.
+    const outcome = readMintScriptResult({
+      minted: false,
+      reason: "unreadable",
+      attempts: ["GET /accounts/a/tokens/permission_groups -> 403"],
     });
-    expect(readMintScriptResult({ minted: false, reason: "unavailable" })).toMatchObject({
-      ok: false,
-      reason: "not-found",
+
+    expect(outcome.ok).toBe(false);
+    if (outcome.ok) return;
+    expect(outcome.reason).toBe("permission");
+    expect(outcome.detail).toContain("Could not read");
+    expect(outcome.detail).toContain("403");
+  });
+
+  it("names the routes it tried on every failure, not just the last one", () => {
+    const attempts = ["GET /accounts/a/tokens/permission_groups -> 200"];
+    const unavailable = readMintScriptResult({
+      minted: false,
+      reason: "unavailable",
+      total: 180,
+      attempts,
     });
+    const readOnly = readMintScriptResult({
+      minted: false,
+      reason: "read-only",
+      seen: ["Browser Rendering Read"],
+      attempts,
+    });
+
+    expect(unavailable.detail).toContain("tried GET /accounts/a/tokens/permission_groups -> 200");
+    expect(unavailable.detail).toContain("180");
+    expect(readOnly.detail).toContain("Browser Rendering Read");
   });
 
   it("reads JSON out of a markdown fence, or with prose in front of it", () => {

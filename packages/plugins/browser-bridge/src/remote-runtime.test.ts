@@ -128,6 +128,41 @@ describe("remote browser runtime", () => {
     vi.clearAllMocks();
   });
 
+  it("refuses a host outside the allowlist without starting a browser", async () => {
+    // Checked before the session, so a refused call does not open a billable
+    // browser on its way to being turned down.
+    const config = {
+      provider: "vercel-sandbox" as const,
+      allowedHosts: ["example.com"],
+    };
+
+    await expect(
+      runRemoteBrowserTool({
+        key: "vercel:bounded",
+        config,
+        credential: "token",
+        tool: "navigate",
+        args: { url: "https://elsewhere.test/" },
+      }),
+    ).rejects.toThrow(/elsewhere.test/);
+    expect(createCloudBrowserSession).not.toHaveBeenCalled();
+  });
+
+  it("refuses cloud metadata even on a target with no allowlist", async () => {
+    // The default posture. Most targets will never set an allowlist, and this
+    // is the address that turns a browser into a credential thief.
+    await expect(
+      runRemoteBrowserTool({
+        key: "vercel:open",
+        config: { provider: "vercel-sandbox" as const },
+        credential: "token",
+        tool: "tabs.open",
+        args: { url: "http://169.254.169.254/latest/meta-data/" },
+      }),
+    ).rejects.toThrow(/link-local/);
+    expect(createCloudBrowserSession).not.toHaveBeenCalled();
+  });
+
   it("maps Vercel string tab ids and snapshot refs to the typed browser protocol", async () => {
     mocks.exec.mockImplementation(
       async (command: string, options?: { args?: readonly string[] }) => {

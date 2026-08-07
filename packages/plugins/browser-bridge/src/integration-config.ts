@@ -3,6 +3,7 @@
 import type { AuthMethodDescriptor } from "@executor-js/sdk/shared";
 
 import type { CloudBrowserProvider } from "./cloud-providers";
+import { normalizeHost, type RemoteHostPolicy } from "./host-policy";
 
 export type BrowserProvider = "local-extension" | CloudBrowserProvider;
 
@@ -27,6 +28,25 @@ type RemoteTargetControls = {
    * them from the catalog entirely.
    */
   readonly allowAdvanced?: boolean;
+  /**
+   * The hosts this target may reach. Empty means any public host.
+   *
+   * The local extension has had this since it existed; a remote target had
+   * nothing, so the only limit on where it could be sent was a person
+   * approving each action one at a time. Setting it is also what lets those
+   * approvals collapse into one per session, since a bounded target no longer
+   * needs a human reading every URL.
+   */
+  readonly allowedHosts?: readonly string[];
+  /**
+   * Whether this target may reach private and link-local addresses.
+   *
+   * Off unless asked for. A browser that can be pointed at an address is a
+   * request forger, and `169.254.169.254` hands out cloud credentials to
+   * anything that asks. Turn it on only for a target aimed at an internal app,
+   * and pair it with an allowlist.
+   */
+  readonly allowPrivateNetwork?: boolean;
 };
 
 export type BrowserIntegrationConfig =
@@ -83,10 +103,38 @@ export const LOCAL_BROWSER_CONFIG: BrowserIntegrationConfig = {
 };
 
 function remoteControls(config: Record<string, unknown>): RemoteTargetControls {
+  const hosts = Array.isArray(config.allowedHosts)
+    ? config.allowedHosts
+        .filter((host): host is string => typeof host === "string")
+        .map(normalizeHost)
+        .filter(Boolean)
+    : [];
   return {
     ...(typeof config.idleTimeoutMs === "number" ? { idleTimeoutMs: config.idleTimeoutMs } : {}),
     ...(typeof config.allowAdvanced === "boolean" ? { allowAdvanced: config.allowAdvanced } : {}),
+    ...(hosts.length ? { allowedHosts: hosts } : {}),
+    ...(config.allowPrivateNetwork === true ? { allowPrivateNetwork: true } : {}),
   };
+}
+
+/**
+ * The access policy for a target, in the shape the host check takes.
+ *
+ * The local extension carries its own policy in its own settings, so it never
+ * reaches here; a config with no remote controls is treated as unbounded,
+ * which is what an existing target that predates this field is.
+ */
+export function hostPolicyFor(config: BrowserIntegrationConfig): RemoteHostPolicy {
+  if (config.provider === "local-extension") return {};
+  return {
+    ...(config.allowedHosts ? { allowedHosts: config.allowedHosts } : {}),
+    ...(config.allowPrivateNetwork ? { allowPrivateNetwork: true } : {}),
+  };
+}
+
+/** Whether a target is held to a named set of hosts. */
+export function targetIsBounded(config: BrowserIntegrationConfig): boolean {
+  return config.provider !== "local-extension" && (config.allowedHosts?.length || 0) > 0;
 }
 
 export function parseBrowserIntegrationConfig(value: unknown): BrowserIntegrationConfig | null {

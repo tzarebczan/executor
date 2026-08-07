@@ -331,6 +331,7 @@ function ProviderForm({
   const [error, setError] = useState<string | null>(null);
   const [recording, setRecording] = useState(false);
   const [allowAdvanced, setAllowAdvanced] = useState(true);
+  const [allowPrivateNetwork, setAllowPrivateNetwork] = useState(false);
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [reuse, setReuse] = useState<ReusableCredentialView | null>(null);
   const [mint, setMint] = useState<ReusableCredentialView | null>(null);
@@ -374,6 +375,12 @@ function ProviderForm({
       proxyCountryCode: text("proxyCountryCode"),
       enableRecording: recording,
       allowAdvanced,
+      // Comma or whitespace separated, because both are what people type.
+      allowedHosts: (text("allowedHosts") || "")
+        .split(/[\s,]+/)
+        .map((host) => host.trim())
+        .filter(Boolean),
+      allowPrivateNetwork,
       ...(reuse ? { reuseIntegration: reuse.integration, reuseConnection: reuse.connection } : {}),
       ...(mint ? { mintIntegration: mint.integration, mintConnection: mint.connection } : {}),
     };
@@ -574,6 +581,36 @@ function ProviderForm({
             An unused session is closed after the idle timeout so it stops costing money. The next
             browser call starts a fresh one, which does not keep open tabs or sign-ins.
           </p>
+          {/* Left blank on purpose by most people: a remote browser already
+              refuses private addresses, so nothing here is needed to be safe.
+              Naming hosts is what turns per-action approvals into one. */}
+          <div className="mt-3 grid gap-1.5">
+            <Field
+              name="allowedHosts"
+              label="Allowed hosts"
+              placeholder="example.com, docs.example.com — blank for any public site"
+            />
+            <p className="text-xs text-muted-foreground">
+              Covers subdomains. Private and link-local addresses are always refused unless you
+              allow them below. Name the hosts and this browser asks for approval once per session
+              instead of once per click.
+            </p>
+          </div>
+          <Label htmlFor="browser-allow-private" className="mt-3 flex items-start gap-2 text-sm">
+            <Checkbox
+              id="browser-allow-private"
+              checked={allowPrivateNetwork}
+              onCheckedChange={(checked) => setAllowPrivateNetwork(checked === true)}
+            />
+            <span>
+              Reach private addresses
+              <span className="block text-xs font-normal text-muted-foreground">
+                For a target pointed at an internal app. Requires an allowed-hosts list, because a
+                browser that can reach a private network and every public site is bounded by
+                nothing.
+              </span>
+            </span>
+          </Label>
           <Label htmlFor="browser-allow-advanced" className="mt-3 flex items-start gap-2 text-sm">
             <Checkbox
               id="browser-allow-advanced"

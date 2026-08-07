@@ -124,6 +124,13 @@ export const AddBrowserProviderPayload = Schema.Struct({
   idleTimeoutMinutes: Schema.optional(Schema.Number),
   /** Expose evaluate, pdf, console, network, dialogs, and viewport. Default true. */
   allowAdvanced: Schema.optional(Schema.Boolean),
+  /**
+   * Hosts this target may reach. Empty means any public host. Naming hosts is
+   * also what lets per-action approvals become one approval per session.
+   */
+  allowedHosts: Schema.optional(Schema.Array(Schema.String)),
+  /** Let this target reach private and link-local addresses. Off by default. */
+  allowPrivateNetwork: Schema.optional(Schema.Boolean),
   vcpus: Schema.optional(Schema.Number),
   keepAliveMs: Schema.optional(Schema.Number),
   timeoutMinutes: Schema.optional(Schema.Number),

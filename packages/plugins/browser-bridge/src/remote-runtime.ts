@@ -25,7 +25,8 @@ import {
   type BrowserToolName,
   type BrowserToolResult,
 } from "./protocol";
-import type { BrowserIntegrationConfig } from "./integration-config";
+import { hostPolicyFor, type BrowserIntegrationConfig } from "./integration-config";
+import { checkRemoteUrl, type RemoteHostPolicy } from "./host-policy";
 
 export interface RemoteBrowserSessionSummary {
   readonly key: string;
@@ -84,8 +85,12 @@ type DownloadEntry = {
 type CdpRuntime = {
   readonly browser: Browser;
   readonly context: BrowserContext;
+  /** Where this target may be sent. Enforced per page, as pages appear. */
+  readonly policy: RemoteHostPolicy;
   readonly pageIds: Map<Page, number>;
   readonly pagesById: Map<number, Page>;
+  /** Per-page policy installation, awaited before the page is used. */
+  readonly guards: Map<Page, Promise<void>>;
   readonly snapshotNodes: Map<
     number,
     { readonly url: string; readonly nodes: readonly BrowserSnapshotNode[] }
@@ -471,6 +476,69 @@ async function hydratedPageTab(runtime: CdpRuntime, page: Page): Promise<Browser
   return { ...tab, title: await page.title().catch(() => "") };
 }
 
+/**
+ * URL patterns for address space no browsing target should reach.
+ *
+ * Sent to the browser as a blocklist, which costs nothing per request, unlike
+ * interception. This is the protection every remote target gets, including the
+ * ones configured before an allowlist existed, and it is the half that matters:
+ * `169.254.169.254` hands out cloud credentials to whatever asks.
+ */
+const PRIVATE_URL_PATTERNS: readonly string[] = [
+  "*://localhost/*",
+  "*://localhost:*",
+  "*://127.*",
+  "*://10.*",
+  "*://192.168.*",
+  "*://169.254.*",
+  "*://[::1]*",
+  "*://[::ffff:*",
+  "*://[fc*",
+  "*://[fd*",
+  "*://[fe8*",
+  "*://metadata/*",
+  "*://*.internal/*",
+  "*://*.internal:*",
+  "*://*.local/*",
+  "*://*.local:*",
+  ...Array.from({ length: 16 }, (_, index) => `*://172.${16 + index}.*`),
+];
+
+/**
+ * Hold a page to the target's access policy.
+ *
+ * Two mechanisms, because they cost different amounts. A blocklist of private
+ * ranges is a single message to the browser and is applied always. An allowlist
+ * cannot be expressed that way, so it needs request interception, and that puts
+ * every request through this process; it is installed only for a target that
+ * asked to be bounded, which is a cost that target opted into.
+ *
+ * Interception covers what an argument check cannot: a click following a link,
+ * a redirect, a script setting location. Those never appear in a tool call.
+ */
+async function guardPage(runtime: CdpRuntime, page: Page): Promise<void> {
+  const policy = runtime.policy;
+  if (!policy.allowPrivateNetwork) {
+    const client = await page.createCDPSession();
+    await client.send("Network.enable");
+    await client.send("Network.setBlockedURLs", { urls: [...PRIVATE_URL_PATTERNS] });
+  }
+  if (!policy.allowedHosts?.length) return;
+  await page.setRequestInterception(true);
+  page.on("request", (request) => {
+    // Only the destination is judged. Refusing subresources would break most
+    // sites without bounding where the browser can be sent, which is the thing
+    // being controlled here.
+    if (!request.isNavigationRequest()) {
+      void request.continue().catch(() => {});
+      return;
+    }
+    const verdict = checkRemoteUrl(request.url(), policy);
+    if (verdict.allowed) void request.continue().catch(() => {});
+    else void request.abort("blockedbyclient").catch(() => {});
+  });
+}
+
 function registerPage(runtime: CdpRuntime, page: Page): number {
   const existing = runtime.pageIds.get(page);
   if (existing != null) return existing;
@@ -478,9 +546,22 @@ function registerPage(runtime: CdpRuntime, page: Page): number {
   runtime.pageIds.set(page, id);
   runtime.pagesById.set(id, page);
   runtime.activePageId ??= id;
+  // Applied to every page as it appears, including ones a site opens itself,
+  // since a target that opens a popup is exactly how a bounded browser would
+  // otherwise be walked out of its bounds.
+  //
+  // The promise is kept rather than discarded: `ensureGuarded` waits on it
+  // before any tool touches the page, so a policy that failed to install stops
+  // the page being used instead of quietly leaving it unguarded.
+  const guard = guardPage(runtime, page);
+  // Handled here only to keep an unawaited rejection quiet. `guard` itself
+  // still rejects for whoever awaits it.
+  guard.catch(() => {});
+  runtime.guards.set(page, guard);
   page.on("close", () => {
     runtime.pageIds.delete(page);
     runtime.pagesById.delete(id);
+    runtime.guards.delete(page);
     runtime.snapshotNodes.delete(id);
     if (runtime.activePageId === id)
       runtime.activePageId = runtime.pagesById.keys().next().value ?? null;
@@ -539,7 +620,10 @@ function registerPage(runtime: CdpRuntime, page: Page): number {
   return id;
 }
 
-async function connectCdp(handle: CloudBrowserHandle): Promise<CdpRuntime> {
+async function connectCdp(
+  handle: CloudBrowserHandle,
+  policy: RemoteHostPolicy,
+): Promise<CdpRuntime> {
   if (!handle.session.cdpUrl) throw new Error("Provider did not return a CDP endpoint");
   const endpoint = new URL(handle.session.cdpUrl);
   const browser = await puppeteer.connect({
@@ -551,10 +635,12 @@ async function connectCdp(handle: CloudBrowserHandle): Promise<CdpRuntime> {
   });
   const context = browser.defaultBrowserContext();
   const runtime: CdpRuntime = {
+    policy,
     browser,
     context,
     pageIds: new Map(),
     pagesById: new Map(),
+    guards: new Map(),
     snapshotNodes: new Map(),
     console: [],
     network: [],
@@ -633,7 +719,9 @@ async function createRemoteBrowserSession(
       vercelSnapshotRefs: new Map(),
       nextVercelTabId: 1,
       activeVercelTabId: null,
-      ...(handle.session.transport === "cdp" ? { cdp: await connectCdp(handle) } : {}),
+      ...(handle.session.transport === "cdp"
+        ? { cdp: await connectCdp(handle, hostPolicyFor(config)) }
+        : {}),
     };
     sessions.set(key, session);
     startReaper();
@@ -750,6 +838,17 @@ function navigationResult(page: Page, tabId: number, navigated: boolean) {
   return { ok: true as const, tabId, url: page.url(), ...(navigated ? { navigated } : {}) };
 }
 
+/**
+ * Wait for a page's access policy to be in place.
+ *
+ * Rethrows if installing it failed, so a page whose policy did not take is
+ * refused rather than used unguarded. A control that fails open is not one.
+ */
+async function ensureGuarded(runtime: CdpRuntime, page: Page): Promise<void> {
+  const guard = runtime.guards.get(page);
+  if (guard) await guard;
+}
+
 async function cdpPage(
   runtime: CdpRuntime,
   tabId?: number,
@@ -759,11 +858,13 @@ async function cdpPage(
     const page = await runtime.context.newPage();
     const newId = registerPage(runtime, page);
     runtime.activePageId = newId;
+    await ensureGuarded(runtime, page);
     return { page, tabId: newId };
   }
   const page = runtime.pagesById.get(id);
   if (!page) throw new Error(`Remote tab ${id} was not found`);
   runtime.activePageId = id;
+  await ensureGuarded(runtime, page);
   return { page, tabId: id };
 }
 
@@ -919,6 +1020,7 @@ async function runCdpTool<Name extends BrowserToolName>(
     const page = await runtime.context.newPage();
     const tabId = registerPage(runtime, page);
     if (input.active !== false) runtime.activePageId = tabId;
+    await ensureGuarded(runtime, page);
     await page.goto(input.url);
     return { ok: true, tab: await hydratedPageTab(runtime, page) } as BrowserToolResult<Name>;
   }
@@ -1549,6 +1651,25 @@ async function runVercelTool<Name extends BrowserToolName>(
   }
 }
 
+/**
+ * Refuse a call that names a host this target may not reach.
+ *
+ * The argument check is the one that produces a usable message, and it is the
+ * only check the agent-browser transport has: that provider runs a CLI, not a
+ * protocol this process can intercept. CDP targets get the network-level block
+ * as well, which is what covers a click, a redirect, or a script navigating
+ * somewhere no argument ever mentioned.
+ */
+function assertToolUrlsAllowed(tool: string, args: unknown, policy: RemoteHostPolicy): void {
+  const value = (args || {}) as { url?: unknown };
+  if (typeof value.url !== "string" || !value.url) return;
+  // `wait` treats url as a pattern to watch for rather than a place to go, so
+  // checking it would refuse a legitimate wait on a redirect target.
+  if (tool === "wait") return;
+  const verdict = checkRemoteUrl(value.url, policy);
+  if (!verdict.allowed) throw new Error(verdict.reason);
+}
+
 export async function runRemoteBrowserTool<Name extends BrowserToolName>(input: {
   readonly key: string;
   readonly config: Exclude<BrowserIntegrationConfig, { provider: "local-extension" }>;
@@ -1556,6 +1677,9 @@ export async function runRemoteBrowserTool<Name extends BrowserToolName>(input: 
   readonly tool: Name;
   readonly args: BrowserToolInputMap[Name];
 }): Promise<BrowserToolResult<Name> | unknown> {
+  // Checked before a session is even started, so a call to a refused host does
+  // not open a billable browser on its way to being turned down.
+  assertToolUrlsAllowed(input.tool, input.args, hostPolicyFor(input.config));
   await startRemoteBrowserSession(input.key, input.config, input.credential);
   const session = sessions.get(input.key)!;
   session.lastUsedAt = Date.now();

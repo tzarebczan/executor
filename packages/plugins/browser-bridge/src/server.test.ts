@@ -195,6 +195,41 @@ describe("remote Advanced gating", () => {
   });
 });
 
+describe("approval scope follows what bounds the target", () => {
+  const target = { provider: "generic-cdp" as const, cdpUrl: "wss://x" };
+  const entry = (config: Parameters<typeof remoteCatalogResult>[0], name: string) =>
+    remoteCatalogResult(config).tools.find((tool) => String(tool.name) === name);
+  const asks = (config: Parameters<typeof remoteCatalogResult>[0], name: string) =>
+    Boolean(entry(config, name)?.annotations);
+
+  it("asks for every action on a target that may go anywhere", () => {
+    // With no allowlist these prompts are the only thing deciding where the
+    // browser is sent. Dropping them would leave nothing in their place.
+    expect(asks(target, browserToolCatalogName("click"))).toBe(true);
+    expect(asks(target, browserToolCatalogName("navigate"))).toBe(true);
+  });
+
+  it("asks once per session on a target held to named hosts", () => {
+    const bounded = { ...target, allowedHosts: ["example.com"] };
+    expect(asks(bounded, browserToolCatalogName("click"))).toBe(false);
+    expect(asks(bounded, browserToolCatalogName("navigate"))).toBe(false);
+    // The session approval is still required, and still says what it covers.
+    expect(asks(bounded, "session_start")).toBe(true);
+    expect(JSON.stringify(entry(bounded, "session_start")?.annotations)).toContain("example.com");
+  });
+
+  it("keeps asking for sensitive tools even on a bounded target", () => {
+    // An allowlist bounds where the browser goes, not what runs once it is
+    // there. `evaluate` is arbitrary code on whatever page is open.
+    const bounded = { ...target, allowedHosts: ["example.com"], allowAdvanced: true };
+    expect(asks(bounded, browserToolCatalogName("evaluate"))).toBe(true);
+  });
+
+  it("does not treat reading as something to approve either way", () => {
+    expect(asks(target, browserToolCatalogName("snapshot"))).toBe(false);
+  });
+});
+
 describe("credentialLooksReusable", () => {
   it("offers a Cloudflare credential for the Cloudflare browser provider", () => {
     expect(credentialLooksReusable("cloudflare-browser-run", "cloudflare-dns", "Cloudflare")).toBe(

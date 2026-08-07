@@ -44,9 +44,11 @@ import {
   browserProviderName,
   LOCAL_BROWSER_CONFIG,
   parseBrowserIntegrationConfig,
+  targetIsBounded,
   type BrowserIntegrationConfig,
 } from "./integration-config";
 import { CLOUD_BROWSER_PROVIDERS } from "./cloud-providers";
+import { normalizeHost } from "./host-policy";
 import {
   cloudflareMintScript,
   mintCloudflareBrowserToken,
@@ -256,27 +258,37 @@ export const BROWSER_TOOL_CATALOG_V1: readonly ToolDef[] = [
   { name: ToolName.make("ping"), description: "Liveness check.", inputSchema: noArgsSchema },
 ];
 
-function browserCatalogEntry(name: BrowserToolName): ToolDef {
+function browserCatalogEntry(
+  name: BrowserToolName,
+  options: { readonly sessionScoped?: boolean } = {},
+): ToolDef {
   const definition = BROWSER_TOOL_DEFINITIONS[name];
   const base = {
     name: ToolName.make(browserToolCatalogName(name)),
     description: definition.description,
     inputSchema: definition.inputSchema,
   };
-  return definition.risk === "read"
-    ? base
-    : {
-        ...base,
-        annotations: approval(
-          `${definition.risk === "sensitive" ? "Allow sensitive" : "Run"} browser operation: ${name}`,
-        ),
-      };
+  if (definition.risk === "read") return base;
+  // On a target held to named hosts, approving the session is approving the
+  // destinations, so ordinary actions inside it do not each need a person. On
+  // an unbounded target these prompts are the only limit on where the browser
+  // can be sent, and dropping them would leave nothing.
+  //
+  // Sensitive tools keep asking either way. An allowlist bounds where the
+  // browser goes, not what runs once it is there.
+  if (options.sessionScoped && definition.risk !== "sensitive") return base;
+  return {
+    ...base,
+    annotations: approval(
+      `${definition.risk === "sensitive" ? "Allow sensitive" : "Run"} browser operation: ${name}`,
+    ),
+  };
 }
 
 export const BROWSER_TOOL_CATALOG: readonly ToolDef[] = [
   BROWSER_TOOL_CATALOG_V1[0]!,
   BROWSER_TOOL_CATALOG_V1[1]!,
-  ...BROWSER_TOOL_NAMES.map(browserCatalogEntry),
+  ...BROWSER_TOOL_NAMES.map((name) => browserCatalogEntry(name)),
 ];
 
 function catalogResult(): ResolveToolsResult {
@@ -328,9 +340,39 @@ export function remoteCatalogResult(
   const names = remoteAdvancedAllowed(config)
     ? BROWSER_TOOL_NAMES
     : BROWSER_TOOL_NAMES.filter((name) => !isAdvancedBrowserTool(name));
+  const sessionScoped = targetIsBounded(config);
   return {
-    tools: [...REMOTE_SESSION_TOOLS, ...names.map(browserCatalogEntry)],
+    tools: [
+      ...remoteSessionTools(config),
+      ...names.map((name) => browserCatalogEntry(name, { sessionScoped })),
+    ],
   };
+}
+
+/**
+ * The session tools, with the start prompt saying what it actually covers.
+ *
+ * On a bounded target one approval now stands in for every action in the
+ * session, so the prompt has to name the hosts it is approving. Asking once for
+ * something broader than the person understood is worse than asking often.
+ */
+function remoteSessionTools(
+  config: Exclude<BrowserIntegrationConfig, { provider: "local-extension" }>,
+): readonly ToolDef[] {
+  const hosts = config.allowedHosts || [];
+  if (!hosts.length) return REMOTE_SESSION_TOOLS;
+  return REMOTE_SESSION_TOOLS.map((tool) =>
+    String(tool.name) === "session_start"
+      ? {
+          ...tool,
+          annotations: approval(
+            `Start a remote browser session limited to ${hosts.join(", ")}. Browsing inside those hosts will not ask again${
+              config.allowPrivateNetwork ? ", and this target may reach private addresses" : ""
+            }.`,
+          ),
+        }
+      : tool,
+  );
 }
 
 function remoteSessionKey(owner: OwnerLike, integration: string, connection: string): string {
@@ -810,9 +852,20 @@ function browserConfigFromInput(
     max: 240,
     integer: true,
   });
+  const hosts = [...new Set((input.allowedHosts || []).map(normalizeHost).filter(Boolean))];
+  // Opting into private address space without naming hosts would leave a target
+  // that can reach an internal network and anything else besides, which is the
+  // combination this exists to prevent.
+  if (input.allowPrivateNetwork && hosts.length === 0) {
+    throw new Error(
+      "List the hosts this target may reach before allowing private addresses. A target that can reach a private network and every public one is not bounded by anything.",
+    );
+  }
   const controls = {
     ...(idleMinutes === undefined ? {} : { idleTimeoutMs: idleMinutes * 60_000 }),
     ...(input.allowAdvanced === undefined ? {} : { allowAdvanced: input.allowAdvanced }),
+    ...(hosts.length ? { allowedHosts: hosts } : {}),
+    ...(input.allowPrivateNetwork ? { allowPrivateNetwork: true } : {}),
   };
   switch (input.provider) {
     case "vercel-sandbox": {

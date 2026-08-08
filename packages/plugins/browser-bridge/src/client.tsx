@@ -41,6 +41,7 @@ import {
 import { PROVIDER_SETUP } from "./provider-setup";
 import {
   BrowserControlApi,
+  BrowserProviderDefinition,
   type AddBrowserProviderInput,
   type BrowserAccessView,
   type BrowserConnectionTestView,
@@ -55,11 +56,33 @@ const overviewAtom = BrowserClient.query("browserControl", "overview", {
   reactivityKeys: ["browser-control"],
 });
 const addProviderAtom = BrowserClient.mutation("browserControl", "addProvider");
-const stopSessionAtom = BrowserClient.mutation("browserControl", "stopSession");
-const removeTargetAtom = BrowserClient.mutation("browserControl", "removeTarget");
-const updateTargetAtom = BrowserClient.mutation("browserControl", "updateTarget");
-const testConnectionAtom = BrowserClient.mutation("browserControl", "testConnection");
-const trialRunAtom = BrowserClient.mutation("browserControl", "trialRun");
+/**
+ * A mutation atom per target rather than one shared by all of them.
+ *
+ * Testing three browsers in quick succession put three calls through a single
+ * atom, and every card then displayed whichever answered last: a Vercel target
+ * showed a live session alongside a Browser Use quota failure it never hit.
+ * Keying by target means a result can only land on the card that asked for it.
+ */
+const stopSessionAtom = Atom.family((_target: string) =>
+  BrowserClient.mutation("browserControl", "stopSession"),
+);
+const removeTargetAtom = Atom.family((_target: string) =>
+  BrowserClient.mutation("browserControl", "removeTarget"),
+);
+const updateTargetAtom = Atom.family((_target: string) =>
+  BrowserClient.mutation("browserControl", "updateTarget"),
+);
+const testConnectionAtom = Atom.family((_target: string) =>
+  BrowserClient.mutation("browserControl", "testConnection"),
+);
+const trialRunAtom = Atom.family((_target: string) =>
+  BrowserClient.mutation("browserControl", "trialRun"),
+);
+
+/** Identifies a target, and scopes both its atoms and its results to it. */
+const targetKey = (target: BrowserTargetView) =>
+  `${target.integration}:${target.connection || "none"}`;
 
 /** `Atom.family` because the form re-renders: a fresh atom per render refetches in a loop. */
 const reusableCredentialsAtom = Atom.family((provider: RemoteProvider) =>
@@ -737,7 +760,7 @@ function EditTargetForm({
 }) {
   const settings = target.settings || {};
   const local = target.provider === "local-extension";
-  const updateTarget = useAtomSet(updateTargetAtom, { mode: "promiseExit" });
+  const updateTarget = useAtomSet(updateTargetAtom(targetKey(target)), { mode: "promiseExit" });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [sessionScopedApproval, setSessionScopedApproval] = useState(
@@ -901,19 +924,7 @@ function EditTargetForm({
 function BrowsersPage() {
   const overview = useAtomValue(overviewAtom);
   const refresh = useAtomRefresh(overviewAtom);
-  const stopSession = useAtomSet(stopSessionAtom, { mode: "promiseExit" });
-  const removeTarget = useAtomSet(removeTargetAtom, { mode: "promiseExit" });
-  const testConnection = useAtomSet(testConnectionAtom, { mode: "promiseExit" });
-  const trialRun = useAtomSet(trialRunAtom, { mode: "promiseExit" });
   const [adding, setAdding] = useState<RemoteProvider | null>(null);
-  const [stopping, setStopping] = useState<string | null>(null);
-  const [removing, setRemoving] = useState<string | null>(null);
-  const [editing, setEditing] = useState<string | null>(null);
-  const [removeErrors, setRemoveErrors] = useState<Record<string, string>>({});
-  const [testing, setTesting] = useState<string | null>(null);
-  const [tests, setTests] = useState<Record<string, BrowserConnectionTestView>>({});
-  const [trialling, setTrialling] = useState<string | null>(null);
-  const [trials, setTrials] = useState<Record<string, BrowserTrialRunView>>({});
   const value = AsyncResult.isSuccess(overview) ? overview.value : null;
   const liveTargets = value?.targets.filter((target) => target.state === "live").length || 0;
 
@@ -957,284 +968,280 @@ function BrowsersPage() {
             </span>
           </div>
           <div className="grid gap-3 md:grid-cols-2">
-            {value?.targets.map((target) => {
-              const key = `${target.integration}:${target.connection || "none"}`;
-              const Icon = target.provider === "local-extension" ? Monitor : Cloud;
-              return (
-                <article key={key} className="rounded-md border bg-card p-4">
-                  <div className="flex items-start gap-3">
-                    <span className="grid size-9 shrink-0 place-items-center rounded-md bg-muted">
-                      <Icon className="size-4" />
-                    </span>
-                    <div className="min-w-0 flex-1">
-                      <div className="flex flex-wrap items-center justify-between gap-2">
-                        <h3 className="truncate text-sm font-semibold">{target.name}</h3>
-                        <StateBadge state={target.state} />
-                      </div>
-                      <p className="mt-1 text-xs text-muted-foreground">{target.detail}</p>
-                      {target.failure && (
-                        <div className="mt-2 border-l-2 border-destructive pl-2">
-                          <p className="text-xs font-medium text-destructive">
-                            {target.failure.hint}
-                          </p>
-                          <p className="mt-1 text-xs text-muted-foreground">
-                            Last start attempt {untilLabel(Date.now(), target.failure.failedAt)} ago
-                          </p>
-                        </div>
-                      )}
-                      {target.session && (
-                        <p className="mt-1 text-xs text-muted-foreground">
-                          Stops after {untilLabel(target.session.idleExpiresAt, Date.now())} idle
-                        </p>
-                      )}
-                      {target.access && <AccessSummary access={target.access} />}
-                      {target.address && (
-                        <div className="mt-3 grid gap-1.5">
-                          <div className="flex min-w-0 items-center rounded bg-muted pl-2">
-                            <code className="min-w-0 flex-1 truncate py-1.5 text-xs">
-                              {target.address}
-                            </code>
-                            <CopyButton value={target.address} className="mr-1" />
-                          </div>
-                          <p className="text-xs text-muted-foreground">
-                            The tool address agents call. Paste it into a prompt to name this
-                            browser.
-                          </p>
-                        </div>
-                      )}
-                      <div className="mt-3 flex flex-wrap items-center gap-2">
-                        {target.address && (
-                          <CopyButton
-                            value={agentPromptFor(target)}
-                            label="Copy prompt"
-                            className="h-8 border px-2.5 text-foreground"
-                          />
-                        )}
-                        {target.connection && (
-                          <Button
-                            variant="outline"
-                            size="sm"
-                            disabled={testing === key}
-                            onClick={async () => {
-                              setTesting(key);
-                              const exit = await testConnection({
-                                params: {
-                                  integration: target.integration,
-                                  connection: target.connection!,
-                                },
-                              });
-                              setTests((previous) => ({
-                                ...previous,
-                                [key]: Exit.isSuccess(exit)
-                                  ? exit.value
-                                  : {
-                                      ok: false,
-                                      detail: messageFromExit(exit, "Could not test this browser"),
-                                      verified: false,
-                                      checkedAt: Date.now(),
-                                    },
-                              }));
-                              setTesting(null);
-                            }}
-                          >
-                            <PlugZap className="size-3.5" />
-                            {testing === key ? "Checking..." : "Check credential"}
-                          </Button>
-                        )}
-                        {target.connection && target.provider !== "local-extension" && (
-                          <Button
-                            variant="outline"
-                            size="sm"
-                            disabled={trialling === key}
-                            /* Separate from the credential check because it
+            {value?.targets.map((target) => (
+              <TargetCard key={targetKey(target)} target={target} />
+            ))}
+          </div>
+        </section>
+        <ProvidersSection value={value} adding={adding} setAdding={setAdding} />
+      </div>
+    </div>
+  );
+}
+
+/**
+ * One browser target.
+ *
+ * A component per target rather than JSX inside a loop, so each one holds its
+ * own mutation atoms and its own in-flight state. Sharing those was what let a
+ * result land on a card that had not asked for it.
+ */
+function TargetCard({ target }: { readonly target: BrowserTargetView }) {
+  const key = targetKey(target);
+  const stopSession = useAtomSet(stopSessionAtom(key), { mode: "promiseExit" });
+  const removeTarget = useAtomSet(removeTargetAtom(key), { mode: "promiseExit" });
+  const testConnection = useAtomSet(testConnectionAtom(key), { mode: "promiseExit" });
+  const trialRun = useAtomSet(trialRunAtom(key), { mode: "promiseExit" });
+  const [busy, setBusy] = useState<"test" | "trial" | "stop" | "remove" | null>(null);
+  const [editing, setEditing] = useState(false);
+  const [test, setTest] = useState<BrowserConnectionTestView | null>(null);
+  const [trial, setTrial] = useState<BrowserTrialRunView | null>(null);
+  const [removeError, setRemoveError] = useState<string | null>(null);
+  const Icon = target.provider === "local-extension" ? Monitor : Cloud;
+  const params = { integration: target.integration, connection: target.connection! };
+
+  return (
+    <article className="rounded-md border bg-card p-4">
+      <div className="flex items-start gap-3">
+        <span className="grid size-9 shrink-0 place-items-center rounded-md bg-muted">
+          <Icon className="size-4" />
+        </span>
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <h3 className="truncate text-sm font-semibold">{target.name}</h3>
+            <StateBadge state={target.state} />
+          </div>
+          <p className="mt-1 text-xs text-muted-foreground">{target.detail}</p>
+          {target.failure && (
+            <div className="mt-2 border-l-2 border-destructive pl-2">
+              <p className="text-xs font-medium text-destructive">{target.failure.hint}</p>
+              <p className="mt-1 text-xs text-muted-foreground">
+                Last start attempt {untilLabel(Date.now(), target.failure.failedAt)} ago
+              </p>
+            </div>
+          )}
+          {target.session && (
+            <p className="mt-1 text-xs text-muted-foreground">
+              Stops after {untilLabel(target.session.idleExpiresAt, Date.now())} idle
+            </p>
+          )}
+          {target.access && <AccessSummary access={target.access} />}
+          {target.address && (
+            <div className="mt-3 grid gap-1.5">
+              <div className="flex min-w-0 items-center rounded bg-muted pl-2">
+                <code className="min-w-0 flex-1 truncate py-1.5 text-xs">{target.address}</code>
+                <CopyButton value={target.address} className="mr-1" />
+              </div>
+              <p className="text-xs text-muted-foreground">
+                The tool address agents call. Paste it into a prompt to name this browser.
+              </p>
+            </div>
+          )}
+          <div className="mt-3 flex flex-wrap items-center gap-2">
+            {target.address && (
+              <CopyButton
+                value={agentPromptFor(target)}
+                label="Copy prompt"
+                className="h-8 border px-2.5 text-foreground"
+              />
+            )}
+            {target.connection && (
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={busy !== null}
+                onClick={async () => {
+                  setBusy("test");
+                  const exit = await testConnection({ params });
+                  setTest(
+                    Exit.isSuccess(exit)
+                      ? exit.value
+                      : {
+                          ok: false,
+                          detail: messageFromExit(exit, "Could not test this browser"),
+                          verified: false,
+                          checkedAt: Date.now(),
+                        },
+                  );
+                  setBusy(null);
+                }}
+              >
+                <PlugZap className="size-3.5" />
+                {busy === "test" ? "Checking..." : "Check credential"}
+              </Button>
+            )}
+            {target.connection && target.provider !== "local-extension" && (
+              <Button
+                variant="outline"
+                size="sm"
+                disabled={busy !== null}
+                /* Separate from the credential check because it
                                starts a real session and is billed like one. It
                                is also the only thing that answers "does this
                                actually browse?", which a probe cannot. */
-                            title="Starts a real session, loads one page, then stops it"
-                            onClick={async () => {
-                              setTrialling(key);
-                              const exit = await trialRun({
-                                params: {
-                                  integration: target.integration,
-                                  connection: target.connection!,
-                                },
-                                reactivityKeys: ["browser-control"],
-                              });
-                              setTrials((previous) => ({
-                                ...previous,
-                                [key]: Exit.isSuccess(exit)
-                                  ? exit.value
-                                  : {
-                                      ok: false,
-                                      detail: messageFromExit(exit, "Could not run this browser"),
-                                      ms: 0,
-                                      ranAt: Date.now(),
-                                    },
-                              }));
-                              setTrialling(null);
-                            }}
-                          >
-                            <PlayCircle className="size-3.5" />
-                            {trialling === key ? "Running..." : "Test run"}
-                          </Button>
-                        )}
-                        {target.connection && (
-                          <Button
-                            variant="outline"
-                            size="sm"
-                            onClick={() => setEditing(editing === key ? null : key)}
-                          >
-                            <SlidersHorizontal className="size-3.5" />
-                            {editing === key ? "Close" : "Settings"}
-                          </Button>
-                        )}
-                        {target.session?.liveUrl && (
-                          <Button variant="outline" size="sm" asChild>
-                            <a href={target.session.liveUrl} target="_blank" rel="noreferrer">
-                              Live view <ExternalLink className="size-3.5" />
-                            </a>
-                          </Button>
-                        )}
-                        {target.state === "live" &&
-                          target.provider !== "local-extension" &&
-                          target.connection && (
-                            <Button
-                              variant="outline"
-                              size="sm"
-                              disabled={stopping === key}
-                              onClick={async () => {
-                                setStopping(key);
-                                await stopSession({
-                                  params: {
-                                    integration: target.integration,
-                                    connection: target.connection!,
-                                  },
-                                  reactivityKeys: ["browser-control"],
-                                });
-                                setStopping(null);
-                              }}
-                            >
-                              <CircleStop className="size-3.5" />
-                              Stop
-                            </Button>
-                          )}
-                        {/* Local Chrome is not removable here: its lifecycle
+                title="Starts a real session, loads one page, then stops it"
+                onClick={async () => {
+                  setBusy("trial");
+                  const exit = await trialRun({
+                    params,
+                    reactivityKeys: ["browser-control"],
+                  });
+                  setTrial(
+                    Exit.isSuccess(exit)
+                      ? exit.value
+                      : {
+                          ok: false,
+                          detail: messageFromExit(exit, "Could not run this browser"),
+                          ms: 0,
+                          ranAt: Date.now(),
+                        },
+                  );
+                  setBusy(null);
+                }}
+              >
+                <PlayCircle className="size-3.5" />
+                {busy === "trial" ? "Running..." : "Test run"}
+              </Button>
+            )}
+            {target.connection && (
+              <Button variant="outline" size="sm" onClick={() => setEditing(!editing)}>
+                <SlidersHorizontal className="size-3.5" />
+                {editing ? "Close" : "Settings"}
+              </Button>
+            )}
+            {target.session?.liveUrl && (
+              <Button variant="outline" size="sm" asChild>
+                <a href={target.session.liveUrl} target="_blank" rel="noreferrer">
+                  Live view <ExternalLink className="size-3.5" />
+                </a>
+              </Button>
+            )}
+            {target.state === "live" &&
+              target.provider !== "local-extension" &&
+              target.connection && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  disabled={busy !== null}
+                  onClick={async () => {
+                    setBusy("stop");
+                    await stopSession({ params, reactivityKeys: ["browser-control"] });
+                    setBusy(null);
+                  }}
+                >
+                  <CircleStop className="size-3.5" />
+                  Stop
+                </Button>
+              )}
+            {/* Local Chrome is not removable here: its lifecycle
                             belongs to the extension, and ensureChrome would
                             re-register it anyway, a Remove that undoes itself
                             reads as a bug. */}
-                        {target.provider !== "local-extension" && target.connection && (
-                          <Button
-                            variant="outline"
-                            size="sm"
-                            className="text-destructive hover:text-destructive"
-                            disabled={removing === key}
-                            onClick={async () => {
-                              if (
-                                !window.confirm(
-                                  `Remove "${target.name}"? Any running session is stopped and its credential is deleted.`,
-                                )
-                              ) {
-                                return;
-                              }
-                              setRemoving(key);
-                              const exit = await removeTarget({
-                                params: {
-                                  integration: target.integration,
-                                  connection: target.connection!,
-                                },
-                                reactivityKeys: ["browser-control"],
-                              });
-                              setRemoveErrors((previous) => {
-                                const next = { ...previous };
-                                if (Exit.isSuccess(exit)) delete next[key];
-                                else
-                                  next[key] = messageFromExit(
-                                    exit,
-                                    "Could not remove this browser",
-                                  );
-                                return next;
-                              });
-                              setRemoving(null);
-                            }}
-                          >
-                            <X className="size-3.5" />
-                            {removing === key ? "Removing..." : "Remove"}
-                          </Button>
-                        )}
-                      </div>
-                      {removeErrors[key] && (
-                        <p className="mt-2 text-xs text-destructive">{removeErrors[key]}</p>
-                      )}
-                      {tests[key] && <ConnectionTestResult result={tests[key]!} />}
-                      {trials[key] && <TrialRunResult result={trials[key]!} />}
-                      {editing === key && (
-                        <EditTargetForm target={target} onDone={() => setEditing(null)} />
-                      )}
-                    </div>
-                  </div>
-                </article>
-              );
-            })}
+            {target.provider !== "local-extension" && target.connection && (
+              <Button
+                variant="outline"
+                size="sm"
+                className="text-destructive hover:text-destructive"
+                disabled={busy !== null}
+                onClick={async () => {
+                  if (
+                    !window.confirm(
+                      `Remove "${target.name}"? Any running session is stopped and its credential is deleted.`,
+                    )
+                  ) {
+                    return;
+                  }
+                  setBusy("remove");
+                  const exit = await removeTarget({
+                    params,
+                    reactivityKeys: ["browser-control"],
+                  });
+                  setRemoveError(
+                    Exit.isSuccess(exit)
+                      ? null
+                      : messageFromExit(exit, "Could not remove this browser"),
+                  );
+                  setBusy(null);
+                }}
+              >
+                <X className="size-3.5" />
+                {busy === "remove" ? "Removing..." : "Remove"}
+              </Button>
+            )}
           </div>
-        </section>
+          {removeError && <p className="mt-2 text-xs text-destructive">{removeError}</p>}
+          {test && <ConnectionTestResult result={test} />}
+          {trial && <TrialRunResult result={trial} />}
+          {editing && <EditTargetForm target={target} onDone={() => setEditing(false)} />}
+        </div>
+      </div>
+    </article>
+  );
+}
 
-        <section className="grid gap-3">
-          <div>
-            <h2 className="text-sm font-semibold uppercase text-muted-foreground">
-              Remote providers
-            </h2>
-            <p className="mt-1 text-xs text-muted-foreground">
-              Availability reflects this Executor host. Configured sessions start on first use.
-            </p>
-          </div>
-          <div className="divide-y rounded-md border">
-            {value?.providers.map((provider) => {
-              const open = adding === provider.id;
-              return (
-                <div key={provider.id} className="px-4 py-4">
-                  <div className="flex flex-wrap items-center gap-3">
-                    <Server className="size-4 shrink-0 text-muted-foreground" />
-                    <div className="min-w-0 flex-1">
-                      <div className="flex flex-wrap items-center gap-2">
-                        <h3 className="text-sm font-medium">{provider.name}</h3>
-                        <AvailabilityBadge availability={provider.availability} />
-                        <Badge variant="secondary">
-                          {provider.transport === "cdp" ? "CDP" : "agent-browser"}
-                        </Badge>
-                        {provider.configured > 0 && (
-                          <Badge variant="secondary">{provider.configured} configured</Badge>
-                        )}
-                      </div>
-                      <p className="mt-1 text-xs text-muted-foreground">
-                        {provider.note} · {provider.availabilityDetail}
-                      </p>
-                    </div>
-                    {/* Never disabled. This used to be greyed out for a provider
+function ProvidersSection({
+  value,
+  adding,
+  setAdding,
+}: {
+  readonly value: { readonly providers: readonly (typeof BrowserProviderDefinition.Type)[] } | null;
+  readonly adding: RemoteProvider | null;
+  readonly setAdding: (provider: RemoteProvider | null) => void;
+}) {
+  return (
+    <section className="grid gap-3">
+      <div>
+        <h2 className="text-sm font-semibold uppercase text-muted-foreground">Remote providers</h2>
+        <p className="mt-1 text-xs text-muted-foreground">
+          Availability reflects this Executor host. Configured sessions start on first use.
+        </p>
+      </div>
+      <div className="divide-y rounded-md border">
+        {value?.providers.map((provider) => {
+          const open = adding === provider.id;
+          return (
+            <div key={provider.id} className="px-4 py-4">
+              <div className="flex flex-wrap items-center gap-3">
+                <Server className="size-4 shrink-0 text-muted-foreground" />
+                <div className="min-w-0 flex-1">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <h3 className="text-sm font-medium">{provider.name}</h3>
+                    <AvailabilityBadge availability={provider.availability} />
+                    <Badge variant="secondary">
+                      {provider.transport === "cdp" ? "CDP" : "agent-browser"}
+                    </Badge>
+                    {provider.configured > 0 && (
+                      <Badge variant="secondary">{provider.configured} configured</Badge>
+                    )}
+                  </div>
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    {provider.note} · {provider.availabilityDetail}
+                  </p>
+                </div>
+                {/* Never disabled. This used to be greyed out for a provider
                         the host could not run, which hid the only instructions
                         for making it runnable behind the very state they fix. */}
-                    <Button
-                      variant={open ? "ghost" : "outline"}
-                      size="sm"
-                      onClick={() => setAdding(open ? null : provider.id)}
-                    >
-                      {open ? <X className="size-4" /> : <Plus className="size-4" />}
-                      {open ? "Close" : provider.configured > 0 ? "Add target" : "Configure"}
-                    </Button>
-                  </div>
-                  {open && (
-                    <ProviderForm
-                      provider={provider.id}
-                      hostIdentity={provider.hostIdentity}
-                      onDone={() => setAdding(null)}
-                    />
-                  )}
-                </div>
-              );
-            })}
-          </div>
-        </section>
+                <Button
+                  variant={open ? "ghost" : "outline"}
+                  size="sm"
+                  onClick={() => setAdding(open ? null : provider.id)}
+                >
+                  {open ? <X className="size-4" /> : <Plus className="size-4" />}
+                  {open ? "Close" : provider.configured > 0 ? "Add target" : "Configure"}
+                </Button>
+              </div>
+              {open && (
+                <ProviderForm
+                  provider={provider.id}
+                  hostIdentity={provider.hostIdentity}
+                  onDone={() => setAdding(null)}
+                />
+              )}
+            </div>
+          );
+        })}
       </div>
-    </div>
+    </section>
   );
 }
 

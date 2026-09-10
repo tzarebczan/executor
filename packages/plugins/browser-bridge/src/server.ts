@@ -3,9 +3,12 @@
 /**
  * Chrome desktop reverse channel (path B).
  *
- * One catalog entry only: DB integration `browser` + connection `desktop`
- * (created by ensureChrome). No static `browser` integration, that duplicated
- * the row in the UI with no status dot.
+ * One integration (`browser`) with one catalog connection per connected
+ * extension instance. The first unlabeled Chrome stays `desktop` so existing
+ * agents keep calling `tools.browser.user.desktop`. A second browser (Brave,
+ * another Chrome profile) gets its own connection and tool prefix.
+ * No static `browser` integration, that duplicated the row in the UI with no
+ * status dot.
  */
 
 import {
@@ -29,7 +32,18 @@ import {
   toolCallerRef,
 } from "@executor-js/sdk/core";
 
-import { callTool, listSessionsForUser, sessionPublicView, type BridgeSession } from "./store";
+import {
+  callTool,
+  findSessionForConnection,
+  listSessionsForUser,
+  sessionPublicView,
+  type BridgeSession,
+} from "./store";
+import {
+  DEFAULT_LOCAL_CONNECTION,
+  localBrowserDisplayName,
+  localToolAddress,
+} from "./local-identity";
 import {
   BROWSER_TOOL_DEFINITIONS,
   BROWSER_TOOL_NAMES,
@@ -104,6 +118,16 @@ const InstallOutput = Schema.Struct({
   connection: Schema.String,
   address: Schema.String,
   note: Schema.String,
+  connections: Schema.optional(
+    Schema.Array(
+      Schema.Struct({
+        connection: Schema.String,
+        address: Schema.String,
+        label: Schema.optional(Schema.String),
+        browser: Schema.optional(Schema.String),
+      }),
+    ),
+  ),
 });
 const InstallOutputStd = schemaToStaticToolSchema(InstallOutput);
 
@@ -166,7 +190,8 @@ export function validateInnerCall(
 export const BROWSER_TOOL_CATALOG_V1: readonly ToolDef[] = [
   {
     name: ToolName.make("status"),
-    description: "List live reverse-bridge sessions.",
+    description:
+      "List connected local browsers and their tool addresses. When more than one Executor Browser is connected, each has its own tools.browser.user.<connection> prefix — call that prefix, do not assume desktop is the only one.",
     inputSchema: noArgsSchema,
   },
   {
@@ -310,7 +335,7 @@ const LOCAL_SESSION_TOOLS: readonly ToolDef[] = [
   {
     name: ToolName.make("session_status"),
     description:
-      "Browser session status for the local Chrome extension: whether a control session is running, its access mode, which hosts are in scope, and when it expires. Does not start one.",
+      "Browser session status for this local Executor Browser connection: whether a control session is running, its access mode, which hosts are in scope, and when it expires. Does not start one.",
     inputSchema: noArgsSchema,
   },
   {
@@ -321,16 +346,31 @@ const LOCAL_SESSION_TOOLS: readonly ToolDef[] = [
   },
 ];
 
-function catalogResult(config?: BrowserIntegrationConfig | null): ResolveToolsResult {
+function describeThisLocalBrowser(connectionName: string, label?: string): string {
+  return ` This connection is the local ${label || connectionName} browser (${localToolAddress(connectionName)}).`;
+}
+
+function catalogResult(
+  config?: BrowserIntegrationConfig | null,
+  identity?: { readonly connectionName: string; readonly label?: string },
+): ResolveToolsResult {
   const sessionScoped =
     config?.provider === "local-extension" && config.sessionScopedApproval === true;
+  const note = identity ? describeThisLocalBrowser(identity.connectionName, identity.label) : "";
+  const tools = [
+    ...LOCAL_SESSION_TOOLS,
+    BROWSER_TOOL_CATALOG_V1[0]!,
+    BROWSER_TOOL_CATALOG_V1[1]!,
+    ...BROWSER_TOOL_NAMES.map((name) => browserCatalogEntry(name, { sessionScoped })),
+  ];
   return {
-    tools: [
-      ...LOCAL_SESSION_TOOLS,
-      BROWSER_TOOL_CATALOG_V1[0]!,
-      BROWSER_TOOL_CATALOG_V1[1]!,
-      ...BROWSER_TOOL_NAMES.map((name) => browserCatalogEntry(name, { sessionScoped })),
-    ],
+    tools: note
+      ? tools.map((toolDef) =>
+          String(toolDef.name) === "status" || String(toolDef.name) === "session_status"
+            ? { ...toolDef, description: `${toolDef.description}${note}` }
+            : toolDef,
+        )
+      : tools,
   };
 }
 
@@ -356,10 +396,13 @@ export function localScopeProblem(
   config: BrowserIntegrationConfig,
   ctx: PluginCtx,
   toolName: string,
+  connectionName: string,
 ): string | null {
   return localScopeVerdict(
     config,
-    accessFromCapabilities(listSessionsForUser(userIdFromOwner(ctx.owner))[0]?.capabilities),
+    accessFromCapabilities(
+      findSessionForConnection(userIdFromOwner(ctx.owner), connectionName)?.capabilities,
+    ),
     toolName,
   );
 }
@@ -384,19 +427,29 @@ export function localScopeVerdict(
   );
 }
 
-export function localSessionStatus(ctx: PluginCtx) {
-  const sessions = listSessionsForUser(userIdFromOwner(ctx.owner));
-  const session = sessions[0];
+export function localSessionStatus(ctx: PluginCtx, connectionName: string) {
+  const session = findSessionForConnection(userIdFromOwner(ctx.owner), connectionName);
   if (!session) {
+    const others = listSessionsForUser(userIdFromOwner(ctx.owner));
     return {
       active: false as const,
+      connection: connectionName,
+      address: localToolAddress(connectionName),
       detail:
-        "The Executor Browser extension is not connected. Open Chrome and check the extension is running.",
+        others.length === 0
+          ? "The Executor Browser extension is not connected. Open the browser and check the extension is running."
+          : `This connection (${localToolAddress(connectionName)}) is not live. Connected: ${others
+              .map((live) => localToolAddress(live.connectionName))
+              .join(", ")}.`,
     };
   }
   const access = accessFromCapabilities(session.capabilities);
   return {
     active: true as const,
+    connection: session.connectionName,
+    address: localToolAddress(session.connectionName),
+    label: localBrowserDisplayName(session),
+    ...(session.browser ? { browser: session.browser } : {}),
     connectedFor: Date.now() - session.createdAt,
     ...(access
       ? {
@@ -535,10 +588,9 @@ function isRemoteBrowserConfig(
  * deciding for itself what "live", "stale", and "absent" mean.
  */
 export function localBridgeVerdict(
-  sessions: readonly BridgeSession[],
+  session: BridgeSession | undefined,
   now: number,
 ): { readonly status: "healthy" | "degraded"; readonly detail: string } {
-  const session = sessions[0];
   if (!session) {
     return {
       status: "degraded",
@@ -1025,35 +1077,61 @@ function browserOverviewEffect(ctx: PluginCtx) {
     const localConnections = localRecord
       ? yield* ctx.connections.list({ integration: localRecord.integration.slug })
       : [];
-    const localConnection = localConnections[0];
-    const localSession = localSessions[0];
-    // The same 90s rule `checkHealth` applies. Without it a session that stopped
-    // polling reads "live" on the card while the health dot says degraded.
-    const localVerdict = localBridgeVerdict(localSessions, Date.now());
-    const localAccess = localSession ? accessFromCapabilities(localSession.capabilities) : null;
-    targets.push({
-      integration: String(localRecord?.integration.slug || BROWSER_INTEGRATION_SLUG),
-      name: localRecord?.integration.name || "Local Chrome",
-      provider: "local-extension",
-      connection: localConnection ? String(localConnection.name) : BROWSER_CONNECTION_NAME,
-      address: localConnection?.address || "tools.browser.user.desktop",
-      settings: {
-        sessionScopedApproval:
-          localRecord?.config &&
-          parseBrowserIntegrationConfig(localRecord.config)?.provider === "local-extension"
-            ? (
-                parseBrowserIntegrationConfig(localRecord.config) as {
-                  sessionScopedApproval?: boolean;
-                }
-              ).sessionScopedApproval === true
-            : false,
-      },
-      state: !localSession ? "offline" : localVerdict.status === "healthy" ? "live" : "stale",
-      detail: localSession
-        ? `Extension ${String((localSession.client as { version?: string } | undefined)?.version || "connected")} connected · ${localSession.pending.length === 0 ? "no requests waiting" : `${localSession.pending.length} request${localSession.pending.length === 1 ? "" : "s"} waiting`}`
-        : "Extension reverse session is not connected",
-      ...(localAccess ? { access: localAccess } : {}),
-    });
+    const integration = String(localRecord?.integration.slug || BROWSER_INTEGRATION_SLUG);
+    const sessionScopedApproval =
+      localRecord?.config.provider === "local-extension" &&
+      localRecord.config.sessionScopedApproval === true;
+    const now = Date.now();
+    const seenLocal = new Set<string>();
+    const localSettings = { sessionScopedApproval };
+
+    for (const session of localSessions) {
+      const connection = session.connectionName || BROWSER_CONNECTION_NAME;
+      seenLocal.add(connection);
+      const persisted = localConnections.find((row) => String(row.name) === connection);
+      const verdict = localBridgeVerdict(session, now);
+      const access = accessFromCapabilities(session.capabilities);
+      targets.push({
+        integration,
+        name: localBrowserDisplayName(session),
+        provider: "local-extension",
+        connection,
+        address: persisted?.address || localToolAddress(connection),
+        settings: localSettings,
+        state: verdict.status === "healthy" ? "live" : "stale",
+        detail: `${localBrowserDisplayName(session)} ${String((session.client as { version?: string } | undefined)?.version || "connected")} connected · ${session.pending.length === 0 ? "no requests waiting" : `${session.pending.length} request${session.pending.length === 1 ? "" : "s"} waiting`}`,
+        ...(access ? { access } : {}),
+      });
+    }
+
+    for (const row of localConnections) {
+      const connection = String(row.name);
+      if (seenLocal.has(connection)) continue;
+      seenLocal.add(connection);
+      targets.push({
+        integration,
+        name: row.identityLabel || connection,
+        provider: "local-extension",
+        connection,
+        address: row.address || localToolAddress(connection),
+        settings: localSettings,
+        state: "offline",
+        detail: "Extension reverse session is not connected",
+      });
+    }
+
+    if (seenLocal.size === 0) {
+      targets.push({
+        integration,
+        name: "Local Chrome",
+        provider: "local-extension",
+        connection: BROWSER_CONNECTION_NAME,
+        address: localToolAddress(BROWSER_CONNECTION_NAME),
+        settings: localSettings,
+        state: "offline",
+        detail: "Extension reverse session is not connected",
+      });
+    }
 
     for (const record of records) {
       if (!isRemoteBrowserConfig(record.config)) continue;
@@ -1687,7 +1765,7 @@ function testBrowserConnectionEffect(ctx: PluginCtx, integration: string, connec
 
     if (!isRemoteBrowserConfig(config)) {
       const verdict = localBridgeVerdict(
-        listSessionsForUser(userIdFromOwner(ctx.owner)),
+        findSessionForConnection(userIdFromOwner(ctx.owner), connection),
         checkedAt,
       );
       return verdict.status === "healthy"
@@ -1883,6 +1961,7 @@ async function runTool(
   args: Record<string, unknown> | undefined,
   timeoutMs: number,
   caller?: { name: string; version?: string } | null,
+  connectionName?: string,
 ): Promise<unknown> {
   const name = browserToolNameFromCatalog(toolName) || toolName;
   // The client name is whatever the client said it was. `principal` is what
@@ -1892,17 +1971,41 @@ async function runTool(
 
   if (name === "status") {
     const sessions = listSessionsForUser(userId).map(sessionPublicView);
-    const live = sessions[0];
+    const self =
+      (connectionName && sessions.find((session) => session.connection === connectionName)) ||
+      sessions[0];
     return {
+      this: self
+        ? {
+            connection: self.connection,
+            address: self.address,
+            ...(self.label ? { label: self.label } : {}),
+            ...(self.browser ? { browser: self.browser } : {}),
+          }
+        : connectionName
+          ? { connection: connectionName, address: localToolAddress(connectionName) }
+          : null,
+      browsers: sessions.map((session) => ({
+        connection: session.connection,
+        address: session.address,
+        ...(session.label ? { label: session.label } : {}),
+        ...(session.browser ? { browser: session.browser } : {}),
+        lastSeenAt: session.lastSeenAt,
+        pending: session.pending,
+      })),
       sessions,
-      live: Boolean(live),
-      extension: live?.client ?? null,
-      tools: (live?.capabilities as { tools?: string[] } | undefined)?.tools ?? [],
-      pendingJobs: live?.pending ?? 0,
+      live: Boolean(self),
+      extension: self?.client ?? null,
+      tools: (self?.capabilities as { tools?: string[] } | undefined)?.tools ?? [],
+      pendingJobs: self?.pending ?? 0,
       note:
         sessions.length === 0
           ? "No live reverse session. Open Executor Browser → Connect (path B)."
-          : `${sessions.length} session(s) live · ${live?.client && typeof live.client === "object" && "name" in live.client ? String((live.client as { name?: string }).name) : "extension"}`,
+          : sessions.length === 1
+            ? `One local browser live: ${self?.label || self?.browser || self?.connection} at ${self?.address}.`
+            : `Multiple local browsers are connected. Use the matching tools.browser.user.<connection> prefix. This call is ${self?.address || localToolAddress(connectionName || DEFAULT_LOCAL_CONNECTION)}. Also live: ${sessions
+                .map((session) => session.address)
+                .join(", ")}.`,
     };
   }
   if (name === "call") {
@@ -1916,6 +2019,7 @@ async function runTool(
       userId,
       tool: validated.tool,
       args: validated.args,
+      connection: connectionName,
       sessionId: typeof body.sessionId === "string" ? body.sessionId : undefined,
       timeoutMs: timeoutOverride,
       caller: attributed,
@@ -1926,56 +2030,106 @@ async function runTool(
     userId,
     tool: validated.tool,
     args: validated.args,
+    connection: connectionName,
     timeoutMs,
     caller: attributed,
   });
 }
 
-function ensureChromeEffect(ctx: PluginCtx) {
-  const slug = IntegrationSlug.make(BROWSER_INTEGRATION_SLUG);
-  const connName = ConnectionName.make(BROWSER_CONNECTION_NAME);
+function ensureLocalConnectionEffect(
+  ctx: PluginCtx,
+  slug: ReturnType<typeof IntegrationSlug.make>,
+  connectionName: string,
+  identityLabel: string,
+) {
+  const name = ConnectionName.make(connectionName);
+  const description = `Local browser via Executor Browser. Agents call ${localToolAddress(connectionName)}.`;
+  const ref = { owner: "user" as const, integration: slug, name };
   return Effect.gen(function* () {
-    yield* ctx.core.integrations.register({
-      slug,
-      name: "Chrome (Executor Browser)",
-      description:
-        "Real Chrome via the Executor Browser extension reverse channel (path B). No companion process required.",
-      config: LOCAL_BROWSER_CONFIG,
-      canRemove: true,
-      canRefresh: true,
-    });
-
-    // Effect v4: catchAll is gone, use catch / orElseSucceed
     const created = yield* ctx.connections
       .create({
         owner: "user",
-        name: connName,
+        name,
         integration: slug,
         template: AuthTemplateSlug.make("none"),
         value: "",
+        identityLabel,
+        description,
       })
       .pipe(
         Effect.map(() => true),
         Effect.catch(() => Effect.succeed(false)),
       );
+    if (!created) {
+      yield* ctx.connections
+        .update(ref, { identityLabel, description })
+        .pipe(Effect.catch(() => Effect.void));
+    }
+    yield* ctx.connections.refresh(ref).pipe(Effect.catch(() => Effect.void));
+    return created;
+  });
+}
 
-    yield* ctx.connections
-      .refresh({
-        owner: "user",
-        integration: slug,
-        name: connName,
-      })
-      .pipe(Effect.catch(() => Effect.void));
+function ensureChromeEffect(ctx: PluginCtx) {
+  const slug = IntegrationSlug.make(BROWSER_INTEGRATION_SLUG);
+  return Effect.gen(function* () {
+    yield* ctx.core.integrations.register({
+      slug,
+      name: "Local browsers",
+      description:
+        "Real browsers via the Executor Browser extension reverse channel (path B). Each connected browser is its own connection (tools.browser.user.<name>). No companion process required.",
+      config: LOCAL_BROWSER_CONFIG,
+      canRemove: true,
+      canRefresh: true,
+    });
 
     const sessions = listSessionsForUser(userIdFromOwner(ctx.owner));
+    const toEnsure: Array<{
+      readonly connectionName: string;
+      readonly identityLabel: string;
+      readonly browser?: string;
+      readonly label?: string;
+    }> =
+      sessions.length > 0
+        ? sessions.map((session) => ({
+            connectionName: session.connectionName,
+            identityLabel: localBrowserDisplayName(session),
+            ...(session.browser ? { browser: session.browser } : {}),
+            ...(session.label ? { label: session.label } : {}),
+          }))
+        : [
+            {
+              connectionName: BROWSER_CONNECTION_NAME,
+              identityLabel: "Local Chrome",
+            },
+          ];
+
+    let createdAny = false;
+    for (const target of toEnsure) {
+      const created = yield* ensureLocalConnectionEffect(
+        ctx,
+        slug,
+        target.connectionName,
+        target.identityLabel,
+      );
+      createdAny = createdAny || created;
+    }
+
+    const primary = toEnsure[0]!;
     return {
       ok: true,
       integration: BROWSER_INTEGRATION_SLUG,
-      connection: BROWSER_CONNECTION_NAME,
-      address: "tools.browser.user.desktop",
-      note: created
-        ? `Chrome connection created.${sessions.length ? " Reverse session live." : " Connect extension for green status."}`
-        : `Chrome connection ensured.${sessions.length ? " Reverse session live." : " Connect extension for green status."}`,
+      connection: primary.connectionName,
+      address: localToolAddress(primary.connectionName),
+      connections: toEnsure.map((target) => ({
+        connection: target.connectionName,
+        address: localToolAddress(target.connectionName),
+        ...(target.label ? { label: target.label } : {}),
+        ...(target.browser ? { browser: target.browser } : {}),
+      })),
+      note: createdAny
+        ? `Browser connection created.${sessions.length ? " Reverse session live." : " Connect extension for green status."}`
+        : `Browser connection ensured.${sessions.length ? ` ${sessions.length} reverse session${sessions.length === 1 ? "" : "s"} live.` : " Connect extension for green status."}`,
     };
   });
 }
@@ -1991,8 +2145,9 @@ export const browserBridgePlugin = definePlugin((options: BrowserBridgePluginOpt
     integrationPresets: [
       {
         id: BROWSER_INTEGRATION_SLUG,
-        name: "Chrome (Executor Browser)",
-        summary: "Drive your real Chrome via the extension reverse channel (path B).",
+        name: "Local browsers",
+        summary:
+          "Drive connected Chrome, Brave, or Edge via the extension reverse channel (path B). Each browser is tools.browser.user.<connection>.",
         featured: true,
       },
     ],
@@ -2011,10 +2166,20 @@ export const browserBridgePlugin = definePlugin((options: BrowserBridgePluginOpt
     },
 
     remoteToolCatalog: false,
-    resolveTools: ({ config }) => {
+    resolveTools: ({ config, connection, ctx }) => {
       const parsed = parseBrowserIntegrationConfig(config);
+      if (isRemoteBrowserConfig(parsed)) {
+        return Effect.succeed(remoteCatalogResult(parsed));
+      }
+      const connectionName = String(connection.name);
+      const session = ctx
+        ? findSessionForConnection(userIdFromOwner(ctx.owner), connectionName)
+        : undefined;
       return Effect.succeed(
-        isRemoteBrowserConfig(parsed) ? remoteCatalogResult(parsed) : catalogResult(parsed),
+        catalogResult(parsed, {
+          connectionName,
+          label: session ? localBrowserDisplayName(session) : connectionName,
+        }),
       );
     },
     validateToolArgs: ({ toolRow, args }) =>
@@ -2101,14 +2266,15 @@ export const browserBridgePlugin = definePlugin((options: BrowserBridgePluginOpt
           });
         }
         const localName = String(toolRow.name);
+        const connectionName = String(credential.connection);
         if (localName === "session_status") {
-          return localSessionStatus(ctx);
+          return localSessionStatus(ctx, connectionName);
         }
         // The catalog dropped the per-action prompts on the understanding that
         // the extension is holding this to a set of hosts. That understanding
         // is checked here, where the extension's mode is live, rather than
         // trusted from a catalog built at some earlier point.
-        const scopeProblem = localScopeProblem(config, ctx, localName);
+        const scopeProblem = localScopeProblem(config, ctx, localName, connectionName);
         if (scopeProblem) return yield* new BrowserBridgeError({ message: scopeProblem });
         if (localName === "session_stop") {
           // Ending a control session only ever reduces what this can reach, so
@@ -2116,9 +2282,14 @@ export const browserBridgePlugin = definePlugin((options: BrowserBridgePluginOpt
           // the human granting access is the point of that step.
           return yield* Effect.tryPromise({
             try: () =>
-              runTool(userIdFromOwner(ctx.owner), "session.stop", {}, defaultTimeout, caller).then(
-                () => ({ ok: true, stopped: true }),
-              ),
+              runTool(
+                userIdFromOwner(ctx.owner),
+                "session.stop",
+                {},
+                defaultTimeout,
+                caller,
+                connectionName,
+              ).then(() => ({ ok: true, stopped: true })),
             catch: (error) => browserBridgeError(error, "Could not end the control session"),
           });
         }
@@ -2130,6 +2301,7 @@ export const browserBridgePlugin = definePlugin((options: BrowserBridgePluginOpt
               (args || {}) as Record<string, unknown>,
               defaultTimeout,
               caller,
+              connectionName,
             ),
           catch: (error) => browserBridgeError(error, "Local browser tool failed"),
         });
@@ -2169,7 +2341,7 @@ export const browserBridgePlugin = definePlugin((options: BrowserBridgePluginOpt
         // HealthStatus vocab: healthy | expired | degraded | unknown.
         const checkedAt = Date.now();
         const verdict = localBridgeVerdict(
-          listSessionsForUser(userIdFromOwner(ctx.owner)),
+          findSessionForConnection(userIdFromOwner(ctx.owner), String(credential.connection)),
           checkedAt,
         );
         return { status: verdict.status, checkedAt, detail: verdict.detail };
@@ -2201,7 +2373,7 @@ export const browserBridgePlugin = definePlugin((options: BrowserBridgePluginOpt
           tool({
             name: "ensureChrome",
             description:
-              "Create Chrome (Executor Browser) integration + tools.browser.user.desktop for this user.",
+              "Create local Executor Browser integration connections for every connected extension (tools.browser.user.<connection>).",
             outputSchema: InstallOutputStd,
             execute: () => self.ensureChrome(),
           }),

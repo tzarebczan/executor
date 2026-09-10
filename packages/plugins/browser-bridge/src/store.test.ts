@@ -3,6 +3,7 @@ import {
   _resetStoreForTests,
   callTool,
   createSession,
+  findSessionForConnection,
   listSessionsForUser,
   postResult,
   takeJobs,
@@ -14,12 +15,68 @@ beforeEach(() => {
 });
 
 describe("browser-bridge store", () => {
-  it("creates a session and replaces prior for same user", () => {
+  it("replaces a reconnect of the same instance, not a second browser", () => {
+    const chrome = createSession({
+      userId: "u1",
+      client: { instanceId: "chrome-1", browser: "Chrome" },
+    });
+    const brave = createSession({
+      userId: "u1",
+      client: { instanceId: "brave-1", browser: "Brave" },
+    });
+    expect(listSessionsForUser("u1")).toHaveLength(2);
+    expect(chrome.connectionName).toBe("desktop");
+    expect(brave.connectionName).toBe("brave");
+
+    const chromeAgain = createSession({
+      userId: "u1",
+      client: { instanceId: "chrome-1", browser: "Chrome" },
+    });
+    const live = listSessionsForUser("u1");
+    expect(live).toHaveLength(2);
+    expect(live.map((s) => s.connectionName).sort()).toEqual(["brave", "desktop"]);
+    expect(findSessionForConnection("u1", "desktop")?.id).toBe(chromeAgain.id);
+    expect(findSessionForConnection("u1", "brave")?.id).toBe(brave.id);
+  });
+
+  it("still replaces an older extension that sends no instance id", () => {
     const a = createSession({ userId: "u1" });
     const b = createSession({ userId: "u1" });
     expect(listSessionsForUser("u1")).toHaveLength(1);
     expect(listSessionsForUser("u1")[0]!.id).toBe(b.id);
     expect(a.id).not.toBe(b.id);
+    expect(b.connectionName).toBe("desktop");
+  });
+
+  it("routes a tool call to the named connection", async () => {
+    createSession({
+      userId: "u1",
+      client: { instanceId: "chrome-1", browser: "Chrome" },
+    });
+    const brave = createSession({
+      userId: "u1",
+      client: { instanceId: "brave-1", browser: "Brave" },
+    });
+
+    const callP = callTool({ userId: "u1", connection: "brave", tool: "ping", args: {} });
+    const jobs = await takeJobs(brave.id, "u1", 2000);
+    expect(jobs).toHaveLength(1);
+    postResult(brave.id, "u1", jobs[0]!.id, { ok: true, browser: "Brave" });
+    await expect(callP).resolves.toEqual({ ok: true, browser: "Brave" });
+  });
+
+  it("refuses an unaddressed call when two browsers are connected", async () => {
+    createSession({
+      userId: "u1",
+      client: { instanceId: "chrome-1", browser: "Chrome" },
+    });
+    createSession({
+      userId: "u1",
+      client: { instanceId: "brave-1", browser: "Brave" },
+    });
+    await expect(callTool({ userId: "u1", tool: "ping" })).rejects.toThrow(
+      /Multiple local browsers/,
+    );
   });
 
   it("does not treat an agent's own call as evidence the extension is alive", async () => {

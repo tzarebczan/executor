@@ -3,7 +3,7 @@
 Completes the loop between **Executor Browser** (Chrome extension) and self-hosted Executor:
 
 ```text
-Agent  →  tools.browser.user.desktop.*  →  callTool(store)
+Agent  →  tools.browser.user.<connection>.*  →  callTool(store)
                                  │
 Extension ← long-poll jobs ←─────┘
     │
@@ -30,7 +30,11 @@ There is **no** `POST /api/browser-bridge/call` (or `/browser-bridge/call`). Age
 
 ## Agent tools (MCP / execute)
 
-Integration **`browser`**, connection **`desktop`**:
+Integration **`browser`**, one connection per connected extension instance.
+The first unlabeled Chrome stays **`desktop`** (`tools.browser.user.desktop`) so
+existing agents keep working. A second browser — Brave, Edge, another Chrome
+profile — gets its own connection name and tool prefix. Call **`status`** on
+either to list every live local browser and its address.
 
 | Tool | Approval | Notes |
 |------|----------|--------|

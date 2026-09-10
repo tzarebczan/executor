@@ -106,5 +106,42 @@ describe("browser bridge HTTP surface", () => {
     expect(response.status).toBe(200);
     expect(typeof body.sessionId).toBe("string");
     expect(body.id).toBe(body.sessionId);
+    expect(body.connection).toBe("desktop");
+    expect(body.address).toBe("tools.browser.user.desktop");
+  });
+
+  it("keeps two browsers as distinct connections", async () => {
+    const handler = makeBrowserBridgeHandler({
+      getSession: async () => ({ user: { id: "user-1" } }),
+    });
+    const chrome = await handler(
+      withKey("https://executor.test/api/browser-bridge/session", {
+        method: "POST",
+        body: JSON.stringify({
+          client: { instanceId: "c1", browser: "Chrome" },
+          connection: { name: "desktop" },
+        }),
+      }),
+    );
+    const brave = await handler(
+      withKey("https://executor.test/api/browser-bridge/session", {
+        method: "POST",
+        body: JSON.stringify({
+          client: { instanceId: "b1", browser: "Brave" },
+          connection: { name: "brave" },
+        }),
+      }),
+    );
+    const chromeBody = (await chrome.json()) as Record<string, unknown>;
+    const braveBody = (await brave.json()) as Record<string, unknown>;
+    expect(chromeBody.connection).toBe("desktop");
+    expect(chromeBody.address).toBe("tools.browser.user.desktop");
+    expect(braveBody.connection).toBe("brave");
+    expect(braveBody.address).toBe("tools.browser.user.brave");
+    expect(chromeBody.sessionId).not.toBe(braveBody.sessionId);
+
+    const listed = await handler(withKey("https://executor.test/api/browser-bridge/sessions"));
+    const sessions = ((await listed.json()) as { sessions: unknown[] }).sessions;
+    expect(sessions).toHaveLength(2);
   });
 });

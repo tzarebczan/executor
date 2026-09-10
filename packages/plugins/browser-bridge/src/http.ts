@@ -10,6 +10,7 @@
  *   GET    /api/browser-bridge/sessions
  */
 
+import { localToolAddress, parseLocalBrowserIdentity } from "./local-identity";
 import {
   createSession,
   deleteSession,
@@ -118,6 +119,10 @@ export function makeBrowserBridgeHandler(deps: BrowserBridgeHttpDeps) {
     // POST /session, open reverse channel + ensure catalog shows Chrome
     if (path === "/session" && request.method === "POST") {
       const body = (await readJson(request)) as Record<string, unknown> | null;
+      const identity = parseLocalBrowserIdentity({
+        client: body?.client,
+        connection: body?.connection,
+      });
       const session = createSession({
         userId,
         organizationId,
@@ -126,6 +131,7 @@ export function makeBrowserBridgeHandler(deps: BrowserBridgeHttpDeps) {
         client: (body?.client as Record<string, unknown>) || undefined,
         capabilities: body?.capabilities,
         connection: (body?.connection as Record<string, unknown>) || undefined,
+        identity,
       });
 
       let catalog: { ok: boolean; detail?: string } | undefined;
@@ -144,8 +150,8 @@ export function makeBrowserBridgeHandler(deps: BrowserBridgeHttpDeps) {
         resultPath: `/api/browser-bridge/session/${session.id}/result`,
         // What should appear in Executor UI after this
         integration: "browser",
-        connection: "desktop",
-        address: "tools.browser.user.desktop",
+        connection: session.connectionName,
+        address: localToolAddress(session.connectionName),
         catalog,
       });
     }
@@ -157,11 +163,19 @@ export function makeBrowserBridgeHandler(deps: BrowserBridgeHttpDeps) {
       }
       try {
         const catalog = await deps.ensureCatalog(request);
+        const live = listSessionsForUser(userId);
+        const connection = live[0]?.connectionName || "desktop";
         return json({
           ...catalog,
           integration: "browser",
-          connection: "desktop",
-          address: "tools.browser.user.desktop",
+          connection,
+          address: localToolAddress(connection),
+          connections: live.map((session) => ({
+            connection: session.connectionName,
+            address: localToolAddress(session.connectionName),
+            ...(session.label ? { label: session.label } : {}),
+            ...(session.browser ? { browser: session.browser } : {}),
+          })),
         });
       } catch (e) {
         return json({ ok: false, error: String(e) }, 500);

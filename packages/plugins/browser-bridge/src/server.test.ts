@@ -91,6 +91,7 @@ const session = (overrides: Partial<BridgeSession> = {}): BridgeSession =>
     userId: "user-1",
     kind: "browser",
     transport: "reverse",
+    connectionName: "desktop",
     createdAt: NOW - 60_000,
     lastSeenAt: NOW,
     pending: [],
@@ -101,14 +102,14 @@ const session = (overrides: Partial<BridgeSession> = {}): BridgeSession =>
 
 describe("localBridgeVerdict", () => {
   it("does not report an absent extension as healthy", () => {
-    const verdict = localBridgeVerdict([], NOW);
+    const verdict = localBridgeVerdict(undefined, NOW);
     expect(verdict.status).toBe("degraded");
     expect(verdict.detail).toContain("Connect");
   });
 
   it("degrades a session that stopped polling, and says how long ago", () => {
     const verdict = localBridgeVerdict(
-      [session({ lastSeenAt: NOW - SESSION_STALE_MS - 5_000 })],
+      session({ lastSeenAt: NOW - SESSION_STALE_MS - 5_000 }),
       NOW,
     );
     expect(verdict.status).toBe("degraded");
@@ -118,13 +119,11 @@ describe("localBridgeVerdict", () => {
 
   it("reports a freshly polled session as healthy with the extension it identified as", () => {
     const verdict = localBridgeVerdict(
-      [
-        session({
-          lastSeenAt: NOW - 1_000,
-          client: { name: "executor-browser", version: "1.4.0" },
-          capabilities: { tools: ["ping", "snapshot"] },
-        }),
-      ],
+      session({
+        lastSeenAt: NOW - 1_000,
+        client: { name: "executor-browser", version: "1.4.0" },
+        capabilities: { tools: ["ping", "snapshot"] },
+      }),
       NOW,
     );
     expect(verdict.status).toBe("healthy");

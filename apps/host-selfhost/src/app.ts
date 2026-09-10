@@ -84,8 +84,9 @@ export const makeSelfHostApp = async (options: MakeSelfHostAppOptions = {}) => {
   // rejects cookie-only requests before this resolver runs, so a page the user
   // has open cannot reach the bridge with their ambient session.
   //
-  // After a session opens we provision tools.browser.user.desktop via MCP
-  // `browserBridge.ensureChrome` (static tool) so the Executor UI shows Chrome.
+  // After a session opens we provision tools.browser.user.<connection> via MCP
+  // `browserBridge.ensureChrome` (static tool) so the Executor UI shows each
+  // connected local browser.
   const browserBridgeHandler = makeBrowserBridgeHandler({
     getSession: async (request) => {
       // oxlint-disable-next-line executor/no-try-catch-or-throw -- boundary: Better Auth reports malformed or unavailable sessions by rejecting

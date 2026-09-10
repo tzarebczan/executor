@@ -1,11 +1,22 @@
 /* oxlint-disable executor/no-error-constructor, executor/no-promise-reject, executor/no-try-catch-or-throw -- boundary: the in-memory long-poll adapter exposes Promise rejection to HTTP and plugin callers, and guards JSON encoding of untrusted extension results */
 
+import {
+  allocateConnectionName,
+  DEFAULT_LOCAL_CONNECTION,
+  localToolAddress,
+  parseLocalBrowserIdentity,
+  type LocalBrowserIdentity,
+} from "./local-identity";
+
 /**
  * In-process reverse browser-bridge sessions.
  *
  * Extension (path B) opens a session and long-polls for jobs.
- * Agents enqueue tools via plugin tools (tools.browser.user.desktop.*) and wait for results.
+ * Agents enqueue tools via plugin tools (tools.browser.user.<connection>.*) and wait for results.
  * There is no raw HTTP /browser-bridge/call, only session/jobs/result.
+ *
+ * One session per extension instance, not one per user: Chrome and Brave can
+ * both stay connected, and each is a distinct catalog connection.
  */
 
 export type BridgeJob = {
@@ -42,6 +53,12 @@ export type BridgeSession = {
   client?: Record<string, unknown>;
   capabilities?: unknown;
   connection?: Record<string, unknown>;
+  /** Stable id the extension persists so reconnects replace this session only. */
+  instanceId?: string;
+  browser?: string;
+  label?: string;
+  /** Catalog connection this session is bound to (`tools.browser.user.<name>`). */
+  connectionName: string;
   createdAt: number;
   lastSeenAt: number;
   /** Jobs waiting to be picked up by the extension */
@@ -102,21 +119,47 @@ export type CreateSessionInput = {
   client?: Record<string, unknown>;
   capabilities?: unknown;
   connection?: Record<string, unknown>;
+  identity?: LocalBrowserIdentity;
 };
+
+function dropSession(id: string, reason: string): void {
+  const s = sessions.get(id);
+  if (!s) return;
+  for (const j of s.pending) j.reject(new Error(reason));
+  for (const j of s.inflight.values()) j.reject(new Error(reason));
+  for (const w of s.waiters) {
+    clearTimeout(w.timer);
+    w.resolve([]);
+  }
+  sessions.delete(id);
+}
+
+function isSameInstance(session: BridgeSession, instanceId?: string): boolean {
+  return instanceId ? session.instanceId === instanceId : !session.instanceId;
+}
 
 export function createSession(input: CreateSessionInput): BridgeSession {
   gc();
-  // One live desktop session per user (replace prior)
+  const identity =
+    input.identity ??
+    parseLocalBrowserIdentity({ client: input.client, connection: input.connection });
+
+  // Reconnect of the same extension instance replaces that session only.
+  // A second browser (different instanceId) stays connected.
+  // Older extensions that send no instanceId still replace each other, which
+  // is the previous one-desktop-session behaviour.
+  let connectionName: string | undefined;
   for (const [id, s] of sessions) {
-    if (s.userId === input.userId) {
-      for (const j of s.pending) j.reject(new Error("session replaced"));
-      for (const j of s.inflight.values()) j.reject(new Error("session replaced"));
-      for (const w of s.waiters) {
-        clearTimeout(w.timer);
-        w.resolve([]);
-      }
-      sessions.delete(id);
-    }
+    if (s.userId !== input.userId || !isSameInstance(s, identity.instanceId)) continue;
+    connectionName ??= s.connectionName;
+    dropSession(id, "session replaced");
+  }
+
+  if (!connectionName) {
+    const taken = [...sessions.values()]
+      .filter((s) => s.userId === input.userId)
+      .map((s) => s.connectionName);
+    connectionName = allocateConnectionName(identity, taken);
   }
 
   const session: BridgeSession = {
@@ -128,6 +171,10 @@ export function createSession(input: CreateSessionInput): BridgeSession {
     client: input.client,
     capabilities: input.capabilities,
     connection: input.connection,
+    ...(identity.instanceId ? { instanceId: identity.instanceId } : {}),
+    ...(identity.browser ? { browser: identity.browser } : {}),
+    ...(identity.label || identity.browser ? { label: identity.label || identity.browser } : {}),
+    connectionName,
     createdAt: Date.now(),
     lastSeenAt: Date.now(),
     pending: [],
@@ -146,6 +193,17 @@ export function getSession(id: string): BridgeSession | undefined {
 export function listSessionsForUser(userId: string): BridgeSession[] {
   gc();
   return [...sessions.values()].filter((s) => s.userId === userId);
+}
+
+export function findSessionForConnection(
+  userId: string,
+  connectionName: string,
+): BridgeSession | undefined {
+  return listSessionsForUser(userId).find(
+    (session) =>
+      session.connectionName === connectionName ||
+      (!session.connectionName && connectionName === DEFAULT_LOCAL_CONNECTION),
+  );
 }
 
 /**
@@ -301,28 +359,48 @@ export function postResult(
 export type CallToolInput = {
   userId: string;
   sessionId?: string;
+  connection?: string;
   tool: string;
   args?: Record<string, unknown>;
   timeoutMs?: number;
   caller?: BridgeCaller;
 };
 
+function sessionForCall(input: CallToolInput): BridgeSession | undefined {
+  if (input.sessionId) {
+    const session = getSession(input.sessionId);
+    return session && session.userId === input.userId ? session : undefined;
+  }
+  if (input.connection) {
+    return findSessionForConnection(input.userId, input.connection);
+  }
+  const live = listSessionsForUser(input.userId);
+  return live.length === 1 ? live[0] : undefined;
+}
+
+function noSessionMessage(input: CallToolInput): string {
+  const live = listSessionsForUser(input.userId);
+  if (live.length > 1 && !input.sessionId && !input.connection) {
+    const named = live
+      .map(
+        (session) =>
+          `${session.label || session.browser || session.connectionName} (${localToolAddress(session.connectionName)})`,
+      )
+      .join(", ");
+    return `Multiple local browsers are connected: ${named}. Call the matching tools.browser.user.<connection> prefix.`;
+  }
+  if (input.connection) {
+    return `No live Executor Browser session for ${localToolAddress(input.connection)}. Open that browser's side panel and press Connect.`;
+  }
+  return "No live browser bridge session. Open Executor Browser extension → Connect (path B reverse).";
+}
+
 /** Agent path: enqueue tool, wait for extension result. */
 export function callTool(input: CallToolInput): Promise<unknown> {
   gc();
-  let s: BridgeSession | undefined;
-  if (input.sessionId) {
-    s = getSession(input.sessionId);
-    if (s && s.userId !== input.userId) s = undefined;
-  } else {
-    s = listSessionsForUser(input.userId)[0];
-  }
+  const s = sessionForCall(input);
   if (!s) {
-    return Promise.reject(
-      new Error(
-        "No live browser bridge session. Open Executor Browser extension → Connect (path B reverse).",
-      ),
-    );
+    return Promise.reject(new Error(noSessionMessage(input)));
   }
   // Deliberately no `touch`: this is the agent calling in, not the extension
   // checking in. Stamping here let a retry loop hold a dead extension at
@@ -371,6 +449,10 @@ export function sessionPublicView(s: BridgeSession) {
     inflight: s.inflight.size,
     client: s.client,
     capabilities: s.capabilities,
+    connection: s.connectionName,
+    address: localToolAddress(s.connectionName),
+    ...(s.browser ? { browser: s.browser } : {}),
+    ...(s.label ? { label: s.label } : {}),
   };
 }
 

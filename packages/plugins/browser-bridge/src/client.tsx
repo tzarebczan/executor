@@ -204,7 +204,7 @@ function agentPromptFor(target: BrowserTargetView): string {
   const local = target.provider === "local-extension";
   const lines = [
     local
-      ? "You can control my Chrome browser through Executor."
+      ? `You can control this local browser (${target.name}) through Executor.`
       : `You can control a remote browser (${target.name}) through Executor.`,
     "",
     `Browser tools: ${target.address} (tabs, navigate, snapshot, click, type, screenshot).`,
@@ -216,6 +216,7 @@ function agentPromptFor(target: BrowserTargetView): string {
     lines.push(
       "- Only tabs in my Executor tab group are controllable; others are refused.",
       "- Normal http(s) pages only; chrome:// pages are refused.",
+      "- If several local browsers are connected, this address is this one. Other browsers have their own tools.browser.user.<connection> prefix — call status to list them.",
     );
   } else {
     lines.push(
@@ -1133,41 +1134,42 @@ function TargetCard({ target }: { readonly target: BrowserTargetView }) {
                   Stop
                 </Button>
               )}
-            {/* Local Chrome is not removable here: its lifecycle
-                            belongs to the extension, and ensureChrome would
-                            re-register it anyway, a Remove that undoes itself
-                            reads as a bug. */}
-            {target.provider !== "local-extension" && target.connection && (
-              <Button
-                variant="outline"
-                size="sm"
-                className="text-destructive hover:text-destructive"
-                disabled={busy !== null}
-                onClick={async () => {
-                  if (
-                    !window.confirm(
-                      `Remove "${target.name}"? Any running session is stopped and its credential is deleted.`,
-                    )
-                  ) {
-                    return;
-                  }
-                  setBusy("remove");
-                  const exit = await removeTarget({
-                    params,
-                    reactivityKeys: ["browser-control"],
-                  });
-                  setRemoveError(
-                    Exit.isSuccess(exit)
-                      ? null
-                      : messageFromExit(exit, "Could not remove this browser"),
-                  );
-                  setBusy(null);
-                }}
-              >
-                <X className="size-3.5" />
-                {busy === "remove" ? "Removing..." : "Remove"}
-              </Button>
-            )}
+            {/* A live local extension reconnects itself, so Remove would
+                            undo on the next poll. An offline extra browser
+                            (second Chrome, Brave) is a catalog row the user
+                            may want gone. */}
+            {target.connection &&
+              (target.provider !== "local-extension" || target.state !== "live") && (
+                <Button
+                  variant="outline"
+                  size="sm"
+                  className="text-destructive hover:text-destructive"
+                  disabled={busy !== null}
+                  onClick={async () => {
+                    if (
+                      !window.confirm(
+                        `Remove "${target.name}"? Any running session is stopped and its credential is deleted.`,
+                      )
+                    ) {
+                      return;
+                    }
+                    setBusy("remove");
+                    const exit = await removeTarget({
+                      params,
+                      reactivityKeys: ["browser-control"],
+                    });
+                    setRemoveError(
+                      Exit.isSuccess(exit)
+                        ? null
+                        : messageFromExit(exit, "Could not remove this browser"),
+                    );
+                    setBusy(null);
+                  }}
+                >
+                  <X className="size-3.5" />
+                  {busy === "remove" ? "Removing..." : "Remove"}
+                </Button>
+              )}
           </div>
           {removeError && <p className="mt-2 text-xs text-destructive">{removeError}</p>}
           {test && <ConnectionTestResult result={test} />}

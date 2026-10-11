@@ -77,6 +77,7 @@ import { LocalAuthApi } from "../contracts/auth.ts";
 import { AccountConnectApi } from "../contracts/account-connections.ts";
 import { browserTelemetry } from "./telemetry.ts";
 import { webFiles } from "./web.ts";
+import { browserBridgeRoutes } from "@executor-js/browser-bridge/effect";
 import { withHostPipeline } from "@executor-js/dashboard-start/in-process";
 import { layerBuildHeader } from "@executor-js/dashboard-start/build-header";
 import { localManagementDocument } from "../contracts/management.ts";
@@ -385,6 +386,21 @@ export const localApi = (
         HttpRouter.add("POST", "/dashboard/api/telemetry/logs", browserTelemetry(config, "logs")),
         programmatic,
         HttpRouter.add("*", "/mcp", mcp.http),
+        // One in-memory table for this process. Loopback only, so the status page
+        // is the same single user the API key connects.
+        browserBridgeRoutes({
+          api: (request) =>
+            Effect.sync(() => {
+              const key = Redacted.value(config.apiKey);
+              const authorization = request.headers.get("authorization") ?? "";
+              const headerKey = request.headers.get("x-api-key") ?? "";
+              const presented = authorization.startsWith("Bearer ")
+                ? authorization.slice("Bearer ".length)
+                : headerKey;
+              return presented === key ? { userId: "local" } : null;
+            }),
+          page: () => Effect.succeed({ userId: "local" }),
+        }),
         HttpRouter.add("*", "/api/auth/*", oauth.handler),
         HttpRouter.add("GET", "/.well-known/oauth-protected-resource", oauth.protectedResource),
         HttpRouter.add("GET", "/.well-known/oauth-protected-resource/mcp", oauth.protectedResource),

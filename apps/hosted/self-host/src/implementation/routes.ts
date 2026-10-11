@@ -17,6 +17,8 @@ import { hostedAppGitAccess } from "@executor-js/hosted-server/app-management";
 import {
   browserTelemetry,
   requestServices,
+  ApiAuthentication,
+  Authentication,
   HostedExecutor,
   ScheduledAuthority,
   ScheduleWakeup,
@@ -43,6 +45,7 @@ import { appUiBaseUrl, catalogFeedUrl } from "../contracts/config.ts";
 import { type HostEgress } from "@executor-js/utils/url-policy";
 import { Config, Effect, Layer, Option } from "effect";
 import { HttpRouter, HttpServer, HttpServerRequest, HttpServerResponse } from "effect/http";
+import { browserBridgeRoutes } from "@executor-js/browser-bridge/effect";
 import { withHostPipeline } from "@executor-js/dashboard-start/in-process";
 import { selfHostApi } from "./api.ts";
 import { selfHostMcp } from "../mcp.ts";
@@ -180,6 +183,36 @@ export const selfHostRouteMap = <DashboardE, DashboardR>(options: {
         HttpRouter.provideRequest(executorServices),
         HttpRouter.provideRequest(auth.identity),
       ),
+      // Built once with this route map: the Bun process, or the one product actor.
+      browserBridgeRoutes({
+        api: (request) =>
+          Effect.gen(function* () {
+            const api = yield* ApiAuthentication;
+            const access = yield* Effect.option(api.authenticate(request.headers));
+            if (Option.isNone(access)) return null;
+            return {
+              userId: access.value.userId,
+              organizationId: access.value.access.organization,
+            };
+          }),
+        page: (request) =>
+          Effect.gen(function* () {
+            const api = yield* ApiAuthentication;
+            const access = yield* Effect.option(api.authenticate(request.headers));
+            if (Option.isSome(access)) {
+              return {
+                userId: access.value.userId,
+                organizationId: access.value.access.organization,
+              };
+            }
+            const session = yield* Authentication;
+            const principal = yield* session.current(request.headers).pipe(
+              Effect.orElseSucceed(() => null),
+            );
+            if (principal === null) return null;
+            return { userId: principal.userId };
+          }),
+      }).pipe(HttpRouter.provideRequest(auth.apiIdentity), HttpRouter.provideRequest(auth.identity)),
       HttpRouter.add("GET", "*", dashboard),
     );
     const notFound = HttpServerResponse.empty({ status: 404 });

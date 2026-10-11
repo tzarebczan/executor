@@ -276,7 +276,12 @@ export function createBridge() {
     }));
   }
 
-  function takeJobs(sessionId: string, userId: string, waitMs: number): Promise<{ ok: true; jobs: ReturnType<typeof drain> } | { ok: false; error: string }> {
+  function takeJobs(
+    sessionId: string,
+    userId: string,
+    waitMs: number,
+    signal?: AbortSignal,
+  ): Promise<{ ok: true; jobs: ReturnType<typeof drain> } | { ok: false; error: string }> {
     const session = sessions.get(sessionId);
     if (!session || session.userId !== userId) return Promise.resolve({ ok: false, error: "session not found" });
     touch(session);
@@ -284,8 +289,13 @@ export function createBridge() {
     const ms = Math.min(Math.max(waitMs, 0), 30_000);
     if (ms === 0) return Promise.resolve({ ok: true, jobs: [] });
     return new Promise((resolve) => {
-      const resolveJobs = (jobs: BridgeJob[]) => {
-        clearTimeout(timer);
+      let settled = false;
+      let hold: ReturnType<typeof setTimeout> | undefined;
+      const finish = (jobs: BridgeJob[]) => {
+        if (settled) return;
+        settled = true;
+        if (hold !== undefined) clearTimeout(hold);
+        signal?.removeEventListener("abort", onAbort);
         resolve({
           ok: true,
           jobs: jobs.map((job) => ({
@@ -296,11 +306,21 @@ export function createBridge() {
           })),
         });
       };
+      const onAbort = () => {
+        session.waiters = session.waiters.filter((waiter) => waiter.resolve !== finish);
+        finish([]);
+      };
       const timer = setTimeout(() => {
-        session.waiters = session.waiters.filter((waiter) => waiter.resolve !== resolveJobs);
-        resolve({ ok: true, jobs: [] });
+        session.waiters = session.waiters.filter((waiter) => waiter.resolve !== finish);
+        finish([]);
       }, ms);
-      session.waiters.push({ resolve: resolveJobs, timer });
+      hold = timer;
+      if (signal?.aborted) {
+        onAbort();
+        return;
+      }
+      signal?.addEventListener("abort", onAbort, { once: true });
+      session.waiters.push({ resolve: finish, timer });
     });
   }
 
@@ -521,7 +541,12 @@ export function createBridge() {
     }
     if (sub === "jobs" && request.method === "GET") {
       const waitMs = Number(url.searchParams.get("waitMs") || "25000");
-      const taken = await takeJobs(sessionId, principal.userId, Number.isFinite(waitMs) ? waitMs : 25000);
+      const taken = await takeJobs(
+        sessionId,
+        principal.userId,
+        Number.isFinite(waitMs) ? waitMs : 25000,
+        request.signal,
+      );
       return taken.ok ? json({ jobs: taken.jobs }) : json({ error: taken.error }, 404);
     }
     if (sub === "result" && request.method === "POST") {

@@ -72,7 +72,13 @@ import { installExecutorApp } from "./executor-app.ts";
 import { localSkills } from "./app-browser.ts";
 import { localMcp } from "./mcp.ts";
 import { dashboard } from "./dashboard.ts";
-import { makeLocalAuth, authHandlers, localBearer, type LocalAuth } from "./auth.ts";
+import {
+  makeLocalAuth,
+  authHandlers,
+  localBearer,
+  localCredential,
+  type LocalAuth,
+} from "./auth.ts";
 import { LocalWebhookSetupApi } from "../contracts/webhook-setup.ts";
 import { localWebhookSetupHandlers } from "./webhook-setup.ts";
 import { DesktopReturnApi } from "../contracts/desktop-return.ts";
@@ -490,15 +496,38 @@ export const localApi = (
         browserBridgeRoutes({
           api: (request) =>
             Effect.sync(() => {
-              const key = Redacted.value(config.apiKey);
-              const authorization = request.headers.get("authorization") ?? "";
-              const headerKey = request.headers.get("x-api-key") ?? "";
-              const presented = authorization.startsWith("Bearer ")
-                ? authorization.slice("Bearer ".length)
-                : headerKey;
-              return presented === key ? { userId: "local" } : null;
+              const authorization = request.headers.get("authorization");
+              // A presented Authorization is the only credential. Falling through
+              // to x-api-key would accept a second header after a bad bearer.
+              // localRequest refuses any Origin other than the dashboard. The
+              // extension's origin is chrome-extension://, so this route does not use it.
+              const headerKey = request.headers.get("x-api-key") ?? undefined;
+              const matches =
+                authorization !== null
+                  ? localBearer(config, authorization)
+                  : localCredential(config, headerKey);
+              return { principal: matches ? { userId: "local" } : null };
             }),
-          page: () => Effect.succeed({ userId: "local" }),
+          // DNS rebinding presents Host: evil.com while connecting to loopback.
+          // The API key still guards the channel. This page has no key, so it
+          // allows only this process's loopback host, or the configured browser origin.
+          page: (request) =>
+            Effect.sync(() => {
+              const host = request.headers.get("host") ?? "";
+              const allowed = [
+                `http://127.0.0.1:${config.port}`,
+                `http://localhost:${config.port}`,
+                ...(config.browserOrigin === undefined ? [] : [config.browserOrigin]),
+              ];
+              const named = allowed.some((origin) => {
+                try {
+                  return new URL(origin).host === host;
+                } catch {
+                  return false;
+                }
+              });
+              return { principal: named ? { userId: "local" } : null };
+            }),
         }),
         HttpRouter.add("*", "/api/auth/*", oauth.handler),
         HttpRouter.add("GET", "/.well-known/oauth-protected-resource", oauth.protectedResource),

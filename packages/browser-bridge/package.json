@@ -1,0 +1,12 @@
+{
+  "name": "@executor-js/browser-bridge",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/bridge.ts",
+    "./effect": "./src/effect.ts"
+  },
+  "dependencies": {
+    "effect": "4.0.1"
+  }
+}

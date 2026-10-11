@@ -17,6 +17,8 @@ import { hostedAppGitAccess } from "@executor-js/hosted-server/app-management";
 import {
   browserTelemetry,
   requestServices,
+  ApiAuthentication,
+  Authentication,
   HostedExecutor,
   ScheduledAuthority,
   ScheduleWakeup,
@@ -43,6 +45,7 @@ import { appUiBaseUrl, catalogFeedUrl } from "../contracts/config.ts";
 import { type HostEgress } from "@executor-js/utils/url-policy";
 import { Config, Effect, Layer, Option } from "effect";
 import { HttpRouter, HttpServer, HttpServerRequest, HttpServerResponse } from "effect/http";
+import { browserBridgeRoutes } from "@executor-js/browser-bridge/effect";
 import { withHostPipeline } from "@executor-js/dashboard-start/in-process";
 import { selfHostApi } from "./api.ts";
 import { selfHostMcp } from "../mcp.ts";
@@ -180,6 +183,56 @@ export const selfHostRouteMap = <DashboardE, DashboardR>(options: {
         HttpRouter.provideRequest(executorServices),
         HttpRouter.provideRequest(auth.identity),
       ),
+      // Built once with this route map: the Bun process, or the one product actor.
+      browserBridgeRoutes({
+        api: (request) =>
+          Effect.gen(function* () {
+            const api = yield* ApiAuthentication;
+            return yield* api.authenticate(request.headers).pipe(
+              Effect.map((value) => ({
+                principal: {
+                  userId: value.userId,
+                  organizationId: value.access.organization,
+                },
+              })),
+              Effect.catchTags({
+                Unauthorized: () => Effect.succeed({ principal: null }),
+                OrganizationForbidden: () => Effect.succeed({ principal: null }),
+                AuthenticationUnavailable: () =>
+                  Effect.succeed({ principal: null, unavailable: true }),
+              }),
+            );
+          }),
+        page: (request) =>
+          Effect.gen(function* () {
+            const api = yield* ApiAuthentication;
+            const apiAuth = yield* api.authenticate(request.headers).pipe(
+              Effect.map((value) => ({
+                principal: {
+                  userId: value.userId,
+                  organizationId: value.access.organization,
+                },
+              })),
+              Effect.catchTags({
+                Unauthorized: () => Effect.succeed({ principal: null }),
+                OrganizationForbidden: () => Effect.succeed({ principal: null }),
+                AuthenticationUnavailable: () =>
+                  Effect.succeed({ principal: null, unavailable: true }),
+              }),
+            );
+            if (apiAuth.unavailable) return apiAuth;
+            if (apiAuth.principal !== null) return apiAuth;
+            const session = yield* Authentication;
+            return yield* session.current(request.headers).pipe(
+              Effect.map((principal) => ({
+                principal: principal === null ? null : { userId: principal.userId },
+              })),
+              Effect.catchTag("AuthenticationUnavailable", () =>
+                Effect.succeed({ principal: null, unavailable: true }),
+              ),
+            );
+          }),
+      }).pipe(HttpRouter.provideRequest(auth.apiIdentity), HttpRouter.provideRequest(auth.identity)),
       HttpRouter.add("GET", "*", dashboard),
     );
     const notFound = HttpServerResponse.empty({ status: 404 });

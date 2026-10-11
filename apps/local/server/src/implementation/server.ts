@@ -40,6 +40,7 @@ import {
   remoteRegistry,
 } from "@executor-js/sdk/core";
 import { filesystemBlobStore, workerdApps } from "@executor-js/sdk/node";
+import { timingSafeEqual } from "node:crypto";
 import {
   Config,
   Effect,
@@ -77,6 +78,7 @@ import { LocalAuthApi } from "../contracts/auth.ts";
 import { AccountConnectApi } from "../contracts/account-connections.ts";
 import { browserTelemetry } from "./telemetry.ts";
 import { webFiles } from "./web.ts";
+import { browserBridgeRoutes } from "@executor-js/browser-bridge/effect";
 import { withHostPipeline } from "@executor-js/dashboard-start/in-process";
 import { layerBuildHeader } from "@executor-js/dashboard-start/build-header";
 import { localManagementDocument } from "../contracts/management.ts";
@@ -385,6 +387,41 @@ export const localApi = (
         HttpRouter.add("POST", "/dashboard/api/telemetry/logs", browserTelemetry(config, "logs")),
         programmatic,
         HttpRouter.add("*", "/mcp", mcp.http),
+        // One in-memory table for this process. Loopback only, so the status page
+        // is the same single user the API key connects.
+        browserBridgeRoutes({
+          api: (request) =>
+            Effect.sync(() => {
+              const key = Redacted.value(config.apiKey);
+              const authorization = request.headers.get("authorization");
+              // A presented Authorization is the only credential. Falling through
+              // to x-api-key would accept a second header after a bad bearer.
+              // The extension sends Origin, so this route does not use the
+              // programmatic Origin refusal above.
+              const presented =
+                authorization === null
+                  ? (request.headers.get("x-api-key") ?? "")
+                  : authorization.startsWith("Bearer ")
+                    ? authorization.slice("Bearer ".length)
+                    : "";
+              const left = Buffer.from(presented);
+              const right = Buffer.from(key);
+              const matches =
+                left.length === right.length && left.length > 0 && timingSafeEqual(left, right);
+              return { principal: matches ? { userId: "local" } : null };
+            }),
+          // DNS rebinding presents Host: evil.com while connecting to loopback.
+          // The API key still guards the channel. This page has no key.
+          page: (request) =>
+            Effect.sync(() => {
+              const host = request.headers.get("host") ?? "";
+              const name = host.startsWith("[")
+                ? host.slice(1, host.indexOf("]"))
+                : (host.split(":")[0] ?? "");
+              const loopback = name === "localhost" || name === "127.0.0.1" || name === "::1";
+              return { principal: loopback ? { userId: "local" } : null };
+            }),
+        }),
         HttpRouter.add("*", "/api/auth/*", oauth.handler),
         HttpRouter.add("GET", "/.well-known/oauth-protected-resource", oauth.protectedResource),
         HttpRouter.add("GET", "/.well-known/oauth-protected-resource/mcp", oauth.protectedResource),

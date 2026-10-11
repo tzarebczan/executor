@@ -188,29 +188,49 @@ export const selfHostRouteMap = <DashboardE, DashboardR>(options: {
         api: (request) =>
           Effect.gen(function* () {
             const api = yield* ApiAuthentication;
-            const access = yield* Effect.option(api.authenticate(request.headers));
-            if (Option.isNone(access)) return null;
-            return {
-              userId: access.value.userId,
-              organizationId: access.value.access.organization,
-            };
+            return yield* api.authenticate(request.headers).pipe(
+              Effect.map((value) => ({
+                principal: {
+                  userId: value.userId,
+                  organizationId: value.access.organization,
+                },
+              })),
+              Effect.catchTags({
+                Unauthorized: () => Effect.succeed({ principal: null }),
+                OrganizationForbidden: () => Effect.succeed({ principal: null }),
+                AuthenticationUnavailable: () =>
+                  Effect.succeed({ principal: null, unavailable: true }),
+              }),
+            );
           }),
         page: (request) =>
           Effect.gen(function* () {
             const api = yield* ApiAuthentication;
-            const access = yield* Effect.option(api.authenticate(request.headers));
-            if (Option.isSome(access)) {
-              return {
-                userId: access.value.userId,
-                organizationId: access.value.access.organization,
-              };
-            }
-            const session = yield* Authentication;
-            const principal = yield* session.current(request.headers).pipe(
-              Effect.orElseSucceed(() => null),
+            const apiAuth = yield* api.authenticate(request.headers).pipe(
+              Effect.map((value) => ({
+                principal: {
+                  userId: value.userId,
+                  organizationId: value.access.organization,
+                },
+              })),
+              Effect.catchTags({
+                Unauthorized: () => Effect.succeed({ principal: null }),
+                OrganizationForbidden: () => Effect.succeed({ principal: null }),
+                AuthenticationUnavailable: () =>
+                  Effect.succeed({ principal: null, unavailable: true }),
+              }),
             );
-            if (principal === null) return null;
-            return { userId: principal.userId };
+            if (apiAuth.unavailable) return apiAuth;
+            if (apiAuth.principal !== null) return apiAuth;
+            const session = yield* Authentication;
+            return yield* session.current(request.headers).pipe(
+              Effect.map((principal) => ({
+                principal: principal === null ? null : { userId: principal.userId },
+              })),
+              Effect.catchTag("AuthenticationUnavailable", () =>
+                Effect.succeed({ principal: null, unavailable: true }),
+              ),
+            );
           }),
       }).pipe(HttpRouter.provideRequest(auth.apiIdentity), HttpRouter.provideRequest(auth.identity)),
       HttpRouter.add("GET", "*", dashboard),

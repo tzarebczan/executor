@@ -40,6 +40,7 @@ import {
   remoteRegistry,
 } from "@executor-js/sdk/core";
 import { filesystemBlobStore, workerdApps } from "@executor-js/sdk/node";
+import { timingSafeEqual } from "node:crypto";
 import {
   Config,
   Effect,
@@ -392,14 +393,34 @@ export const localApi = (
           api: (request) =>
             Effect.sync(() => {
               const key = Redacted.value(config.apiKey);
-              const authorization = request.headers.get("authorization") ?? "";
-              const headerKey = request.headers.get("x-api-key") ?? "";
-              const presented = authorization.startsWith("Bearer ")
-                ? authorization.slice("Bearer ".length)
-                : headerKey;
-              return presented === key ? { userId: "local" } : null;
+              const authorization = request.headers.get("authorization");
+              // A presented Authorization is the only credential. Falling through
+              // to x-api-key would accept a second header after a bad bearer.
+              // The extension sends Origin, so this route does not use the
+              // programmatic Origin refusal above.
+              const presented =
+                authorization === null
+                  ? (request.headers.get("x-api-key") ?? "")
+                  : authorization.startsWith("Bearer ")
+                    ? authorization.slice("Bearer ".length)
+                    : "";
+              const left = Buffer.from(presented);
+              const right = Buffer.from(key);
+              const matches =
+                left.length === right.length && left.length > 0 && timingSafeEqual(left, right);
+              return { principal: matches ? { userId: "local" } : null };
             }),
-          page: () => Effect.succeed({ userId: "local" }),
+          // DNS rebinding presents Host: evil.com while connecting to loopback.
+          // The API key still guards the channel. This page has no key.
+          page: (request) =>
+            Effect.sync(() => {
+              const host = request.headers.get("host") ?? "";
+              const name = host.startsWith("[")
+                ? host.slice(1, host.indexOf("]"))
+                : (host.split(":")[0] ?? "");
+              const loopback = name === "localhost" || name === "127.0.0.1" || name === "::1";
+              return { principal: loopback ? { userId: "local" } : null };
+            }),
         }),
         HttpRouter.add("*", "/api/auth/*", oauth.handler),
         HttpRouter.add("GET", "/.well-known/oauth-protected-resource", oauth.protectedResource),

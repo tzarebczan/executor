@@ -153,6 +153,7 @@
         "@executor-js/app-management": "workspace:*",
         "@executor-js/app-source": "workspace:*",
         "@executor-js/app-templates": "workspace:*",
+        "@executor-js/browser-bridge": "workspace:*",
         "@executor-js/dashboard-start": "workspace:*",
         "@executor-js/hosted-self-host-web": "workspace:*",
         "@executor-js/hosted-server": "workspace:*",
@@ -308,6 +309,7 @@
         "@executor-js/app-management": "workspace:*",
         "@executor-js/app-source": "workspace:*",
         "@executor-js/app-templates": "workspace:*",
+        "@executor-js/browser-bridge": "workspace:*",
         "@executor-js/catalog": "workspace:*",
         "@executor-js/dashboard-start": "workspace:*",
         "@executor-js/local-web": "workspace:*",
@@ -486,7 +488,7 @@
     },
     "packages/apps": {
       "name": "apps",
-      "version": "0.0.1-beta.120",
+      "version": "0.0.1-beta.122",
       "dependencies": {
         "@cfworker/json-schema": "4.1.1",
         "@csstools/css-tokenizer": "4.0.2",
@@ -528,6 +530,12 @@
       "name": "@executor-js/authorization",
       "dependencies": {
         "@executor-js/sdk": "workspace:*",
+        "effect": "4.0.1",
+      },
+    },
+    "packages/browser-bridge": {
+      "name": "@executor-js/browser-bridge",
+      "dependencies": {
         "effect": "4.0.1",
       },
     },
@@ -1397,6 +1405,8 @@
     "@executor-js/app-workflow-report": ["@executor-js/app-workflow-report@workspace:playground/demo-apps/workflow-report"],
 
     "@executor-js/authorization": ["@executor-js/authorization@workspace:packages/authorization"],
+
+    "@executor-js/browser-bridge": ["@executor-js/browser-bridge@workspace:packages/browser-bridge"],
 
     "@executor-js/catalog": ["@executor-js/catalog@workspace:packages/catalog"],
 

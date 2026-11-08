@@ -73,11 +73,27 @@ export interface PublicSession {
 const AGENT_TOOLS = [
   { name: "ping", description: "Check that this browser is connected." },
   { name: "tabs.list", description: "List the tabs this browser lets agents use." },
-  { name: "tabs.open", description: "Open a page in the agent tab group.", input: { url: { type: "string" } } },
-  { name: "navigate", description: "Go to a URL in the current agent tab.", input: { url: { type: "string" } } },
+  {
+    name: "tabs.open",
+    description: "Open a page in the agent tab group.",
+    input: { url: { type: "string" } },
+  },
+  {
+    name: "navigate",
+    description: "Go to a URL in the current agent tab.",
+    input: { url: { type: "string" } },
+  },
   { name: "snapshot", description: "Read the structure of the current page." },
-  { name: "click", description: "Click an element from the latest snapshot.", input: { selector: { type: "string" } } },
-  { name: "type", description: "Type into an element from the latest snapshot.", input: { selector: { type: "string" }, text: { type: "string" } } },
+  {
+    name: "click",
+    description: "Click an element from the latest snapshot.",
+    input: { selector: { type: "string" } },
+  },
+  {
+    name: "type",
+    description: "Type into an element from the latest snapshot.",
+    input: { selector: { type: "string" }, text: { type: "string" } },
+  },
   { name: "screenshot", description: "Capture the current page." },
   {
     name: "evaluate",
@@ -96,17 +112,21 @@ function readString(value: unknown): string | undefined {
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === "object" && !Array.isArray(value)
-    ? value as Record<string, unknown>
+    ? (value as Record<string, unknown>)
     : undefined;
 }
 
 function slug(raw: string): string {
-  const cleaned = raw.toLowerCase().replace(/[^a-z0-9]+/g, "").slice(0, 32);
+  const cleaned = raw
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "")
+    .slice(0, 32);
   return cleaned || DEFAULT_CONNECTION;
 }
 
 function preferredName(identity: { browser?: string; label?: string; requested?: string }): string {
-  if (identity.requested && identity.requested !== DEFAULT_CONNECTION) return slug(identity.requested);
+  if (identity.requested && identity.requested !== DEFAULT_CONNECTION)
+    return slug(identity.requested);
   if (identity.label) return slug(identity.label);
   const browser = identity.browser?.toLowerCase();
   if (!browser || browser === "chrome" || browser === "chromium") return DEFAULT_CONNECTION;
@@ -189,11 +209,18 @@ export function createBridge() {
     return [...sessions.values()].filter((session) => session.userId === userId);
   }
 
-  function allocate(userId: string, identity: { browser?: string; label?: string; requested?: string }): string {
+  function allocate(
+    userId: string,
+    identity: { browser?: string; label?: string; requested?: string },
+  ): string {
     const taken = new Set(listForUser(userId).map((session) => session.connectionName));
     const preferred = preferredName(identity);
     if (!taken.has(preferred)) return preferred;
-    const base = slug(identity.label || identity.browser || (preferred === DEFAULT_CONNECTION ? "chrome" : preferred));
+    const base = slug(
+      identity.label ||
+        identity.browser ||
+        (preferred === DEFAULT_CONNECTION ? "chrome" : preferred),
+    );
     if (!taken.has(base)) return base;
     for (let n = 2; n < 100; n += 1) {
       const candidate = `${base}${n}`;
@@ -202,7 +229,10 @@ export function createBridge() {
     return `${base}${Date.now().toString(36)}`;
   }
 
-  function openSession(principal: BridgePrincipal, body: Record<string, unknown> | null): BridgeSession {
+  function openSession(
+    principal: BridgePrincipal,
+    body: Record<string, unknown> | null,
+  ): BridgeSession {
     gc();
     const client = asRecord(body?.client);
     const connection = asRecord(body?.connection);
@@ -250,7 +280,9 @@ export function createBridge() {
     return session;
   }
 
-  function drain(session: BridgeSession): Array<{ id: string; tool: string; args: Record<string, unknown>; caller?: BridgeCaller }> {
+  function drain(
+    session: BridgeSession,
+  ): Array<{ id: string; tool: string; args: Record<string, unknown>; caller?: BridgeCaller }> {
     const batch = session.pending.splice(0, session.pending.length);
     for (const job of batch) {
       job.delivered = true;
@@ -269,11 +301,13 @@ export function createBridge() {
     const waiter = session.waiters.shift();
     if (!waiter) return;
     clearTimeout(waiter.timer);
-    waiter.resolve(session.pending.splice(0, session.pending.length).map((job) => {
-      job.delivered = true;
-      session.inflight.set(job.id, job);
-      return job;
-    }));
+    waiter.resolve(
+      session.pending.splice(0, session.pending.length).map((job) => {
+        job.delivered = true;
+        session.inflight.set(job.id, job);
+        return job;
+      }),
+    );
   }
 
   function takeJobs(
@@ -283,7 +317,8 @@ export function createBridge() {
     signal?: AbortSignal,
   ): Promise<{ ok: true; jobs: ReturnType<typeof drain> } | { ok: false; error: string }> {
     const session = sessions.get(sessionId);
-    if (!session || session.userId !== userId) return Promise.resolve({ ok: false, error: "session not found" });
+    if (!session || session.userId !== userId)
+      return Promise.resolve({ ok: false, error: "session not found" });
     touch(session);
     if (session.pending.length > 0) return Promise.resolve({ ok: true, jobs: drain(session) });
     const ms = Math.min(Math.max(waitMs, 0), 30_000);
@@ -324,7 +359,12 @@ export function createBridge() {
     });
   }
 
-  function postResult(sessionId: string, userId: string, jobId: string, result: unknown): { ok: true } | { ok: false; error: string } {
+  function postResult(
+    sessionId: string,
+    userId: string,
+    jobId: string,
+    result: unknown,
+  ): { ok: true } | { ok: false; error: string } {
     const session = sessions.get(sessionId);
     if (!session || session.userId !== userId) return { ok: false, error: "session not found" };
     touch(session);
@@ -347,7 +387,11 @@ export function createBridge() {
     return { ok: true };
   }
 
-  function sessionForCall(userId: string, sessionId?: string, connection?: string): BridgeSession | undefined {
+  function sessionForCall(
+    userId: string,
+    sessionId?: string,
+    connection?: string,
+  ): BridgeSession | undefined {
     gc();
     if (sessionId) {
       const session = sessions.get(sessionId);
@@ -370,9 +414,10 @@ export function createBridge() {
     const session = sessionForCall(input.userId, input.sessionId, input.connection);
     if (!session) {
       const live = listForUser(input.userId);
-      const error = live.length > 1
-        ? `Multiple browsers are connected (${live.map((item) => toolAddress(item.connectionName)).join(", ")}). Name which one.`
-        : "No browser is connected. Open Executor Browser and connect.";
+      const error =
+        live.length > 1
+          ? `Multiple browsers are connected (${live.map((item) => toolAddress(item.connectionName)).join(", ")}). Name which one.`
+          : "No browser is connected. Open Executor Browser and connect.";
       return Promise.resolve({ ok: false, error });
     }
     const timeoutMs = input.timeoutMs ?? DEFAULT_CALL_TIMEOUT_MS;
@@ -468,7 +513,11 @@ export function createBridge() {
         result: { content: [{ type: "text", text: JSON.stringify(result.result) }] },
       });
     }
-    return json({ jsonrpc: "2.0", id, error: { code: -32601, message: `unknown method ${method}` } });
+    return json({
+      jsonrpc: "2.0",
+      id,
+      error: { code: -32601, message: `unknown method ${method}` },
+    });
   }
 
   async function handle(request: Request, principal: BridgePrincipal | null): Promise<Response> {
@@ -521,20 +570,23 @@ export function createBridge() {
     const sub = match[2];
     if (!sub && request.method === "DELETE") {
       const session = sessions.get(sessionId);
-      if (!session || session.userId !== principal.userId) return json({ error: "session not found" }, 404);
+      if (!session || session.userId !== principal.userId)
+        return json({ error: "session not found" }, 404);
       drop(sessionId, "session closed");
       return json({ ok: true });
     }
     if (!sub && request.method === "GET") {
       const session = sessions.get(sessionId);
-      if (!session || session.userId !== principal.userId) return json({ error: "session not found" }, 404);
+      if (!session || session.userId !== principal.userId)
+        return json({ error: "session not found" }, 404);
       return json(publicView(session));
     }
     if (!sub && request.method === "PATCH") {
       const body = asRecord(await readJson(request));
       if (body?.capabilities === undefined) return json({ error: "capabilities required" }, 400);
       const session = sessions.get(sessionId);
-      if (!session || session.userId !== principal.userId) return json({ error: "session not found" }, 404);
+      if (!session || session.userId !== principal.userId)
+        return json({ error: "session not found" }, 404);
       session.capabilities = body.capabilities;
       touch(session);
       return json({ ok: true });

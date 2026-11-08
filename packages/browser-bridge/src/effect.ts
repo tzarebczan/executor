@@ -27,17 +27,20 @@ export const browserBridgeRoutes = <ApiE, ApiR, PageE, PageR>(authenticate: {
   const bridge = createBridge();
   const unavailable = () =>
     HttpServerResponse.fromWeb(
-      new Response(JSON.stringify({ error: "Executor could not check the credential. Try again." }), {
-        status: 503,
-        headers: { "content-type": "application/json", "cache-control": "no-store" },
-      }),
+      new Response(
+        JSON.stringify({ error: "Executor could not check the credential. Try again." }),
+        {
+          status: 503,
+          headers: { "content-type": "application/json", "cache-control": "no-store" },
+        },
+      ),
     );
   const api = Effect.gen(function* () {
     const request = yield* HttpServerRequest.HttpServerRequest;
     const web = yield* HttpServerRequest.toWeb(request);
-    const auth = yield* authenticate.api(web).pipe(
-      Effect.orElseSucceed(() => ({ principal: null, unavailable: true })),
-    );
+    const auth = yield* authenticate
+      .api(web)
+      .pipe(Effect.orElseSucceed(() => ({ principal: null, unavailable: true })));
     if (auth.unavailable) return unavailable();
     const response = yield* Effect.promise(() => bridge.handle(web, auth.principal));
     return HttpServerResponse.fromWeb(response);
@@ -45,9 +48,9 @@ export const browserBridgeRoutes = <ApiE, ApiR, PageE, PageR>(authenticate: {
   const page = Effect.gen(function* () {
     const request = yield* HttpServerRequest.HttpServerRequest;
     const web = yield* HttpServerRequest.toWeb(request);
-    const auth = yield* authenticate.page(web).pipe(
-      Effect.orElseSucceed(() => ({ principal: null, unavailable: true })),
-    );
+    const auth = yield* authenticate
+      .page(web)
+      .pipe(Effect.orElseSucceed(() => ({ principal: null, unavailable: true })));
     if (auth.unavailable) return unavailable();
     const principal = auth.principal;
     const html = renderBrowsersPage({

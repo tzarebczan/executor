@@ -37,18 +37,21 @@ export function renderBrowsersPage(input: {
   readonly origin: string;
 }): string {
   const now = Date.now();
-  const rows = input.sessions.length === 0
-    ? `<p class="empty">No browser connected.</p>`
-    : input.sessions.map((session) => {
-        const name = escapeHtml(session.label || session.browser || session.connection);
-        const fresh = now - session.lastSeenAt < 45_000;
-        return `<li class="${fresh ? "live" : "stale"}">
+  const rows =
+    input.sessions.length === 0
+      ? `<p class="empty">No browser connected.</p>`
+      : input.sessions
+          .map((session) => {
+            const name = escapeHtml(session.label || session.browser || session.connection);
+            const fresh = now - session.lastSeenAt < 45_000;
+            return `<li class="${fresh ? "live" : "stale"}">
           <span class="lamp" aria-hidden="true"></span>
           <span class="name">${name}</span>
           <span class="meta">${escapeHtml(cdpLabel(session.capabilities))} · ${escapeHtml(age(session.lastSeenAt, now))}</span>
           <code>${escapeHtml(session.address)}</code>
         </li>`;
-      }).join("");
+          })
+          .join("");
   const status = !input.signedIn
     ? "Sign in to see this host's browsers."
     : input.sessions.length === 0

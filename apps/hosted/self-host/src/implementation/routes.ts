@@ -225,7 +225,7 @@ export const selfHostRouteMap = <DashboardE, DashboardR>(options: {
                   Effect.succeed({ principal: null, unavailable: true }),
               }),
             );
-            if (apiAuth.unavailable) return apiAuth;
+            if ("unavailable" in apiAuth && apiAuth.unavailable) return apiAuth;
             if (apiAuth.principal !== null) return apiAuth;
             const session = yield* Authentication;
             return yield* session.current(request.headers).pipe(
@@ -237,7 +237,10 @@ export const selfHostRouteMap = <DashboardE, DashboardR>(options: {
               ),
             );
           }),
-      }).pipe(HttpRouter.provideRequest(auth.apiIdentity), HttpRouter.provideRequest(auth.identity)),
+      }).pipe(
+        HttpRouter.provideRequest(auth.apiIdentity),
+        HttpRouter.provideRequest(auth.identity),
+      ),
       HttpRouter.add("GET", "*", dashboard),
     );
     const notFound = HttpServerResponse.empty({ status: 404 });

@@ -97,8 +97,10 @@ const AGENT_TOOLS = [
   { name: "screenshot", description: "Capture the current page." },
   {
     name: "evaluate",
-    description: "Run a CDP command. The browser must have developer tools on.",
-    input: { method: { type: "string" }, params: { type: "object" } },
+    description:
+      "Evaluate JavaScript in the current page. Developer tools must be on. awaitPromise defaults to true.",
+    input: { expression: { type: "string" }, awaitPromise: { type: "boolean" } },
+    required: ["expression"],
   },
 ] as const;
 
@@ -204,16 +206,37 @@ export function createBridge() {
     };
   }
 
-  function listForUser(userId: string): BridgeSession[] {
+  function sameCredential(session: BridgeSession, principal: BridgePrincipal): boolean {
+    return (
+      session.userId === principal.userId && session.organizationId === principal.organizationId
+    );
+  }
+
+  /**
+   * The status page signs in as the person and has no organization, so it lists
+   * every browser they connected. A credential names its organization. The local
+   * server names none, and its sessions don't either.
+   */
+  function visibleTo(session: BridgeSession, principal: BridgePrincipal): boolean {
+    if (session.userId !== principal.userId) return false;
+    if (principal.organizationId === undefined) return true;
+    return session.organizationId === principal.organizationId;
+  }
+
+  function listWhere(match: (session: BridgeSession) => boolean): BridgeSession[] {
     gc();
-    return [...sessions.values()].filter((session) => session.userId === userId);
+    return [...sessions.values()].filter(match);
   }
 
   function allocate(
-    userId: string,
+    principal: BridgePrincipal,
     identity: { browser?: string; label?: string; requested?: string },
   ): string {
-    const taken = new Set(listForUser(userId).map((session) => session.connectionName));
+    const taken = new Set(
+      [...sessions.values()]
+        .filter((session) => sameCredential(session, principal))
+        .map((session) => session.connectionName),
+    );
     const preferred = preferredName(identity);
     if (!taken.has(preferred)) return preferred;
     const base = slug(
@@ -243,7 +266,7 @@ export function createBridge() {
     let connectionName: string | undefined;
     const replacing: string[] = [];
     for (const [id, session] of sessions) {
-      if (session.userId !== principal.userId) continue;
+      if (!sameCredential(session, principal)) continue;
       const same = instanceId ? session.instanceId === instanceId : !session.instanceId;
       if (!same) continue;
       connectionName ??= session.connectionName;
@@ -251,7 +274,7 @@ export function createBridge() {
     }
     for (const id of replacing) drop(id, "session replaced");
     const shownLabel = label || browser;
-    connectionName ??= allocate(principal.userId, {
+    connectionName ??= allocate(principal, {
       ...(browser ? { browser } : {}),
       ...(label ? { label } : {}),
       ...(requested ? { requested } : {}),
@@ -312,12 +335,12 @@ export function createBridge() {
 
   function takeJobs(
     sessionId: string,
-    userId: string,
+    principal: BridgePrincipal,
     waitMs: number,
     signal?: AbortSignal,
   ): Promise<{ ok: true; jobs: ReturnType<typeof drain> } | { ok: false; error: string }> {
     const session = sessions.get(sessionId);
-    if (!session || session.userId !== userId)
+    if (!session || !sameCredential(session, principal))
       return Promise.resolve({ ok: false, error: "session not found" });
     touch(session);
     if (session.pending.length > 0) return Promise.resolve({ ok: true, jobs: drain(session) });
@@ -361,12 +384,13 @@ export function createBridge() {
 
   function postResult(
     sessionId: string,
-    userId: string,
+    principal: BridgePrincipal,
     jobId: string,
     result: unknown,
   ): { ok: true } | { ok: false; error: string } {
     const session = sessions.get(sessionId);
-    if (!session || session.userId !== userId) return { ok: false, error: "session not found" };
+    if (!session || !sameCredential(session, principal))
+      return { ok: false, error: "session not found" };
     touch(session);
     let encoded = "";
     const encodedResult = JSON.stringify(result ?? null);
@@ -388,22 +412,22 @@ export function createBridge() {
   }
 
   function sessionForCall(
-    userId: string,
+    principal: BridgePrincipal,
     sessionId?: string,
     connection?: string,
   ): BridgeSession | undefined {
     gc();
     if (sessionId) {
       const session = sessions.get(sessionId);
-      return session && session.userId === userId ? session : undefined;
+      return session && sameCredential(session, principal) ? session : undefined;
     }
-    const live = listForUser(userId);
+    const live = [...sessions.values()].filter((session) => sameCredential(session, principal));
     if (connection) return live.find((session) => session.connectionName === connection);
     return live.length === 1 ? live[0] : undefined;
   }
 
   function callTool(input: {
-    readonly userId: string;
+    readonly principal: BridgePrincipal;
     readonly tool: string;
     readonly args?: Record<string, unknown>;
     readonly sessionId?: string;
@@ -411,9 +435,9 @@ export function createBridge() {
     readonly timeoutMs?: number;
     readonly caller?: BridgeCaller;
   }): Promise<{ ok: true; result: unknown } | { ok: false; error: string }> {
-    const session = sessionForCall(input.userId, input.sessionId, input.connection);
+    const session = sessionForCall(input.principal, input.sessionId, input.connection);
     if (!session) {
-      const live = listForUser(input.userId);
+      const live = listWhere((item) => sameCredential(item, input.principal));
       const error =
         live.length > 1
           ? `Multiple browsers are connected (${live.map((item) => toolAddress(item.connectionName)).join(", ")}). Name which one.`
@@ -479,6 +503,7 @@ export function createBridge() {
             inputSchema: {
               type: "object",
               properties: "input" in tool ? tool.input : {},
+              ...("required" in tool ? { required: tool.required } : {}),
             },
           })),
         },
@@ -494,7 +519,7 @@ export function createBridge() {
       const toolArgs = { ...args };
       delete toolArgs.connection;
       const result = await callTool({
-        userId: principal.userId,
+        principal,
         tool: name,
         args: toolArgs,
         ...(connection ? { connection } : {}),
@@ -546,7 +571,9 @@ export function createBridge() {
       });
     }
     if (path === "/sessions" && request.method === "GET") {
-      return json({ sessions: listForUser(principal.userId).map(publicView) });
+      return json({
+        sessions: listWhere((session) => sameCredential(session, principal)).map(publicView),
+      });
     }
     if (path === "/call" && request.method === "POST") {
       const body = asRecord(await readJson(request));
@@ -555,7 +582,7 @@ export function createBridge() {
       const sessionId = readString(body?.sessionId);
       const connectionName = readString(body?.connection);
       const result = await callTool({
-        userId: principal.userId,
+        principal,
         tool,
         args: asRecord(body?.args) ?? {},
         ...(sessionId ? { sessionId } : {}),
@@ -570,14 +597,14 @@ export function createBridge() {
     const sub = match[2];
     if (!sub && request.method === "DELETE") {
       const session = sessions.get(sessionId);
-      if (!session || session.userId !== principal.userId)
+      if (!session || !sameCredential(session, principal))
         return json({ error: "session not found" }, 404);
       drop(sessionId, "session closed");
       return json({ ok: true });
     }
     if (!sub && request.method === "GET") {
       const session = sessions.get(sessionId);
-      if (!session || session.userId !== principal.userId)
+      if (!session || !sameCredential(session, principal))
         return json({ error: "session not found" }, 404);
       return json(publicView(session));
     }
@@ -585,7 +612,7 @@ export function createBridge() {
       const body = asRecord(await readJson(request));
       if (body?.capabilities === undefined) return json({ error: "capabilities required" }, 400);
       const session = sessions.get(sessionId);
-      if (!session || session.userId !== principal.userId)
+      if (!session || !sameCredential(session, principal))
         return json({ error: "session not found" }, 404);
       session.capabilities = body.capabilities;
       touch(session);
@@ -595,7 +622,7 @@ export function createBridge() {
       const waitMs = Number(url.searchParams.get("waitMs") || "25000");
       const taken = await takeJobs(
         sessionId,
-        principal.userId,
+        principal,
         Number.isFinite(waitMs) ? waitMs : 25000,
         request.signal,
       );
@@ -605,7 +632,7 @@ export function createBridge() {
       const body = asRecord(await readJson(request));
       const jobId = readString(body?.jobId);
       if (!jobId) return json({ error: "jobId required" }, 400);
-      const posted = postResult(sessionId, principal.userId, jobId, body?.result);
+      const posted = postResult(sessionId, principal, jobId, body?.result);
       return posted.ok ? json({ ok: true }) : json({ error: posted.error }, 404);
     }
     return json({ error: `unknown browser-bridge path ${path}` }, 404);
@@ -613,8 +640,8 @@ export function createBridge() {
 
   return {
     handle,
-    listPublic(userId: string): readonly PublicSession[] {
-      return listForUser(userId).map(publicView);
+    listPublic(principal: BridgePrincipal): readonly PublicSession[] {
+      return listWhere((session) => visibleTo(session, principal)).map(publicView);
     },
     callTool,
   };

@@ -55,7 +55,7 @@ export const browserBridgeRoutes = <ApiE, ApiR, PageE, PageR>(authenticate: {
     const principal = auth.principal;
     const html = renderBrowsersPage({
       signedIn: principal !== null,
-      sessions: principal ? bridge.listPublic(principal.userId) : [],
+      sessions: principal ? bridge.listPublic(principal) : [],
       origin: new URL(web.url).origin,
     });
     return HttpServerResponse.fromWeb(

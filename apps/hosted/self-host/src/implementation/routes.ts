@@ -46,7 +46,8 @@ import { appUiBaseUrl, catalogFeedUrl } from "../contracts/config.ts";
 import { type HostEgress } from "@executor-js/utils/url-policy";
 import { Config, Effect, Layer, Option } from "effect";
 import { HttpRouter, HttpServer, HttpServerRequest, HttpServerResponse } from "effect/http";
-import { browserBridgeRoutes } from "@executor-js/browser-bridge/effect";
+import { type AuthorizationPolicy } from "@executor-js/authorization";
+import { browserBridgeRoutes, type BridgeAuth } from "@executor-js/browser-bridge/effect";
 import { withHostPipeline } from "@executor-js/dashboard-start/in-process";
 import { selfHostApi } from "./api.ts";
 import { selfHostMcp } from "../mcp.ts";
@@ -55,6 +56,29 @@ import { selfHostAnalytics } from "./product-analytics.ts";
 
 import type { SourceTextFile as SourceFile } from "@executor-js/sdk/core";
 import type { selfHostExecutorServices } from "./executor-services.ts";
+
+/**
+ * Browser control is not an app tool. API keys carry full authority. An OAuth
+ * grant carries only its policy, so a grant for selected apps must not reach
+ * the channel. Full consent still does.
+ */
+const browserChannelAuth = (value: {
+  readonly userId: string;
+  readonly access: { readonly organization: string };
+  readonly policy: AuthorizationPolicy;
+}): BridgeAuth & { readonly limited: boolean } => {
+  if (value.policy.actions.kind !== "all" || value.policy.tools.kind !== "all") {
+    return { principal: null, limited: true };
+  }
+  return {
+    principal: {
+      userId: value.userId,
+      organizationId: value.access.organization,
+    },
+    limited: false,
+  };
+};
+
 /** Compose the self-host route map without opening a listener; shared by the process entry and HTTP tests. */
 export const selfHostRouteMap = <DashboardE, DashboardR>(options: {
   readonly skills: readonly SourceFile[];
@@ -193,40 +217,37 @@ export const selfHostRouteMap = <DashboardE, DashboardR>(options: {
         api: (request) =>
           Effect.gen(function* () {
             const api = yield* ApiAuthentication;
-            return yield* api.authenticate(request.headers).pipe(
-              Effect.map((value) => ({
-                principal: {
-                  userId: value.userId,
-                  organizationId: value.access.organization,
-                },
-              })),
+            const auth = yield* api.authenticate(request.headers).pipe(
+              Effect.map(browserChannelAuth),
               Effect.catchTags({
-                Unauthorized: () => Effect.succeed({ principal: null }),
-                OrganizationForbidden: () => Effect.succeed({ principal: null }),
+                Unauthorized: () => Effect.succeed({ principal: null, limited: false }),
+                OrganizationForbidden: () => Effect.succeed({ principal: null, limited: false }),
                 AuthenticationUnavailable: () =>
-                  Effect.succeed({ principal: null, unavailable: true }),
+                  Effect.succeed({ principal: null, unavailable: true, limited: false }),
               }),
             );
+            return "unavailable" in auth && auth.unavailable
+              ? { principal: null, unavailable: true }
+              : { principal: auth.principal };
           }),
         page: (request) =>
           Effect.gen(function* () {
             const api = yield* ApiAuthentication;
             const apiAuth = yield* api.authenticate(request.headers).pipe(
-              Effect.map((value) => ({
-                principal: {
-                  userId: value.userId,
-                  organizationId: value.access.organization,
-                },
-              })),
+              Effect.map(browserChannelAuth),
               Effect.catchTags({
-                Unauthorized: () => Effect.succeed({ principal: null }),
-                OrganizationForbidden: () => Effect.succeed({ principal: null }),
+                Unauthorized: () => Effect.succeed({ principal: null, limited: false }),
+                OrganizationForbidden: () => Effect.succeed({ principal: null, limited: false }),
                 AuthenticationUnavailable: () =>
-                  Effect.succeed({ principal: null, unavailable: true }),
+                  Effect.succeed({ principal: null, unavailable: true, limited: false }),
               }),
             );
-            if ("unavailable" in apiAuth && apiAuth.unavailable) return apiAuth;
-            if (apiAuth.principal !== null) return apiAuth;
+            if ("unavailable" in apiAuth && apiAuth.unavailable)
+              return { principal: null, unavailable: true };
+            // A presented bearer that is only a limited grant must not fall
+            // through to the dashboard cookie.
+            if (apiAuth.limited || apiAuth.principal !== null)
+              return { principal: apiAuth.principal };
             const session = yield* Authentication;
             return yield* session.current(request.headers).pipe(
               Effect.map((principal) => ({
